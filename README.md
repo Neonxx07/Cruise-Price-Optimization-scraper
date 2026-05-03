@@ -1,6 +1,6 @@
 <div align="center">
 
-# ⚓ Cruise Price Optimization
+# ⚓ Cruise Price Intelligence System (Playwright + AI Optimization)
 
 **Automated repricing intelligence for Royal Caribbean, Celebrity & Norwegian Cruise Line**
 
