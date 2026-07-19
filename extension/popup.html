@@ -1,0 +1,123 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<style>
+  *{box-sizing:border-box;margin:0;padding:0;}
+  body{width:420px;font-family:-apple-system,BlinkMacSystemFont,Arial,sans-serif;font-size:13px;background:#f8fafc;color:#1e293b;}
+  .header{background:linear-gradient(135deg,#1e3a5f,#1d4ed8);padding:12px 16px;color:white;display:flex;align-items:center;gap:10px;}
+  .header-icon{font-size:22px;} .header h1{font-size:14px;font-weight:700;} .header p{font-size:11px;opacity:.75;margin-top:1px;}
+  .cl-toggle{display:flex;gap:0;margin:10px 14px 0;border-radius:8px;overflow:hidden;border:1.5px solid #e2e8f0;}
+  .cl-btn{flex:1;padding:7px 0;border:none;font-size:12px;font-weight:700;cursor:pointer;background:#f8fafc;color:#64748b;transition:all .15s;}
+  .cl-btn.active.espresso{background:#1d4ed8;color:white;} .cl-btn.active.ncl{background:#d4002a;color:white;}
+  .cl-btn:hover:not(.active){background:#e2e8f0;}
+  .body{padding:12px 14px;} .label{font-size:10px;font-weight:700;color:#64748b;text-transform:uppercase;letter-spacing:.5px;margin-bottom:5px;}
+  textarea{width:100%;height:76px;border:1.5px solid #e2e8f0;border-radius:8px;padding:8px;font-size:12px;font-family:monospace;resize:none;background:white;color:#1e293b;}
+  textarea:focus{outline:none;border-color:#1d4ed8;} textarea::placeholder{color:#94a3b8;font-family:Arial;}
+  .hint{font-size:10px;color:#94a3b8;margin-top:4px;margin-bottom:10px;}
+  .btn-row{display:flex;gap:8px;margin-bottom:10px;}
+  .btn{flex:1;padding:9px;border:none;border-radius:8px;font-size:13px;font-weight:700;cursor:pointer;transition:all .15s;}
+  .btn-run{background:#1d4ed8;color:white;} .btn-run.ncl-mode{background:#d4002a;} .btn-run:hover:not(:disabled){opacity:.88;}
+  .btn-run:disabled{background:#93c5fd;cursor:not-allowed;} .btn-stop{background:#fee2e2;color:#dc2626;display:none;}
+  .btn-stop.show{display:flex;align-items:center;justify-content:center;} .btn-stop:hover{background:#fecaca;}
+  .progress{display:none;margin-bottom:9px;} .progress.show{display:block;}
+  .prog-top{display:flex;justify-content:space-between;font-size:10px;color:#64748b;margin-bottom:4px;}
+  .prog-bar{height:4px;background:#e2e8f0;border-radius:99px;overflow:hidden;}
+  .prog-fill{height:100%;background:#1d4ed8;border-radius:99px;width:0;transition:width .3s;} .prog-fill.ncl-mode{background:#d4002a;}
+  #results{display:flex;flex-direction:column;gap:7px;max-height:320px;overflow-y:auto;}
+  .card{background:white;border-radius:9px;padding:10px 12px;border-left:4px solid #e2e8f0;box-shadow:0 1px 3px rgba(0,0,0,.06);animation:pop .2s ease;}
+  @keyframes pop{from{opacity:0;transform:translateY(-3px)}to{opacity:1;transform:translateY(0)}}
+  .card.OPTIMIZATION{border-left-color:#10b981;} .card.TRAP{border-left-color:#f59e0b;}
+  .card.NO_SAVING,.card.WLT,.card.SKIPPED_TODAY{border-left-color:#94a3b8;} .card.ERROR{border-left-color:#ef4444;}
+  .card.CHECKING{border-left-color:#3b82f6;} .card.PAID_IN_FULL{border-left-color:#8b5cf6;}
+  .card-top{display:flex;justify-content:space-between;align-items:center;margin-bottom:4px;} .card-id{font-weight:700;font-size:13px;}
+  .card-badge{font-size:10px;font-weight:700;padding:2px 7px;border-radius:99px;text-transform:uppercase;}
+  .OPTIMIZATION .card-badge{background:#d1fae5;color:#065f46;} .TRAP .card-badge{background:#fef3c7;color:#92400e;}
+  .NO_SAVING .card-badge,.WLT .card-badge,.SKIPPED_TODAY .card-badge{background:#f1f5f9;color:#64748b;}
+  .ERROR .card-badge{background:#fee2e2;color:#991b1b;} .CHECKING .card-badge{background:#dbeafe;color:#1e40af;}
+  .PAID_IN_FULL .card-badge{background:#ede9fe;color:#5b21b6;}
+  .card-saving{font-size:19px;font-weight:900;color:#10b981;} .TRAP .card-saving{color:#f59e0b;font-size:14px;}
+  .NO_SAVING .card-saving,.WLT .card-saving,.SKIPPED_TODAY .card-saving{color:#94a3b8;font-size:13px;font-weight:600;}
+  .ERROR .card-saving{color:#ef4444;font-size:11px;} .CHECKING .card-saving{color:#3b82f6;font-size:12px;} .PAID_IN_FULL .card-saving{color:#8b5cf6;font-size:12px;}
+  .card-prices,.card-fares{font-size:11px;color:#94a3b8;margin-top:2px;}
+  .gained{color:#10b981;} .lost{color:#ef4444;} .re-addable{color:#0e7490;font-weight:600;}
+  .conf-row{margin-top:5px;margin-bottom:2px;display:flex;flex-direction:column;gap:2px;}
+  .conf-stars{display:inline-flex;align-items:center;gap:5px;font-size:12px;padding:2px 8px;border-radius:5px;font-weight:700;width:fit-content;}
+  .card-pkg-loss{font-size:11px;margin-top:5px;padding:5px 8px;background:#fff7ed;border:1px solid #fed7aa;border-radius:5px;color:#9a3412;}
+  .card-note{display:flex;align-items:center;justify-content:space-between;background:#f8fafc;border-radius:6px;padding:5px 9px;margin-top:6px;gap:8px;}
+  .note-label{font-size:9px;color:#94a3b8;font-weight:700;text-transform:uppercase;margin-bottom:1px;}
+  .note-text{font-family:monospace;font-size:11px;font-weight:700;color:#1e293b;}
+  .card-actions{display:flex;gap:5px;margin-top:7px;}
+  .optimize-btn{flex:2;padding:6px;background:linear-gradient(135deg,#1e3a5f,#1d4ed8);color:white;border:none;border-radius:6px;font-size:11px;font-weight:700;cursor:pointer;}
+  .optimize-btn:hover{opacity:.88;} .optimize-btn:disabled{opacity:.5;cursor:not-allowed;}
+  .view-btn{flex:1;padding:6px;background:#f8fafc;color:#374151;border:1.5px solid #e2e8f0;border-radius:6px;font-size:11px;font-weight:600;cursor:pointer;}
+  .view-btn:hover{background:#f1f5f9;}
+  .copy-btn{font-size:11px;padding:4px 10px;background:#1d4ed8;color:white;border:none;border-radius:5px;cursor:pointer;white-space:nowrap;flex-shrink:0;}
+  .ncl-badge{background:#fee2e2;color:#991b1b;font-size:9px;padding:1px 4px;border-radius:3px;margin-left:4px;}
+  .spinner{display:inline-block;width:11px;height:11px;border:2px solid #3b82f6;border-top-color:transparent;border-radius:50%;animation:spin .6s linear infinite;vertical-align:middle;margin-right:4px;}
+  #summary{display:none;margin-top:9px;background:white;border-radius:9px;padding:10px 14px;border:1.5px solid #e2e8f0;} #summary.show{display:block;}
+  .sum-grid{display:grid;grid-template-columns:repeat(5,1fr);text-align:center;gap:4px;margin-bottom:7px;}
+  .sum-num{font-size:18px;font-weight:900;line-height:1;} .sum-lbl{font-size:9px;color:#94a3b8;margin-top:2px;}
+  .sum-saved{text-align:center;font-size:12px;color:#64748b;} .sum-saved b{color:#10b981;font-size:15px;}
+  .bottom-bar{display:flex;gap:6px;padding:8px 14px 12px;border-top:1px solid #f1f5f9;margin-top:8px;}
+  .bar-btn{flex:1;padding:6px;background:white;border:1.5px solid #e2e8f0;border-radius:6px;font-size:11px;font-weight:600;color:#64748b;cursor:pointer;}
+  .bar-btn:hover{background:#f8fafc;}
+  #logPanel{display:none;max-height:150px;overflow-y:auto;background:#0f172a;font-family:monospace;font-size:10px;color:#94a3b8;padding:9px 12px;line-height:1.7;}
+  #statusMsg{font-size:11px;color:#64748b;padding:0 0 7px;display:none;}
+</style>
+</head>
+<body>
+
+<div class="header">
+  <div class="header-icon">⚓</div>
+  <div>
+    <h1>CruiseIntel Optimization</h1>
+    <p id="headerSub">ESPRESSO — Royal Caribbean &amp; Celebrity</p>
+  </div>
+</div>
+
+<div class="cl-toggle">
+  <button class="cl-btn active espresso" id="clEspresso">🏴 ESPRESSO (RCL / Celebrity)</button>
+  <button class="cl-btn ncl" id="clNCL">🇳🇴 Norwegian (NCL)</button>
+</div>
+
+<div class="body">
+  <div class="label" style="margin-top:8px;">Booking Numbers</div>
+  <textarea id="bookingInput" placeholder="4097990&#10;64756965, 60129622"></textarea>
+  <div class="hint" id="hintText">Must be logged into ESPRESSO before running</div>
+
+  <div class="btn-row">
+    <button class="btn btn-run" id="runBtn">▶ Run Check</button>
+    <button class="btn btn-stop" id="stopBtn">■ Stop</button>
+  </div>
+
+  <div class="progress" id="progressBar">
+    <div class="prog-top"><span id="progText">Checking...</span><span id="progCount">0 / 0</span></div>
+    <div class="prog-bar"><div class="prog-fill" id="progFill"></div></div>
+  </div>
+
+  <div id="statusMsg"></div>
+  <div id="results"></div>
+
+  <div id="summary">
+    <div class="sum-grid">
+      <div><div class="sum-num" style="color:#10b981" id="sOpt">0</div><div class="sum-lbl">Optimize</div></div>
+      <div><div class="sum-num" style="color:#f59e0b" id="sTrap">0</div><div class="sum-lbl">Trap</div></div>
+      <div><div class="sum-num" style="color:#94a3b8" id="sNos">0</div><div class="sum-lbl">No saving</div></div>
+      <div><div class="sum-num" style="color:#8b5cf6" id="sPaid">0</div><div class="sum-lbl">Paid full</div></div>
+      <div><div class="sum-num" style="color:#ef4444" id="sErr">0</div><div class="sum-lbl">Errors</div></div>
+    </div>
+    <div class="sum-saved">Total savings: <b id="sSaved">$0.00</b></div>
+  </div>
+</div>
+
+<div class="bottom-bar">
+  <button class="bar-btn" id="logBtn">📋 Log</button>
+  <button class="bar-btn" id="exportBtn">⬇ CSV</button>
+  <button class="bar-btn" id="clearBtn" style="color:#ef4444;">🗑 Clear</button>
+</div>
+<div id="logPanel"></div>
+
+<script src="popup.js"></script>
+</body>
+</html>

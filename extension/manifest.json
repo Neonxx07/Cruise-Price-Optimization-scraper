@@ -1,0 +1,31 @@
+{
+  "manifest_version": 3,
+  "name": "CruiseIntel Optimization",
+  "version": "6.3",
+  "description": "Repricing intelligence for Royal Caribbean, Celebrity & Norwegian Cruise Line",
+  "permissions": [
+    "tabs",
+    "scripting",
+    "storage",
+    "activeTab",
+    "windows",
+    "alarms"
+  ],
+  "host_permissions": [
+    "https://secure.cruisingpower.com/*",
+    "https://seawebagents.ncl.com/*"
+  ],
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "CruiseIntel Optimization",
+    "default_icon": {
+      "48": "icon.png"
+    }
+  },
+  "background": {
+    "service_worker": "background.js"
+  },
+  "icons": {
+    "48": "icon.png"
+  }
+}
