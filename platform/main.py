@@ -54,6 +54,8 @@ async def _run_login_check(args):
     from utils.logging import setup_logging
 
     setup_logging(settings.log_level)
+    settings.browser_headless = getattr(args, "headless", True)
+    print(f"LOGIN CHECK: browser_headless={settings.browser_headless}")
 
     cruise_line = CruiseLine(args.cruise_line.upper())
     scraper = NclScraper() if cruise_line == CruiseLine.NCL else EspressoScraper()
@@ -63,7 +65,7 @@ async def _run_login_check(args):
         base_url = settings.ncl_search_url if cruise_line == CruiseLine.NCL else settings.espresso_home_url
         await scraper.navigate(base_url)
 
-        print(f"⚓ A browser window opened to {cruise_line.value}.")
+        print(f"⚓ A browser session started for {cruise_line.value}.")
         print("   Please log in there now (username/password/MFA as usual).")
         print(f"   Waiting up to {args.timeout_minutes} minute(s) for login to complete...\n")
 
@@ -81,6 +83,7 @@ async def _run_login_check(args):
             print("   ...still waiting for login")
 
         print("⏰ Timed out waiting for login. Run 'python main.py login' again when ready.")
+        raise RuntimeError("Login check timed out")
     finally:
         await scraper.stop()
 
@@ -142,7 +145,11 @@ async def _run_scan(args):
         print(f"   [{job.progress_done}/{job.progress_total}] {job.current_booking_id or 'done'}")
 
     job = await service.start_scan(
-        booking_ids, cruise_line, on_progress=on_progress, raw_dump_dir=args.capture_raw,
+        booking_ids,
+        cruise_line,
+        on_progress=on_progress,
+        raw_dump_dir=args.capture_raw,
+        capture_market_data=args.capture_market_data,
     )
 
     # Wait for completion
@@ -248,8 +255,12 @@ async def _run_watch(args):
                 print(f"   [{job.progress_done}/{job.progress_total}] {job.current_booking_id or 'done'}")
 
             job = await service.start_scan(
-                booking_ids, cruise_line, on_progress=on_progress,
-                bypass_cache=True, raw_dump_dir=args.capture_raw,
+                booking_ids,
+                cruise_line,
+                on_progress=on_progress,
+                bypass_cache=True,
+                raw_dump_dir=args.capture_raw,
+                capture_market_data=args.capture_market_data,
             )
 
             while job.status.value in ("PENDING", "RUNNING"):
@@ -334,6 +345,11 @@ def main():
         help="Append each booking's raw API response to DIR/raw_responses.jsonl "
              "(for later offline analysis / calculator development)",
     )
+    scan_parser.add_argument(
+        "--capture-market-data",
+        action="store_true",
+        help="Store ESPRESSO category table snapshots in the database for later analysis.",
+    )
 
     # Watch command — recurring overnight scans
     watch_parser = subparsers.add_parser(
@@ -364,6 +380,11 @@ def main():
         "--capture-raw", metavar="DIR",
         help="Append each booking's raw API response to DIR/raw_responses.jsonl "
              "(for later offline analysis / calculator development)",
+    )
+    watch_parser.add_argument(
+        "--capture-market-data",
+        action="store_true",
+        help="Store ESPRESSO category table snapshots in the database for later analysis.",
     )
 
     args = parser.parse_args()

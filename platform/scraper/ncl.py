@@ -223,7 +223,7 @@ class NclScraper(BaseScraper):
             }})()
         """)
 
-    async def check_booking(self, booking_id: str) -> BookingResult:
+    async def check_booking(self, booking_id: str, capture_market_data: bool = False) -> BookingResult:
         """
         Full NCL booking check flow. ALWAYS unlocks in finally.
 

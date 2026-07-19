@@ -40,6 +40,7 @@ class BaseScraper(ABC):
         # offline analysis / calculator development) — read-only capture
         # of data already fetched, nothing new is requested because of it.
         self.raw_dump_dir: Optional[str] = None
+        self.last_market_data: dict | None = None
 
     async def start(self) -> None:
         """Launch the browser and create a page."""
@@ -137,7 +138,7 @@ class BaseScraper(ABC):
         await self.page.click(submit_selector)
 
     @abstractmethod
-    async def check_booking(self, booking_id: str) -> BookingResult:
+    async def check_booking(self, booking_id: str, capture_market_data: bool = False) -> BookingResult:
         """Check a single booking for optimization opportunities."""
         ...
 

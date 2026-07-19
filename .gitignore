@@ -18,6 +18,8 @@ env/
 # Database
 *.db
 *.sqlite3
+*.jsonl
+/platform/data/
 
 # Logs
 logs/

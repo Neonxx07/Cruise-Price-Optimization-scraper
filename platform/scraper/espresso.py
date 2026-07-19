@@ -156,6 +156,42 @@ class EspressoScraper(BaseScraper):
         """)
         await self.wait_for("#catAvailCategoryList, [id*='catAvail']", timeout=12000)
 
+    async def _capture_category_table(self, current_category: str | None = None) -> dict:
+        """Capture the loaded ESPRESSO category table state without mutating the page."""
+        result = await self.page.evaluate(f"""
+            (() => {{
+                const tbody = document.querySelector('#catAvailCategoryList tbody')
+                           || document.querySelector('[id*="catAvail"] tbody');
+                const rows = [];
+                if (tbody) {{
+                    for (const row of tbody.querySelectorAll('tr')) {{
+                        const category = row.querySelector('td.c1 div.categoryIcon span, .categoryIcon span')?.textContent?.trim() || null;
+                        const status = row.querySelector('td.c2.rooms .svCabin .status, .svCabin .status')?.textContent?.trim() || '';
+                        const radio = row.querySelector('input[name="rbCategorySelection"][data-columnindex="0"]')
+                                   || row.querySelector('input[type="radio"]');
+                        rows.push({{
+                            category,
+                            status,
+                            radioValue: radio?.value || null,
+                            radioChecked: Boolean(radio?.checked),
+                            promo: row.querySelector('.promo, .currentPromo')?.textContent?.trim() || '',
+                            rowText: row.innerText.trim(),
+                        }});
+                    }}
+                }}
+                const token = location.href.match(/execution=(e\\d+s\\d+)/)?.[1] || null;
+                const selectionJSON = document.querySelector('input.selectionJSON, input[name*="selectionJSON"]')?.value || '';
+                return {{
+                    ok: true,
+                    currentCategory: {json.dumps(current_category)},
+                    executionToken: token,
+                    selectionJSON,
+                    rows,
+                }};
+            }})()
+        """)
+        return result
+
     async def _read_page_data(self, category: str | None) -> dict:
         """Read execution token, selection JSON, and radio value from page."""
         cat_js = f"'{category}'" if category else "null"
@@ -228,7 +264,7 @@ class EspressoScraper(BaseScraper):
         """)
         return result
 
-    async def check_booking(self, booking_id: str) -> BookingResult:
+    async def check_booking(self, booking_id: str, capture_market_data: bool = False) -> BookingResult:
         """
         Full ESPRESSO booking check flow.
 
@@ -236,6 +272,7 @@ class EspressoScraper(BaseScraper):
         load categories → WLT check → execute API → calculate result.
         """
         price_category: str | None = None
+        self.last_market_data = None
 
         async def _attempt():
             nonlocal price_category
@@ -263,6 +300,15 @@ class EspressoScraper(BaseScraper):
 
             # Click categories and load the table
             await self._click_categories()
+
+            if capture_market_data:
+                self.last_market_data = await self._capture_category_table(price_category)
+                logger.info(
+                    "espresso.market_data_captured",
+                    booking_id=booking_id,
+                    current_category=price_category,
+                    rows_count=len(self.last_market_data.get("rows", [])),
+                )
 
             # WLT check (AFTER categories table is loaded — fix from v6.3)
             if price_category and await self._check_wlt(price_category):

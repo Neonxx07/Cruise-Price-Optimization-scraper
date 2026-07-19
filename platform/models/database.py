@@ -8,7 +8,7 @@ from __future__ import annotations
 import json
 from datetime import datetime
 
-from sqlalchemy import Column, DateTime, Float, Integer, String, Text, create_engine
+from sqlalchemy import Column, DateTime, Float, Integer, Index, String, Text, create_engine
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase
 
@@ -92,6 +92,25 @@ class CacheEntry(Base):
     key = Column(String(100), nullable=False, unique=True, index=True)
     value_json = Column(Text, default="{}")
     expires_at = Column(DateTime, nullable=False)
+
+
+class MarketDataRecord(Base):
+    """Read-only market/category table captures from ESPRESSO scans."""
+
+    __tablename__ = "market_data"
+    __table_args__ = (
+        Index("ix_market_data_booking_created_at", "booking_id", "created_at"),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    booking_id = Column(String(20), nullable=False, index=True)
+    cruise_line = Column(String(10), nullable=False)
+    capture_type = Column(String(50), nullable=False, default="espresso_category_table")
+    current_category = Column(String(20))
+    execution_token = Column(String(100))
+    selection_json = Column(Text)
+    category_table_json = Column(Text, nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
 
 
 # ── Engine & Session ────────────────────────────────────────────

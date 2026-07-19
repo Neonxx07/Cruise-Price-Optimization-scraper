@@ -17,7 +17,7 @@ from sqlalchemy import select
 from config.settings import settings
 from core.calculator import make_error_result, make_skipped_result
 from core.models import BookingResult, BookingStatus, CruiseLine, ScanJob, ScanJobStatus
-from models.database import BookingRecord, PriceHistory, ScanJobRecord, async_session
+from models.database import BookingRecord, MarketDataRecord, PriceHistory, ScanJobRecord, async_session
 from scraper.base import BaseScraper
 from scraper.espresso import EspressoScraper
 from scraper.ncl import NclScraper
@@ -51,6 +51,7 @@ class BookingService:
         on_progress: Callable[[ScanJob], None] | None = None,
         bypass_cache: bool = False,
         raw_dump_dir: str | None = None,
+        capture_market_data: bool = False,
     ) -> ScanJob:
         """
         Start a batch scan of booking IDs.
@@ -84,7 +85,7 @@ class BookingService:
         await self._save_job_to_db(job)
 
         # Run in background
-        asyncio.create_task(self._run_batch(job, on_progress, bypass_cache, raw_dump_dir))
+        asyncio.create_task(self._run_batch(job, on_progress, bypass_cache, raw_dump_dir, capture_market_data))
 
         return job
 
@@ -94,6 +95,7 @@ class BookingService:
         on_progress: Callable[[ScanJob], None] | None = None,
         bypass_cache: bool = False,
         raw_dump_dir: str | None = None,
+        capture_market_data: bool = False,
     ) -> None:
         """Execute the batch scan."""
         scraper = self._get_scraper(job.cruise_line)
@@ -129,10 +131,13 @@ class BookingService:
                 logger.info("batch.checking", booking_id=booking_id, index=i + 1, total=len(job.booking_ids))
 
                 try:
-                    result = await scraper.check_booking(booking_id)
+                    result = await scraper.check_booking(booking_id, capture_market_data=capture_market_data)
                 except Exception as e:
                     logger.error("batch.error", booking_id=booking_id, error=str(e))
                     result = make_error_result(booking_id, None, job.cruise_line, str(e))
+
+                if capture_market_data and scraper.last_market_data:
+                    await self._save_market_data_to_db(result, scraper.last_market_data)
 
                 if result.status == BookingStatus.ERROR:
                     consecutive_failures += 1
@@ -282,6 +287,22 @@ class BookingService:
                 cruise_line=result.cruise_line.value,
                 total=result.old_total,
                 category=result.price_category,
+            ))
+            await session.commit()
+
+    async def _save_market_data_to_db(self, result: BookingResult, market_data: dict) -> None:
+        """Persist read-only ESPRESSO market/category snapshot data."""
+        import json
+
+        async with async_session() as session:
+            session.add(MarketDataRecord(
+                booking_id=result.booking_id,
+                cruise_line=result.cruise_line.value,
+                capture_type="espresso_category_table",
+                current_category=market_data.get("currentCategory"),
+                execution_token=market_data.get("executionToken"),
+                selection_json=market_data.get("selectionJSON"),
+                category_table_json=json.dumps(market_data.get("rows", []), ensure_ascii=False),
             ))
             await session.commit()
 
