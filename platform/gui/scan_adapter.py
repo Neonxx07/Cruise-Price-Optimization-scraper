@@ -1,50 +1,18 @@
-"""Adapter between the GUI and BookingService business logic."""
+"""Result export adapter for the desktop GUI."""
 
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Callable
 
-from core.models import BookingResult, CruiseLine, ScanJob
-from models.database import init_db
-from services.booking_service import BookingService
+from core.models import BookingResult
 from services.csv_export import export_results_csv
 from services.excel_export import export_results_excel
 
 
-ProgressCallback = Callable[[ScanJob], None]
-
-
 class GuiScanAdapter:
-    """Wraps BookingService for use by the desktop GUI."""
-
-    def __init__(self) -> None:
-        self.service = BookingService()
-        self.job: ScanJob | None = None
-
-    async def initialize(self) -> None:
-        """Prepare the database and any persistence required by the GUI."""
-        await init_db()
-
-    async def start_scan(
-        self,
-        booking_ids: list[str],
-        cruise_line: CruiseLine,
-        on_progress: ProgressCallback | None = None,
-        raw_dump_dir: str | None = None,
-    ) -> ScanJob:
-        """Start scanning booking IDs and return the scan job."""
-        self.job = await self.service.start_scan(
-            booking_ids,
-            cruise_line,
-            on_progress=on_progress,
-            bypass_cache=True,
-            raw_dump_dir=raw_dump_dir,
-        )
-        return self.job
-
-    def get_current_job(self) -> ScanJob | None:
-        return self.job
+    """Wraps result export for use by the desktop GUI. Scanning itself is
+    driven directly through BookingQueueManager (see queue_manager.py),
+    not through this adapter."""
 
     def export_csv(self, results: list[BookingResult], path: str) -> None:
         """Export scan results to a CSV file."""

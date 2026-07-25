@@ -85,6 +85,27 @@ function fn_espresso_checkWLT(cat) {
   return { isWLT: false, status: 'unknown' };
 }
 
+function fn_espresso_readTopPrices() {
+  // The two 'viewPriceQuoteLink' figures rendered at the top of the
+  // categories page — the reservation's current price
+  // (sb.summary.price.price) and the price for whichever category radio
+  // is currently selected (sb.summary.price.allocationPrice). These come
+  // straight from the page's own Angular state, so they're a reliable
+  // "did the price actually change" check — cheaper and more trustworthy
+  // than the showRepriceModalCheck fetch, which returns a short,
+  // non-JSON body specifically when there's no real change (previously
+  // misdiagnosed downstream as an expired token).
+  const parseAmt = (el) => {
+    if (!el) return null;
+    const n = parseFloat((el.textContent || '').replace(/[^0-9.\-]/g, ''));
+    return isNaN(n) ? null : n;
+  };
+  const links = Array.from(document.querySelectorAll('a.viewPriceQuoteLink.fit'));
+  const currentEl = links.find(el => (el.getAttribute('ng-show') || '').includes('sb.summary.price.price'));
+  const allocEl = links.find(el => (el.getAttribute('ng-show') || '').includes('sb.summary.price.allocationPrice'));
+  return { currentPrice: parseAmt(currentEl), allocationPrice: parseAmt(allocEl) };
+}
+
 async function fn_espresso_readPageData(cat) {
   const m = location.href.match(/execution=(e\d+s\d+)/);
   const token = m ? m[1] : null;

@@ -3,6 +3,14 @@
 from pydantic_settings import BaseSettings
 from pathlib import Path
 
+# Where the saved login session (cookies + localStorage, via Playwright's
+# storage_state) is written — logging in once here (via "Check login" /
+# `main.py login`) keeps that session on disk, so scans and later app
+# restarts reuse it instead of starting a fresh, logged-out browser every
+# time. Lives next to the app, not in the repo (see .gitignore) since it
+# holds real session cookies.
+_DEFAULT_BROWSER_PROFILE_DIR = str(Path(__file__).resolve().parent.parent / "browser-profile")
+
 
 class Settings(BaseSettings):
     """Application settings loaded from environment variables or .env file."""
@@ -20,8 +28,10 @@ class Settings(BaseSettings):
     database_url: str = "sqlite+aiosqlite:///./cruise_intel.db"
 
     # ── Scraper ─────────────────────────────────────────────────
-    # Path to Chrome/Edge user data dir for authenticated sessions
-    browser_user_data_dir: str = ""
+    # Directory holding the saved login session (storage_state.json).
+    # Non-empty by default so login persists across scans and app restarts —
+    # set to "" (e.g. in .env) to force a fresh incognito-style session every run.
+    browser_user_data_dir: str = _DEFAULT_BROWSER_PROFILE_DIR
     browser_headless: bool = True
     scraper_timeout_ms: int = 30000
     scraper_retry_attempts: int = 3
@@ -60,6 +70,13 @@ class Settings(BaseSettings):
     espresso_home_url: str = "https://secure.cruisingpower.com/home"
     espresso_base_url: str = "https://secure.cruisingpower.com/espresso/protected/reservations.do"
     ncl_search_url: str = "https://seawebagents.ncl.com/tva/search/"
+    goccl_search_url: str = "https://www.goccl.com/BookingEngine/BookingSearch/SearchForReservations.aspx"
+
+    # ── GoCCL ───────────────────────────────────────────────────
+    # Guests count matters: GoCCL's offer-code comparison table shows
+    # "Average Per Person," but the review screen's GROSS AMOUNT is the
+    # full per-cabin total — see scraper/goccl.py for the comparison math.
+    goccl_default_guests_count: int = 2
 
     # ── Logging ─────────────────────────────────────────────────
     log_level: str = "INFO"

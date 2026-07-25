@@ -35,6 +35,31 @@ def cmd_api(args):
     )
 
 
+def _scraper_for(cruise_line):
+    """Factory: get the right scraper for the cruise line (CLI entry points)."""
+    from core.models import CruiseLine
+    from scraper.espresso import EspressoScraper
+    from scraper.goccl import GoCCLScraper
+    from scraper.ncl import NclScraper
+
+    if cruise_line == CruiseLine.NCL:
+        return NclScraper()
+    if cruise_line == CruiseLine.GOCCL:
+        return GoCCLScraper()
+    return EspressoScraper()
+
+
+def _login_base_url(cruise_line, settings):
+    """Where to land a fresh browser session for a manual login check."""
+    from core.models import CruiseLine
+
+    if cruise_line == CruiseLine.NCL:
+        return settings.ncl_search_url
+    if cruise_line == CruiseLine.GOCCL:
+        return settings.goccl_search_url
+    return settings.espresso_home_url
+
+
 def cmd_login(args):
     """Open a browser and wait for the user to log in manually."""
     asyncio.run(_run_login_check(args))
@@ -50,19 +75,26 @@ async def _run_login_check(args):
     from config.settings import settings
     from core.models import CruiseLine
     from scraper.espresso import EspressoScraper
+    from scraper.goccl import GoCCLScraper
     from scraper.ncl import NclScraper
     from utils.logging import setup_logging
 
     setup_logging(settings.log_level)
-    settings.browser_headless = getattr(args, "headless", True)
-    print(f"LOGIN CHECK: browser_headless={settings.browser_headless}")
+    # Login is the one step a human must complete by hand (MFA etc.), so
+    # it must always show a real window — no CLI flag exposes an override,
+    # and none should: a hidden login window can't be logged into.
+    login_headless = False
+    print(f"LOGIN CHECK: browser_headless={login_headless}")
 
     cruise_line = CruiseLine(args.cruise_line.upper())
-    scraper = NclScraper() if cruise_line == CruiseLine.NCL else EspressoScraper()
+    scraper = _scraper_for(cruise_line)
 
-    await scraper.start()
+    # Only this one login session runs visibly (if requested) — does not
+    # affect settings.browser_headless, so scans started afterward keep
+    # running headless as configured instead of inheriting this override.
+    await scraper.start(headless=login_headless)
     try:
-        base_url = settings.ncl_search_url if cruise_line == CruiseLine.NCL else settings.espresso_home_url
+        base_url = _login_base_url(cruise_line, settings)
         await scraper.navigate(base_url)
 
         print(f"⚓ A browser session started for {cruise_line.value}.")
@@ -73,7 +105,7 @@ async def _run_login_check(args):
         poll_s = 5
         while time.monotonic() < deadline:
             await asyncio.sleep(poll_s)
-            if cruise_line == CruiseLine.NCL:
+            if cruise_line in (CruiseLine.NCL, CruiseLine.GOCCL):
                 logged_in = "login" not in scraper.page.url.lower() and "signin" not in scraper.page.url.lower()
             else:
                 logged_in = await scraper._check_login()
@@ -138,11 +170,18 @@ async def _run_scan(args):
     print(f"⚓ Scanning {len(booking_ids)} booking(s) on {cruise_line.value}...")
     if args.capture_raw:
         print(f"   Capturing raw API responses to {args.capture_raw}/raw_responses.jsonl")
+    if args.capture_everything:
+        print(f"   Capturing full page HTML + network traffic + action log to {args.capture_raw or 'data'}/")
 
     service = BookingService()
 
     def on_progress(job):
         print(f"   [{job.progress_done}/{job.progress_total}] {job.current_booking_id or 'done'}")
+
+    def on_action(entry):
+        detail = {k: v for k, v in entry.items() if k not in ("timestamp", "action", "cruise_line")}
+        detail_str = " ".join(f"{k}={v}" for k, v in detail.items())
+        print(f"   · {entry['action']}  {detail_str}")
 
     job = await service.start_scan(
         booking_ids,
@@ -150,6 +189,8 @@ async def _run_scan(args):
         on_progress=on_progress,
         raw_dump_dir=args.capture_raw,
         capture_market_data=args.capture_market_data,
+        capture_everything=args.capture_everything,
+        on_action=on_action if args.capture_everything else None,
     )
 
     # Wait for completion
@@ -261,6 +302,7 @@ async def _run_watch(args):
                 bypass_cache=True,
                 raw_dump_dir=args.capture_raw,
                 capture_market_data=args.capture_market_data,
+                capture_everything=args.capture_everything,
             )
 
             while job.status.value in ("PENDING", "RUNNING"):
@@ -323,7 +365,7 @@ def main():
     login_parser = subparsers.add_parser(
         "login", help="Open a browser and wait for you to log in manually (no credentials handled)",
     )
-    login_parser.add_argument("--cruise-line", default="ESPRESSO", help="ESPRESSO or NCL")
+    login_parser.add_argument("--cruise-line", default="ESPRESSO", help="ESPRESSO, NCL, or GOCCL")
     login_parser.add_argument(
         "--timeout-minutes", type=float, default=15.0,
         help="How long to wait for login before giving up (default: 15)",
@@ -337,7 +379,7 @@ def main():
         help="Path to a watchlist text file, one booking ID per line "
              "(blank lines and '#' comments ignored). Overrides --bookings.",
     )
-    scan_parser.add_argument("--cruise-line", default="ESPRESSO", help="ESPRESSO or NCL")
+    scan_parser.add_argument("--cruise-line", default="ESPRESSO", help="ESPRESSO, NCL, or GOCCL")
     scan_parser.add_argument("--output", "-o", help="Output CSV file path")
     scan_parser.add_argument("--excel", "-x", help="Output color-coded .xlsx report file path")
     scan_parser.add_argument(
@@ -350,6 +392,13 @@ def main():
         action="store_true",
         help="Store ESPRESSO category table snapshots in the database for later analysis.",
     )
+    scan_parser.add_argument(
+        "--capture-everything",
+        action="store_true",
+        help="Also capture full page HTML + structured extraction, all network traffic, and a "
+             "step-by-step action log for every booking. Requires --capture-raw (defaults to "
+             "'data' if not set). Increases scan time and disk use.",
+    )
 
     # Watch command — recurring overnight scans
     watch_parser = subparsers.add_parser(
@@ -361,7 +410,7 @@ def main():
         help="Path to a watchlist text file, one booking ID per line "
              "(blank lines and '#' comments ignored). Overrides --bookings.",
     )
-    watch_parser.add_argument("--cruise-line", default="ESPRESSO", help="ESPRESSO or NCL")
+    watch_parser.add_argument("--cruise-line", default="ESPRESSO", help="ESPRESSO, NCL, or GOCCL")
     watch_parser.add_argument(
         "--interval-minutes", type=int, default=60, help="Minutes between passes (default: 60)",
     )
@@ -386,8 +435,18 @@ def main():
         action="store_true",
         help="Store ESPRESSO category table snapshots in the database for later analysis.",
     )
+    watch_parser.add_argument(
+        "--capture-everything",
+        action="store_true",
+        help="Also capture full page HTML + structured extraction, all network traffic, and a "
+             "step-by-step action log for every booking, every pass. Requires --capture-raw "
+             "(defaults to 'data' if not set). Increases scan time and disk use.",
+    )
 
     args = parser.parse_args()
+
+    if args.command in ("scan", "watch") and getattr(args, "capture_everything", False) and not args.capture_raw:
+        args.capture_raw = "data"
 
     if args.command == "api":
         cmd_api(args)

@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import csv
 import io
-from datetime import datetime
 
 from core.models import BookingResult
 
@@ -48,9 +47,3 @@ def export_results_csv(results: list[BookingResult]) -> str:
         ])
 
     return output.getvalue()
-
-
-def generate_filename(prefix: str = "cruiseintel") -> str:
-    """Generate a timestamped CSV filename."""
-    date = datetime.utcnow().strftime("%Y-%m-%d_%H%M")
-    return f"{prefix}_{date}.csv"

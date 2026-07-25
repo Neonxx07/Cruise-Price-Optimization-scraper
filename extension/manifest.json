@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "CruiseIntel Optimization",
-  "version": "6.3",
-  "description": "Repricing intelligence for Royal Caribbean, Celebrity & Norwegian Cruise Line",
+  "version": "6.4",
+  "description": "Repricing intelligence for Royal Caribbean, Celebrity, Norwegian Cruise Line & Carnival (GoCCL)",
   "permissions": [
     "tabs",
     "scripting",
@@ -13,7 +13,8 @@
   ],
   "host_permissions": [
     "https://secure.cruisingpower.com/*",
-    "https://seawebagents.ncl.com/*"
+    "https://seawebagents.ncl.com/*",
+    "https://www.goccl.com/*"
   ],
   "action": {
     "default_popup": "popup.html",

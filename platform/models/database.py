@@ -8,7 +8,7 @@ from __future__ import annotations
 import json
 from datetime import datetime
 
-from sqlalchemy import Column, DateTime, Float, Integer, Index, String, Text, create_engine
+from sqlalchemy import Column, DateTime, Float, Integer, Index, String, Text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase
 
@@ -123,9 +123,3 @@ async def init_db():
     """Create all tables."""
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
-
-
-async def get_session() -> AsyncSession:
-    """Get a database session (for dependency injection)."""
-    async with async_session() as session:
-        yield session

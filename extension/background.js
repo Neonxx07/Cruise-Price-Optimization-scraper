@@ -1,15 +1,11 @@
 // background.js — CruiseIntel Optimization v6.3
 // Traffic Cop: routes bookings, manages queue, owns the dedicated window.
-// Fixes: clearState preserves cache, getResumable/getAutoSaveCSV handlers added,
-//        handleOptimize creates safe new window, full log coverage, ghost-state reset.
 
-importScripts('calculator.js', 'adapter_espresso.js', 'adapter_ncl.js');
+importScripts('calculator.js', 'adapter_espresso.js', 'adapter_ncl.js', 'adapter_goccl.js');
 
 // ── State ──────────────────────────────────────────────────────
 let state = {
   running: false,
-  bookings: [],
-  index: 0,
   results: [],
   log: [],
   progress: { done: 0, total: 0, currentId: null },
@@ -21,6 +17,7 @@ const CACHE_TTL_MS = 12 * 60 * 60 * 1000;
 
 const BG_NCL_SEARCH_URL = 'https://seawebagents.ncl.com/tva/search/';
 const BG_ESPRESSO_URL = 'https://secure.cruisingpower.com/espresso/protected/reservations.do';
+const BG_GOCCL_SEARCH_URL = 'https://www.goccl.com/BookingEngine/BookingSearch/SearchForReservations.aspx';
 
 // ── Keep-alive (MV3 workers die after 5 min without this) ─────
 chrome.alarms.create('keepAlive', { periodInMinutes: 0.4 });
@@ -153,22 +150,7 @@ async function cacheNoSaving(cruiseLine, bookingId) {
   await chrome.storage.local.set({ [key]: { ts: Date.now() } });
 }
 
-// ── Resume / AutoSave ──────────────────────────────────────────
-async function saveResume(bookings, index, cruiseLine) {
-  await chrome.storage.local.set({
-    resumeBookings: bookings,
-    resumeIndex: index,
-    resumeTimestamp: Date.now(),
-    resumeCruiseLine: cruiseLine
-  });
-}
-
-async function clearResume() {
-  await chrome.storage.local.remove([
-    'resumeBookings', 'resumeIndex', 'resumeTimestamp', 'resumeCruiseLine'
-  ]);
-}
-
+// ── AutoSave ────────────────────────────────────────────────────
 async function autoSaveCSV() {
   if (!state.results.length) return;
   const header = 'Booking ID,Cruise Line,Status,Net Saving,Old Total,New Total,Category,New Category,Note,Lost Packages';
@@ -209,7 +191,11 @@ async function handleESPRESSOBooking(bookingId) {
     const sr = await runInPage(tabId, fn_espresso_search, bookingId);
     if (!sr?.ok) throw new Error('Search failed: ' + (sr?.error || 'unknown'));
     if (attemptNum === 0) _bgLog(bookingId, 'SEARCH', 'OK', '');
-    await waitForEl(tabId, '#sideBar, [id*="sideBar"]', 15000);
+    // Some bookings' search-result pages render the sidebar noticeably
+    // slower (observed recurring timeouts on real bookings at 15s while
+    // every other booking clears well under it) — 25s gives those room
+    // to load without meaningfully slowing down the normal case.
+    await waitForEl(tabId, '#sideBar, [id*="sideBar"]', 25000);
 
     const catInfo = await runInPage(tabId, fn_espresso_readCategory);
     if (catInfo?.priceCategory) priceCategory = catInfo.priceCategory;
@@ -240,6 +226,21 @@ async function handleESPRESSOBooking(bookingId) {
     if ((r.dataLength || 0) < 300) {
       const paidStatus = await runInPage(tabId, fn_espresso_checkPaidStatus);
       if (paidStatus?.isPaid) return { _paidInFull: true, oldTotal: paidStatus.totalPrice };
+
+      // A short/non-JSON response is what the portal returns when there's
+      // genuinely nothing to compare. Confirm that against the page's own
+      // displayed price — read only now, after the real allocate/reprice
+      // calls have actually run, never as a pre-emptive skip (an earlier
+      // version of this check ran before the API call and produced false
+      // "no change" verdicts, because the page hadn't updated yet at that
+      // point — masking real optimizations).
+      const topPrices = await runInPage(tabId, fn_espresso_readTopPrices);
+      if (topPrices?.currentPrice != null && topPrices?.allocationPrice != null &&
+          Math.abs(topPrices.currentPrice - topPrices.allocationPrice) < 0.01) {
+        _bgLog(bookingId, 'PRICE_CHECK', 'OK', `No change: $${topPrices.currentPrice} (confirmed via displayed price)`);
+        return { _noPriceChange: true, price: topPrices.currentPrice };
+      }
+
       throw new Error(`API returned only ${r.dataLength} chars — token likely expired`);
     }
 
@@ -256,6 +257,10 @@ async function handleESPRESSOBooking(bookingId) {
     _bgLog(bookingId, 'SKIP', 'INFO', '💳 Booking is fully paid');
     return makePaidInFullResult(bookingId, priceCategory, 'ESPRESSO', apiResult.oldTotal);
   }
+  if (apiResult?._noPriceChange) {
+    _bgLog(bookingId, 'SKIP', 'INFO', `Price unchanged ($${apiResult.price})`);
+    return makeNoPriceChangeResult(bookingId, priceCategory, 'ESPRESSO', apiResult.price);
+  }
 
   const result = calculateESPRESSO(apiResult.data, bookingId, priceCategory);
   _bgLog(bookingId, 'RESULT', result.status, `net=$${result.netSaving} | ${result.note}`);
@@ -264,17 +269,15 @@ async function handleESPRESSOBooking(bookingId) {
 }
 
 // ── Main batch loop ────────────────────────────────────────────
-async function runBatch(bookings, isSingle, startIndex = 0, cruiseLine = 'ESPRESSO') {
+async function runBatch(bookings, cruiseLine = 'ESPRESSO') {
   state.running = true;
-  state.bookings = bookings;
   state.cruiseLine = cruiseLine;
-  state.progress = { done: startIndex, total: bookings.length, currentId: null };
-  if (startIndex === 0) state.results = [];
+  state.progress = { done: 0, total: bookings.length, currentId: null };
+  state.results = [];
 
   await ensureDedicatedWindow();
-  await saveResume(bookings, startIndex, cruiseLine);
 
-  for (let i = startIndex; i < bookings.length; i++) {
+  for (let i = 0; i < bookings.length; i++) {
     if (!state.running) break;
     const bookingId = bookings[i];
     state.progress.currentId = bookingId;
@@ -291,7 +294,6 @@ async function runBatch(bookings, isSingle, startIndex = 0, cruiseLine = 'ESPRES
       state.results.push({ status: 'SKIPPED_TODAY', data: makeSkippedResult(bookingId, null, cruiseLine, hoursAgo) });
       state.progress.done = i + 1;
       await autoSaveCSV();
-      await saveResume(bookings, i + 1, cruiseLine);
       await sleep(10);
       continue;
     }
@@ -301,9 +303,9 @@ async function runBatch(bookings, isSingle, startIndex = 0, cruiseLine = 'ESPRES
     let result;
     try {
       const tabId = await getDedicatedTab();
-      result = cruiseLine === 'NCL'
-        ? await handleNCLBooking(bookingId, tabId)
-        : await handleESPRESSOBooking(bookingId);
+      if (cruiseLine === 'NCL') result = await handleNCLBooking(bookingId, tabId);
+      else if (cruiseLine === 'GOCCL') result = await handleGOCCLBooking(bookingId, tabId);
+      else result = await handleESPRESSOBooking(bookingId);
     } catch (e) {
       _bgLog(bookingId, 'ERROR', 'ERROR', e.message);
       result = makeErrorResult(bookingId, null, cruiseLine, e.message);
@@ -312,13 +314,11 @@ async function runBatch(bookings, isSingle, startIndex = 0, cruiseLine = 'ESPRES
     state.results.push({ status: result.status, data: result });
     state.progress.done = i + 1;
     await autoSaveCSV();
-    await saveResume(bookings, i + 1, cruiseLine);
     broadcastState();
     await sleep(500);
   }
 
   await closeDedicatedWindow();
-  await clearResume();
   state.running = false;
   state.progress.currentId = null;
   broadcastState();
@@ -331,7 +331,9 @@ async function handleOptimize(bookingId, cruiseLine, targetCategory) {
   _bgLog(bookingId, 'OPTIMIZE', 'INFO', `Opening ${cruiseLine} in new window...`);
   let newWinId = null;
   try {
-    const startUrl = cruiseLine === 'NCL' ? BG_NCL_SEARCH_URL : BG_ESPRESSO_URL;
+    const startUrl = cruiseLine === 'NCL' ? BG_NCL_SEARCH_URL
+      : cruiseLine === 'GOCCL' ? BG_GOCCL_SEARCH_URL
+      : BG_ESPRESSO_URL;
     const win = await chrome.windows.create({ url: startUrl, state: 'normal', type: 'normal', width: 1200, height: 800 });
     newWinId = win.id;
     const tabId = win.tabs?.[0]?.id;
@@ -354,11 +356,34 @@ async function handleOptimize(bookingId, cruiseLine, targetCategory) {
       } else {
         _bgLog(bookingId, 'OPTIMIZE', 'OK', 'NCL booking open — click Switch to Edit Mode to review');
       }
+    } else if (cruiseLine === 'GOCCL') {
+      await waitForEl(tabId, '#ctl00_DefaultContent_txtBookingNumber', 15000);
+      await runInPage(tabId, fn_goccl_search, bookingId);
+      await waitForEl(tabId, '#booked-root', 20000);
+      await runInPage(tabId, fn_goccl_openModifyBooking);
+      await sleep(800);
+      await runInPage(tabId, fn_goccl_openChangeOfferRate);
+      await waitForEl(tabId, "section.rate__container, div[class*='rate']", 15000);
+
+      if (targetCategory) {
+        // targetCategory carries the candidate OFFER CODE here — GoCCL's
+        // comparison axis is fare code, not category (category stays fixed).
+        const sel = await runInPage(tabId, fn_goccl_selectOfferAndContinue, targetCategory);
+        if (sel?.ok) {
+          await sleep(800);
+          await runInPage(tabId, fn_goccl_clickContinue);
+          _bgLog(bookingId, 'OPTIMIZE', 'OK', `GoCCL: offer code "${targetCategory}" selected — review the category table and click Keep Same Stateroom`);
+        } else {
+          _bgLog(bookingId, 'OPTIMIZE', 'WARN', `GoCCL: could not auto-select offer code "${targetCategory}" (${sel?.error || 'not found'}) — select it manually`);
+        }
+      } else {
+        _bgLog(bookingId, 'OPTIMIZE', 'OK', 'GoCCL offer-code comparison open — review and select manually');
+      }
     } else {
       // ESPRESSO
       await espresso_waitForLogin(tabId, bookingId);
       await runInPage(tabId, fn_espresso_search, bookingId);
-      await waitForEl(tabId, '#sideBar, [id*="sideBar"]', 15000);
+      await waitForEl(tabId, '#sideBar, [id*="sideBar"]', 25000);
       const catInfo = await runInPage(tabId, fn_espresso_readCategory);
       await runInPage(tabId, fn_espresso_clickCategories);
       await waitForEl(tabId, '#catAvailCategoryList, [id*="catAvail"]', 12000);
@@ -385,10 +410,8 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   }
 
   if (msg.action === 'startBatch') {
-    // If force=true (second click when stuck), reset ghost state
-    if (msg.force) { state.running = false; }
     if (state.running) { sendResponse({ ok: false, error: 'Already running' }); return true; }
-    runBatch(msg.bookings, msg.isSingle, 0, msg.cruiseLine || state.cruiseLine);
+    runBatch(msg.bookings, msg.cruiseLine || state.cruiseLine);
     sendResponse({ ok: true }); return true;
   }
 
@@ -397,17 +420,15 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     sendResponse({ ok: true }); return true;
   }
 
-  // FIX: clearState no longer wipes chrome.storage.local.clear() (that killed the smart cache)
-  // Only removes run-specific keys. Cache entries (cache_*) are preserved.
+  // clearState does not wipe chrome.storage.local.clear() (that would kill
+  // the smart cache) — only removes run-specific keys. Cache entries
+  // (cache_*) are preserved.
   if (msg.action === 'clearState') {
-    state.running = false;   // FIX: reset ghost running state
+    state.running = false;
     state.results = [];
     state.log = [];
     state.progress = { done: 0, total: 0, currentId: null };
-    chrome.storage.local.remove([
-      'autoSaveCSV', 'autoSaveTime',
-      'resumeBookings', 'resumeIndex', 'resumeTimestamp', 'resumeCruiseLine'
-    ]);
+    chrome.storage.local.remove(['autoSaveCSV', 'autoSaveTime']);
     broadcastState();
     sendResponse({ ok: true }); return true;
   }
@@ -427,19 +448,13 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     let url;
     if (msg.cruiseLine === 'NCL') {
       url = BG_NCL_SEARCH_URL;
+    } else if (msg.cruiseLine === 'GOCCL') {
+      url = BG_GOCCL_SEARCH_URL;
     } else {
       url = BG_ESPRESSO_URL + (bookingId ? `?reservationid=${bookingId}` : '');
     }
     chrome.windows.create({ url, state: 'normal', type: 'normal', width: 1200, height: 800 });
     sendResponse({ ok: true }); return true;
-  }
-
-  // FIX: these were missing — popup.js calls both of these
-  if (msg.action === 'getResumable') {
-    chrome.storage.local.get([
-      'resumeBookings', 'resumeIndex', 'resumeTimestamp', 'resumeCruiseLine'
-    ]).then(s => sendResponse(s));
-    return true;
   }
 
   if (msg.action === 'getAutoSaveCSV') {

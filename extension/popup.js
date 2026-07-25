@@ -17,7 +17,7 @@ function setProgress(done, total, running) {
   if (!total) { bar.className = 'progress'; return; }
   bar.className = 'progress show';
   document.getElementById('progFill').style.width = Math.round(done / total * 100) + '%';
-  document.getElementById('progFill').className = 'prog-fill' + (cruiseLine === 'NCL' ? ' ncl-mode' : '');
+  document.getElementById('progFill').className = 'prog-fill' + (cruiseLine === 'NCL' ? ' ncl-mode' : cruiseLine === 'GOCCL' ? ' goccl-mode' : '');
   document.getElementById('progText').textContent = running ? 'Checking...' : 'Done!';
   document.getElementById('progCount').textContent = done + ' / ' + total;
 }
@@ -31,7 +31,9 @@ function addCard(bookingId, status, data) {
   card.id = 'card_' + bookingId; card.className = 'card ' + status;
 
   const badges = { OPTIMIZATION: '✅ Optimization', TRAP: '⚠️ Trap', NO_SAVING: '⏭ No saving', ERROR: '❌ Error', WLT: '⏭ WLT', CHECKING: 'Checking', PAID_IN_FULL: '💳 Paid in Full', SKIPPED_TODAY: '⏩ Cached' };
-  const cl = (data?.cruiseLine || cruiseLine) === 'NCL' ? '<span class="ncl-badge">NCL</span>' : '';
+  const badgeCl = data?.cruiseLine || cruiseLine;
+  const cl = badgeCl === 'NCL' ? '<span class="ncl-badge">NCL</span>'
+    : badgeCl === 'GOCCL' ? '<span class="goccl-badge">GOCCL</span>' : '';
 
   if (status === 'CHECKING') {
     card.innerHTML = `<div class="card-top"><span class="card-id">${bookingId}${cl}</span><span class="card-badge">Checking</span></div><div class="card-saving"><span class="spinner"></span>Checking...</div>`;
@@ -113,6 +115,7 @@ function applyState(s) {
 
   document.getElementById('clEspresso').disabled = running;
   document.getElementById('clNCL').disabled = running;
+  document.getElementById('clGoccl').disabled = running;
   document.getElementById('clearBtn').disabled = running;
 
   renderAllCards(results); updateSummary(results);
@@ -135,12 +138,17 @@ function applyState(s) {
 }
 
 function updateCruiseLineUI(cl) {
-  cruiseLine = cl; const isNCL = cl === 'NCL';
-  document.getElementById('clEspresso').className = 'cl-btn espresso' + (isNCL ? '' : ' active');
+  cruiseLine = cl;
+  const isNCL = cl === 'NCL', isGoccl = cl === 'GOCCL';
+  document.getElementById('clEspresso').className = 'cl-btn espresso' + (!isNCL && !isGoccl ? ' active' : '');
   document.getElementById('clNCL').className = 'cl-btn ncl' + (isNCL ? ' active' : '');
-  document.getElementById('headerSub').textContent = isNCL ? 'Norwegian Cruise Line — SeaWeb' : 'ESPRESSO — Royal Caribbean & Celebrity';
-  document.getElementById('hintText').textContent = isNCL ? 'Must be logged into NCL SeaWeb before running' : 'Must be logged into ESPRESSO before running';
-  document.getElementById('runBtn').className = 'btn btn-run' + (isNCL ? ' ncl-mode' : '');
+  document.getElementById('clGoccl').className = 'cl-btn goccl' + (isGoccl ? ' active' : '');
+
+  const subs = { NCL: 'Norwegian Cruise Line — SeaWeb', GOCCL: 'GoCCL — Carnival Cruise Line', ESPRESSO: 'ESPRESSO — Royal Caribbean & Celebrity' };
+  const hints = { NCL: 'Must be logged into NCL SeaWeb before running', GOCCL: 'Must be logged into GoCCL Navigator before running', ESPRESSO: 'Must be logged into ESPRESSO before running' };
+  document.getElementById('headerSub').textContent = subs[cl] || subs.ESPRESSO;
+  document.getElementById('hintText').textContent = hints[cl] || hints.ESPRESSO;
+  document.getElementById('runBtn').className = 'btn btn-run' + (isNCL ? ' ncl-mode' : isGoccl ? ' goccl-mode' : '');
 }
 
 document.addEventListener('DOMContentLoaded', async () => {
@@ -149,12 +157,13 @@ document.addEventListener('DOMContentLoaded', async () => {
 
   document.getElementById('clEspresso').addEventListener('click', () => { updateCruiseLineUI('ESPRESSO'); chrome.runtime.sendMessage({ action: 'setCruiseLine', cruiseLine: 'ESPRESSO' }); });
   document.getElementById('clNCL').addEventListener('click', () => { updateCruiseLineUI('NCL'); chrome.runtime.sendMessage({ action: 'setCruiseLine', cruiseLine: 'NCL' }); });
+  document.getElementById('clGoccl').addEventListener('click', () => { updateCruiseLineUI('GOCCL'); chrome.runtime.sendMessage({ action: 'setCruiseLine', cruiseLine: 'GOCCL' }); });
   document.getElementById('bookingInput').addEventListener('input', () => { chrome.storage.session.set({ bookingInput: document.getElementById('bookingInput').value }); });
 
   document.getElementById('runBtn').addEventListener('click', () => {
     const bookings = parseBookings(document.getElementById('bookingInput').value);
     if (!bookings.length) return setStatus('Please enter at least one booking number.');
-    chrome.runtime.sendMessage({ action: 'startBatch', bookings, isSingle: bookings.length === 1, resumeFrom: 0, cruiseLine });
+    chrome.runtime.sendMessage({ action: 'startBatch', bookings, cruiseLine });
   });
 
   document.getElementById('stopBtn').addEventListener('click', () => {

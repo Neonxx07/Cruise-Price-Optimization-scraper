@@ -9,7 +9,7 @@
   .header-icon{font-size:22px;} .header h1{font-size:14px;font-weight:700;} .header p{font-size:11px;opacity:.75;margin-top:1px;}
   .cl-toggle{display:flex;gap:0;margin:10px 14px 0;border-radius:8px;overflow:hidden;border:1.5px solid #e2e8f0;}
   .cl-btn{flex:1;padding:7px 0;border:none;font-size:12px;font-weight:700;cursor:pointer;background:#f8fafc;color:#64748b;transition:all .15s;}
-  .cl-btn.active.espresso{background:#1d4ed8;color:white;} .cl-btn.active.ncl{background:#d4002a;color:white;}
+  .cl-btn.active.espresso{background:#1d4ed8;color:white;} .cl-btn.active.ncl{background:#d4002a;color:white;} .cl-btn.active.goccl{background:#f59e0b;color:white;}
   .cl-btn:hover:not(.active){background:#e2e8f0;}
   .body{padding:12px 14px;} .label{font-size:10px;font-weight:700;color:#64748b;text-transform:uppercase;letter-spacing:.5px;margin-bottom:5px;}
   textarea{width:100%;height:76px;border:1.5px solid #e2e8f0;border-radius:8px;padding:8px;font-size:12px;font-family:monospace;resize:none;background:white;color:#1e293b;}
@@ -17,13 +17,13 @@
   .hint{font-size:10px;color:#94a3b8;margin-top:4px;margin-bottom:10px;}
   .btn-row{display:flex;gap:8px;margin-bottom:10px;}
   .btn{flex:1;padding:9px;border:none;border-radius:8px;font-size:13px;font-weight:700;cursor:pointer;transition:all .15s;}
-  .btn-run{background:#1d4ed8;color:white;} .btn-run.ncl-mode{background:#d4002a;} .btn-run:hover:not(:disabled){opacity:.88;}
+  .btn-run{background:#1d4ed8;color:white;} .btn-run.ncl-mode{background:#d4002a;} .btn-run.goccl-mode{background:#f59e0b;} .btn-run:hover:not(:disabled){opacity:.88;}
   .btn-run:disabled{background:#93c5fd;cursor:not-allowed;} .btn-stop{background:#fee2e2;color:#dc2626;display:none;}
   .btn-stop.show{display:flex;align-items:center;justify-content:center;} .btn-stop:hover{background:#fecaca;}
   .progress{display:none;margin-bottom:9px;} .progress.show{display:block;}
   .prog-top{display:flex;justify-content:space-between;font-size:10px;color:#64748b;margin-bottom:4px;}
   .prog-bar{height:4px;background:#e2e8f0;border-radius:99px;overflow:hidden;}
-  .prog-fill{height:100%;background:#1d4ed8;border-radius:99px;width:0;transition:width .3s;} .prog-fill.ncl-mode{background:#d4002a;}
+  .prog-fill{height:100%;background:#1d4ed8;border-radius:99px;width:0;transition:width .3s;} .prog-fill.ncl-mode{background:#d4002a;} .prog-fill.goccl-mode{background:#f59e0b;}
   #results{display:flex;flex-direction:column;gap:7px;max-height:320px;overflow-y:auto;}
   .card{background:white;border-radius:9px;padding:10px 12px;border-left:4px solid #e2e8f0;box-shadow:0 1px 3px rgba(0,0,0,.06);animation:pop .2s ease;}
   @keyframes pop{from{opacity:0;transform:translateY(-3px)}to{opacity:1;transform:translateY(0)}}
@@ -39,8 +39,7 @@
   .card-saving{font-size:19px;font-weight:900;color:#10b981;} .TRAP .card-saving{color:#f59e0b;font-size:14px;}
   .NO_SAVING .card-saving,.WLT .card-saving,.SKIPPED_TODAY .card-saving{color:#94a3b8;font-size:13px;font-weight:600;}
   .ERROR .card-saving{color:#ef4444;font-size:11px;} .CHECKING .card-saving{color:#3b82f6;font-size:12px;} .PAID_IN_FULL .card-saving{color:#8b5cf6;font-size:12px;}
-  .card-prices,.card-fares{font-size:11px;color:#94a3b8;margin-top:2px;}
-  .gained{color:#10b981;} .lost{color:#ef4444;} .re-addable{color:#0e7490;font-weight:600;}
+  .card-prices{font-size:11px;color:#94a3b8;margin-top:2px;}
   .conf-row{margin-top:5px;margin-bottom:2px;display:flex;flex-direction:column;gap:2px;}
   .conf-stars{display:inline-flex;align-items:center;gap:5px;font-size:12px;padding:2px 8px;border-radius:5px;font-weight:700;width:fit-content;}
   .card-pkg-loss{font-size:11px;margin-top:5px;padding:5px 8px;background:#fff7ed;border:1px solid #fed7aa;border-radius:5px;color:#9a3412;}
@@ -54,6 +53,7 @@
   .view-btn:hover{background:#f1f5f9;}
   .copy-btn{font-size:11px;padding:4px 10px;background:#1d4ed8;color:white;border:none;border-radius:5px;cursor:pointer;white-space:nowrap;flex-shrink:0;}
   .ncl-badge{background:#fee2e2;color:#991b1b;font-size:9px;padding:1px 4px;border-radius:3px;margin-left:4px;}
+  .goccl-badge{background:#fef3c7;color:#92400e;font-size:9px;padding:1px 4px;border-radius:3px;margin-left:4px;}
   .spinner{display:inline-block;width:11px;height:11px;border:2px solid #3b82f6;border-top-color:transparent;border-radius:50%;animation:spin .6s linear infinite;vertical-align:middle;margin-right:4px;}
   #summary{display:none;margin-top:9px;background:white;border-radius:9px;padding:10px 14px;border:1.5px solid #e2e8f0;} #summary.show{display:block;}
   .sum-grid{display:grid;grid-template-columns:repeat(5,1fr);text-align:center;gap:4px;margin-bottom:7px;}
@@ -79,6 +79,7 @@
 <div class="cl-toggle">
   <button class="cl-btn active espresso" id="clEspresso">🏴 ESPRESSO (RCL / Celebrity)</button>
   <button class="cl-btn ncl" id="clNCL">🇳🇴 Norwegian (NCL)</button>
+  <button class="cl-btn goccl" id="clGoccl">🎪 GoCCL (Carnival)</button>
 </div>
 
 <div class="body">

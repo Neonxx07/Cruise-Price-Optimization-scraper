@@ -56,6 +56,9 @@ class BookingQueueManager:
     def is_running(self) -> bool:
         return self._running
 
+    def has_live_session(self, cruise_line: CruiseLine) -> bool:
+        return self._service.has_live_session(cruise_line)
+
     def get_snapshot(self) -> QueueSnapshot:
         items = list(self._queue)
         queued = sum(1 for item in items if item.status == QueueStatus.QUEUED)
@@ -97,6 +100,17 @@ class BookingQueueManager:
     async def initialize(self) -> None:
         await init_db()
 
+    async def check_login(self, cruise_line: CruiseLine, timeout_minutes: float = 15.0) -> bool:
+        """Log in via the shared, continuous browser session (see
+        BookingService.check_login) — the same instance stays open for
+        start_processing to reuse afterward."""
+        await self.initialize()
+        return await self._service.check_login(cruise_line, timeout_minutes=timeout_minutes)
+
+    async def close_live_session(self) -> None:
+        """Close the shared browser session, if one is open. Call on app exit."""
+        await self._service.close_live_scraper()
+
     async def start_processing(
         self,
         cruise_line: CruiseLine,
@@ -105,6 +119,8 @@ class BookingQueueManager:
         raw_dump_dir: str | None = None,
         force_live_recheck: bool = False,
         capture_market_data: bool = False,
+        capture_everything: bool = False,
+        on_action: Callable[[dict], None] | None = None,
     ) -> None:
         if self._running:
             raise RuntimeError("Scan queue is already running")
@@ -125,6 +141,11 @@ class BookingQueueManager:
             bypass_cache=force_live_recheck,
             raw_dump_dir=raw_dump_dir,
             capture_market_data=capture_market_data,
+            capture_everything=capture_everything,
+            on_action=on_action,
+            # The GUI keeps one continuous browser session alive across
+            # login + every scan — see BookingService.get_or_create_scraper.
+            keep_browser_open=True,
         )
         self._current_job_id = self._job.job_id
         self._on_state_change = on_state_change

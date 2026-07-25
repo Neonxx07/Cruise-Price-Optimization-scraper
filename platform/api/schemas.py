@@ -15,7 +15,7 @@ class ScanRequest(BaseModel):
     """Request to start a batch scan."""
 
     booking_ids: list[str] = Field(..., min_length=1, max_length=100)
-    cruise_line: str = Field(default="ESPRESSO", pattern="^(ESPRESSO|NCL)$")
+    cruise_line: str = Field(default="ESPRESSO", pattern="^(ESPRESSO|NCL|GOCCL)$")
 
 
 class StopScanRequest(BaseModel):

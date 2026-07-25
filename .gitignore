@@ -21,6 +21,12 @@ env/
 *.jsonl
 /platform/data/
 
+# Scan output / reports
+*.csv
+*.xlsx
+/platform/reports/
+/platform/watchlist.txt
+
 # Logs
 logs/
 *.log
@@ -47,3 +53,6 @@ platform/browser-profile/
 # Coverage
 htmlcov/
 .coverage
+
+# Claude Code local runtime state (session locks, not project source)
+.claude/scheduled_tasks.lock

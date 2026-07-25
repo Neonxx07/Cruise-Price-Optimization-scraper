@@ -239,12 +239,15 @@ class NclScraper(BaseScraper):
         try:
             # Step 1: Navigate
             logger.info("ncl.navigate", booking_id=booking_id)
+            self.log_action("navigate", booking_id=booking_id, url=settings.ncl_search_url)
             await self.navigate(settings.ncl_search_url)
             await self.wait_for("#SWXMLForm_SearchReservation_ResID", timeout=15000)
 
             # Step 2: Search
             logger.info("ncl.search", booking_id=booking_id)
+            self.log_action("search_booking", booking_id=booking_id)
             await self._search_booking(booking_id)
+            await self.dump_page_snapshot(booking_id, "after_search")
 
             try:
                 await self.wait_for(
@@ -279,17 +282,24 @@ class NclScraper(BaseScraper):
             old_total = preload.get("invoiceTotal", 0)
             current_promos = preload.get("currentPromos", "")
             logger.info("ncl.booking_info", booking_id=booking_id, category=current_category, total=old_total)
+            self.log_action(
+                "booking_info", booking_id=booking_id, category=current_category, old_total=old_total,
+            )
+            await self.dump_page_snapshot(booking_id, "booking_summary")
 
             # Step 4: Scrape addons
             addons = await self._scrape_addons()
             logger.info("ncl.addons", booking_id=booking_id, count=len(addons))
+            self.log_action("scrape_addons", booking_id=booking_id, count=len(addons))
 
             # Step 5: Enter edit mode (LOCKS booking for 30 min)
             in_edit_mode = await self._switch_to_edit_mode()
             logger.info("ncl.edit_mode", booking_id=booking_id, locked=in_edit_mode)
+            self.log_action("edit_mode", booking_id=booking_id, locked=in_edit_mode)
 
             # Step 6: Category tab
             await self._click_category_tab()
+            await self.dump_page_snapshot(booking_id, "categories_table")
 
             # Step 7: Read categories
             cat_data = await self._read_category_data()
@@ -341,13 +351,16 @@ class NclScraper(BaseScraper):
             )
             result.new_price_category = target["category"]
             logger.info("ncl.result", booking_id=booking_id, status=result.status.value, net=result.net_saving)
+            self.log_action("result", booking_id=booking_id, status=result.status.value, net_saving=result.net_saving)
             return result
 
         except Exception as e:
             logger.error("ncl.error", booking_id=booking_id, error=str(e))
+            self.log_action("error", booking_id=booking_id, error=str(e))
             return make_error_result(booking_id, current_category, CruiseLine.NCL, str(e))
 
         finally:
             # ALWAYS UNLOCK — even on success, error, and exception
             if in_edit_mode:
                 await self._cancel_edit()
+                self.log_action("cancel_edit", booking_id=booking_id)

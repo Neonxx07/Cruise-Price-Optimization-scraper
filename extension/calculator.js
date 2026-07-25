@@ -57,6 +57,10 @@ function nclAddonValue(addonName) {
 const READDABLE_PATTERNS = [/email/i, /bonus/i, /promo/i, /loyalty/i, /coupon/i];
 function isReAddable(fareName) { return READDABLE_PATTERNS.some(p => p.test(fareName)); }
 
+// Minimum ratio of (price drop) to (OBC lost) before a repricing that
+// forfeits OBC is treated as a genuine optimization rather than a wash.
+const OBC_LOSS_MIN_RATIO = 3;
+
 function calcConfidence(oldItems, newItems, net, oldTotal, lostPkgValue, obcChange) {
   try {
     const oc = espressoGetCruiseFare(oldItems);
@@ -116,7 +120,19 @@ function calculateESPRESSO(raw, bookingId, priceCategory) {
 
     const reAddNote = reAddableFares.length ? ' — re-add: ' + reAddableFares.join(', ') : '';
     let status, note;
-    if (net > 0) { status = 'OPTIMIZATION'; note = 'optimized $' + Math.round(net) + reAddNote; }
+    if (net > 0 && lostPkgValue > 0 && net < lostPkgValue) {
+      // Net saving is positive on paper, but it's smaller than the value
+      // of a package being given up to get it — not a real optimization.
+      status = 'TRAP';
+      note = 'trap - losing $' + Math.round(lostPkgValue) + ' perk for only $' + Math.round(net) + ' net' + reAddNote;
+    } else if (net > 0 && obcChange < 0 && priceDrop < Math.abs(obcChange) * OBC_LOSS_MIN_RATIO) {
+      // Net is positive on paper, but a chunk of it is OBC being
+      // forfeited rather than a real fare reduction — only worth
+      // recommending once the price drop clears the OBC lost by
+      // OBC_LOSS_MIN_RATIO.
+      status = 'NO_SAVING';
+      note = 'no saving — $' + Math.round(priceDrop) + ' drop costs $' + Math.round(Math.abs(obcChange)) + ' OBC (need ' + OBC_LOSS_MIN_RATIO + 'x)' + reAddNote;
+    } else if (net > 0) { status = 'OPTIMIZATION'; note = 'optimized $' + Math.round(net) + reAddNote; }
     else if (priceDrop > 0 && net <= 0) { status = 'TRAP'; note = 'trap - do not reprice' + reAddNote; }
     else { status = 'NO_SAVING'; note = 'no saving' + (reAddableFares.length ? ' — can re-add: ' + reAddableFares.join(', ') : ''); }
 
@@ -176,7 +192,60 @@ function calculateNCL(bookingId, priceCategory, invoiceTotal, newResTotal, addon
   } catch (e) { return { cruiseLine: 'NCL', status: 'ERROR', error: e.message, bookingId, priceCategory }; }
 }
 
+// GoCCL's automatic discovery only reads the offer-code comparison screen
+// (average-per-person prices by stateroom type) — never the confirmed,
+// per-category GROSS AMOUNT that only appears after a human-reviewed
+// preview click-through. So unlike ESPRESSO/NCL, this can only surface an
+// UNCONFIRMED candidate offer code, capped at 1-star confidence.
+const GOCCL_CANDIDATE_CONFIDENCE = 1;
+
+function calculateGOCCL(bookingId, priceCategory, currentStateroomType, currentOfferCode, currentPriceGross, availableOfferCodes, guestsCount) {
+  try {
+    guestsCount = guestsCount || 2;
+    const candidates = (availableOfferCodes || []).filter(o =>
+      o.stateroomType === currentStateroomType &&
+      o.offerCode !== currentOfferCode &&
+      safeFloat(o.pricePerPerson) > 0
+    );
+
+    const oldTotal = round2(currentPriceGross);
+
+    if (!candidates.length) {
+      return {
+        cruiseLine: 'GOCCL', status: 'NO_SAVING',
+        note: `no saving — no cheaper offer code found for ${currentStateroomType}`,
+        bookingId, priceCategory, oldTotal, newTotal: oldTotal, priceDrop: 0, obcChange: 0, netSaving: 0,
+        lostFares: [], gainedFares: [], reAddableFares: [], lostPkgNames: [], lostPkgValue: 0, confidence: 0, error: null
+      };
+    }
+
+    const cheapest = candidates.reduce((a, b) => safeFloat(a.pricePerPerson) <= safeFloat(b.pricePerPerson) ? a : b);
+    const newTotal = round2(safeFloat(cheapest.pricePerPerson) * guestsCount);
+    const priceDrop = round2(oldTotal - newTotal);
+
+    if (priceDrop <= 0) {
+      return {
+        cruiseLine: 'GOCCL', status: 'NO_SAVING',
+        note: "no saving — cheapest candidate offer code isn't actually lower once guest count is applied",
+        bookingId, priceCategory, oldTotal, newTotal, priceDrop: 0, obcChange: 0, netSaving: 0,
+        lostFares: [], gainedFares: [], reAddableFares: [], lostPkgNames: [], lostPkgValue: 0, confidence: 0, error: null
+      };
+    }
+
+    return {
+      cruiseLine: 'GOCCL', status: 'OPTIMIZATION',
+      note: `candidate $${Math.round(priceDrop)} — offer code '${cheapest.offerCode || ''}' (${cheapest.offerName || ''}) — UNCONFIRMED, preview before repricing`,
+      bookingId, priceCategory, oldTotal, newTotal, priceDrop, obcChange: 0, netSaving: priceDrop,
+      lostFares: [], gainedFares: [], reAddableFares: [], lostPkgNames: [], lostPkgValue: 0,
+      confidence: GOCCL_CANDIDATE_CONFIDENCE, oldCruiseFare: 0, newCruiseFare: 0, fareChangePct: 0, error: null
+    };
+  } catch (e) { return { cruiseLine: 'GOCCL', status: 'ERROR', error: e.message, bookingId, priceCategory }; }
+}
+
 function makeWLTResult(bookingId, priceCategory, cruiseLine) { return { cruiseLine, status: 'WLT', note: 'WLT - waitlisted', bookingId, priceCategory, netSaving: 0, oldTotal: 0, newTotal: 0, priceDrop: 0, obcChange: 0, lostFares: [], gainedFares: [], reAddableFares: [], lostPkgNames: [], lostPkgValue: 0, confidence: 0, error: null }; }
 function makePaidInFullResult(bookingId, priceCategory, cruiseLine, oldTotal) { return { cruiseLine, status: 'PAID_IN_FULL', note: '💳 Fully paid — repricing unavailable', bookingId, priceCategory, oldTotal: oldTotal || 0, newTotal: 0, priceDrop: 0, obcChange: 0, netSaving: 0, lostFares: [], gainedFares: [], reAddableFares: [], lostPkgNames: [], lostPkgValue: 0, confidence: 0, error: null }; }
+// Confirmed via the page's own displayed price (not the reprice-modal
+// API, which returns a short/non-JSON body in exactly this scenario).
+function makeNoPriceChangeResult(bookingId, priceCategory, cruiseLine, price) { const p = Number(price) || 0; return { cruiseLine, status: 'NO_SAVING', note: `no saving — price unchanged ($${p.toFixed(2)})`, bookingId, priceCategory, oldTotal: p, newTotal: p, priceDrop: 0, obcChange: 0, netSaving: 0, lostFares: [], gainedFares: [], reAddableFares: [], lostPkgNames: [], lostPkgValue: 0, confidence: 0, error: null }; }
 function makeSkippedResult(bookingId, priceCategory, cruiseLine, checkedHoursAgo) { const h = Math.round(checkedHoursAgo * 10) / 10; return { cruiseLine, status: 'SKIPPED_TODAY', note: `Checked ${h}h ago — no saving cached`, bookingId, priceCategory, oldTotal: 0, newTotal: 0, priceDrop: 0, obcChange: 0, netSaving: 0, lostFares: [], gainedFares: [], reAddableFares: [], lostPkgNames: [], lostPkgValue: 0, confidence: 0, error: null }; }
 function makeErrorResult(bookingId, priceCategory, cruiseLine, errorMsg) { return { cruiseLine, status: 'ERROR', note: errorMsg, error: errorMsg, bookingId, priceCategory, oldTotal: 0, newTotal: 0, priceDrop: 0, obcChange: 0, netSaving: 0, lostFares: [], gainedFares: [], reAddableFares: [], lostPkgNames: [], lostPkgValue: 0, confidence: 0 }; }

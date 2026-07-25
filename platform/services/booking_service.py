@@ -8,9 +8,10 @@ from __future__ import annotations
 
 import asyncio
 import random
+import time
 import uuid
 from datetime import datetime
-from typing import AsyncGenerator, Callable
+from typing import Callable
 
 from sqlalchemy import select
 
@@ -20,6 +21,7 @@ from core.models import BookingResult, BookingStatus, CruiseLine, ScanJob, ScanJ
 from models.database import BookingRecord, MarketDataRecord, PriceHistory, ScanJobRecord, async_session
 from scraper.base import BaseScraper
 from scraper.espresso import EspressoScraper
+from scraper.goccl import GoCCLScraper
 from scraper.ncl import NclScraper
 from services.cache_service import CacheService
 from utils.logging import get_logger
@@ -37,12 +39,98 @@ class BookingService:
         self.cache = CacheService()
         self._active_jobs: dict[str, ScanJob] = {}
         self._stop_flags: dict[str, bool] = {}
+        # A single long-lived scraper/browser, reused across "Check login"
+        # and every scan in the same app session (see get_or_create_scraper).
+        # Replaying saved session cookies into a brand-new browser process
+        # is exactly the pattern ESPRESSO's bot-detection (Akamai) flags —
+        # keeping one continuous instance from login through every scan
+        # avoids that entirely, matching the one run that worked end to end.
+        self._live_scraper: BaseScraper | None = None
 
     def _get_scraper(self, cruise_line: CruiseLine) -> BaseScraper:
         """Factory: get the right scraper for the cruise line."""
         if cruise_line == CruiseLine.NCL:
             return NclScraper()
+        if cruise_line == CruiseLine.GOCCL:
+            return GoCCLScraper()
         return EspressoScraper()
+
+    @staticmethod
+    def _is_dead_browser_error(exc: Exception) -> bool:
+        """Whether an exception means the underlying Playwright browser/
+        context/page died mid-scrape (as opposed to a normal portal-level
+        failure like a bad selector or a real API error). Seen in practice
+        as e.g. "Page.goto: Target page, context or browser has been
+        closed" — reusing the same scraper for the next booking would just
+        fail identically every time, so this is the signal to restart it."""
+        msg = str(exc).lower()
+        return "has been closed" in msg or "target closed" in msg
+
+    def has_live_session(self, cruise_line: CruiseLine) -> bool:
+        """Whether a browser session is already open for this cruise line
+        (i.e. check_login has run) — Start should require this, since
+        starting one fresh would fall back to a hidden headless browser
+        with whatever stale session is on disk."""
+        return self._live_scraper is not None and self._live_scraper.cruise_line == cruise_line
+
+    @staticmethod
+    def _login_base_url(cruise_line: CruiseLine) -> str:
+        """Where to land a fresh browser session for a manual login check."""
+        if cruise_line == CruiseLine.NCL:
+            return settings.ncl_search_url
+        if cruise_line == CruiseLine.GOCCL:
+            return settings.goccl_search_url
+        return settings.espresso_home_url
+
+    async def get_or_create_scraper(self, cruise_line: CruiseLine, headless: bool | None = None) -> BaseScraper:
+        """Get the live, already-open scraper for this cruise line, or start
+        a new one if none is open yet (or the cruise line changed)."""
+        if self._live_scraper is not None:
+            if self._live_scraper.cruise_line == cruise_line:
+                return self._live_scraper
+            await self._live_scraper.stop()
+            self._live_scraper = None
+
+        scraper = self._get_scraper(cruise_line)
+        await scraper.start(headless=headless)
+        self._live_scraper = scraper
+        return scraper
+
+    async def close_live_scraper(self) -> None:
+        """Close the live browser session, if one is open — saves the
+        final session state. Call this on app shutdown."""
+        if self._live_scraper is not None:
+            await self._live_scraper.stop()
+            self._live_scraper = None
+
+    async def check_login(
+        self, cruise_line: CruiseLine, timeout_minutes: float = 15.0,
+    ) -> bool:
+        """
+        Open (or reuse) the live browser, visibly, and wait for the user to
+        log in. The same browser instance stays open afterward for
+        start_scan to reuse — never closed and reopened, since that's what
+        triggers the bot-detection replay flag.
+        """
+        scraper = await self.get_or_create_scraper(cruise_line, headless=False)
+        base_url = self._login_base_url(cruise_line)
+        await scraper.navigate(base_url)
+
+        deadline = time.monotonic() + timeout_minutes * 60
+        poll_s = 5
+        while time.monotonic() < deadline:
+            await asyncio.sleep(poll_s)
+            if cruise_line in (CruiseLine.NCL, CruiseLine.GOCCL):
+                logged_in = "login" not in scraper.page.url.lower() and "signin" not in scraper.page.url.lower()
+            else:
+                logged_in = await scraper._check_login()
+            if logged_in:
+                logger.info("login_check.success", cruise_line=cruise_line.value)
+                return True
+            logger.info("login_check.waiting", cruise_line=cruise_line.value)
+
+        logger.warning("login_check.timeout", cruise_line=cruise_line.value)
+        return False
 
     async def start_scan(
         self,
@@ -52,6 +140,9 @@ class BookingService:
         bypass_cache: bool = False,
         raw_dump_dir: str | None = None,
         capture_market_data: bool = False,
+        capture_everything: bool = False,
+        on_action: Callable[[dict], None] | None = None,
+        keep_browser_open: bool = False,
     ) -> ScanJob:
         """
         Start a batch scan of booking IDs.
@@ -65,6 +156,17 @@ class BookingService:
                 point is to re-check the same bookings over time).
             raw_dump_dir: If set, append each booking's raw API response to
                 raw_dump_dir/raw_responses.jsonl for later offline analysis.
+            capture_everything: If True, also capture full page HTML +
+                structured extraction and all network traffic to
+                raw_dump_dir, and record a step-by-step action log to
+                raw_dump_dir/actions.jsonl.
+            on_action: Optional callback invoked with each action-log entry
+                as it happens (used by the GUI to show a live activity log).
+            keep_browser_open: If True, reuse the live scraper (from
+                get_or_create_scraper/check_login) and leave it open when
+                the batch finishes, instead of starting a fresh browser and
+                closing it — used by the GUI so login and every scan share
+                one continuous session. CLI one-shot runs leave this False.
 
         Returns:
             ScanJob with results populated as they complete.
@@ -85,7 +187,10 @@ class BookingService:
         await self._save_job_to_db(job)
 
         # Run in background
-        asyncio.create_task(self._run_batch(job, on_progress, bypass_cache, raw_dump_dir, capture_market_data))
+        asyncio.create_task(self._run_batch(
+            job, on_progress, bypass_cache, raw_dump_dir, capture_market_data,
+            capture_everything, on_action, keep_browser_open,
+        ))
 
         return job
 
@@ -96,15 +201,24 @@ class BookingService:
         bypass_cache: bool = False,
         raw_dump_dir: str | None = None,
         capture_market_data: bool = False,
+        capture_everything: bool = False,
+        on_action: Callable[[dict], None] | None = None,
+        keep_browser_open: bool = False,
     ) -> None:
         """Execute the batch scan."""
-        scraper = self._get_scraper(job.cruise_line)
+        if keep_browser_open:
+            scraper = await self.get_or_create_scraper(job.cruise_line)
+        else:
+            scraper = self._get_scraper(job.cruise_line)
         scraper.raw_dump_dir = raw_dump_dir
+        scraper.capture_everything = capture_everything
+        scraper.on_action = on_action
 
         consecutive_failures = 0
 
         try:
-            await scraper.start()
+            if not keep_browser_open:
+                await scraper.start()
 
             for i, booking_id in enumerate(job.booking_ids):
                 if self._stop_flags.get(job.job_id):
@@ -135,6 +249,23 @@ class BookingService:
                 except Exception as e:
                     logger.error("batch.error", booking_id=booking_id, error=str(e))
                     result = make_error_result(booking_id, None, job.cruise_line, str(e))
+
+                    if self._is_dead_browser_error(e):
+                        logger.warning("batch.browser_dead_restarting", booking_id=booking_id)
+                        try:
+                            await scraper.stop()
+                        except Exception:
+                            pass
+                        scraper = self._get_scraper(job.cruise_line)
+                        scraper.raw_dump_dir = raw_dump_dir
+                        scraper.capture_everything = capture_everything
+                        scraper.on_action = on_action
+                        try:
+                            await scraper.start()
+                            if keep_browser_open:
+                                self._live_scraper = scraper
+                        except Exception as restart_error:
+                            logger.error("batch.browser_restart_failed", error=str(restart_error))
 
                 if capture_market_data and scraper.last_market_data:
                     await self._save_market_data_to_db(result, scraper.last_market_data)
@@ -182,9 +313,15 @@ class BookingService:
         except Exception as e:
             logger.error("batch.fatal", job_id=job.job_id, error=str(e))
             job.status = ScanJobStatus.FAILED
+            if keep_browser_open:
+                # The live session may be in a broken state after a fatal
+                # error — drop it so the next scan starts a clean one
+                # rather than silently reusing something broken.
+                await self.close_live_scraper()
 
         finally:
-            await scraper.stop()
+            if not keep_browser_open:
+                await scraper.stop()
             job.completed_at = datetime.utcnow()
             job.current_booking_id = None
             await self._update_job_in_db(job)
@@ -291,14 +428,20 @@ class BookingService:
             await session.commit()
 
     async def _save_market_data_to_db(self, result: BookingResult, market_data: dict) -> None:
-        """Persist read-only ESPRESSO market/category snapshot data."""
+        """Persist read-only market/category snapshot data."""
         import json
+
+        capture_types = {
+            CruiseLine.ESPRESSO: "espresso_category_table",
+            CruiseLine.NCL: "ncl_category_table",
+            CruiseLine.GOCCL: "goccl_offer_code_comparison",
+        }
 
         async with async_session() as session:
             session.add(MarketDataRecord(
                 booking_id=result.booking_id,
                 cruise_line=result.cruise_line.value,
-                capture_type="espresso_category_table",
+                capture_type=capture_types.get(result.cruise_line, "category_table"),
                 current_category=market_data.get("currentCategory"),
                 execution_token=market_data.get("executionToken"),
                 selection_json=market_data.get("selectionJSON"),

@@ -33,7 +33,6 @@ from qasync import asyncSlot
 from core.models import BookingResult, CruiseLine
 from gui.queue_manager import BookingQueueManager, QueueStatus
 from gui.scan_adapter import GuiScanAdapter
-from main import _run_login_check
 
 
 class MainWindow(QMainWindow):
@@ -45,10 +44,29 @@ class MainWindow(QMainWindow):
         self.adapter = GuiScanAdapter()
         self.queue_manager = BookingQueueManager()
         self.results: list[BookingResult] = []
+        self._shutting_down = False
 
         self._build_ui()
         self._refresh_summary()
         self._update_queue_view(self.queue_manager.get_snapshot())
+
+    def closeEvent(self, event) -> None:
+        """Close the live browser session (saving its final state) before
+        the app actually exits, instead of leaving it dangling."""
+        if self._shutting_down:
+            event.accept()
+            return
+        event.ignore()
+        self._shutting_down = True
+        self.status_label.setText("Closing browser session...")
+        asyncio.ensure_future(self._shutdown_and_close())
+
+    async def _shutdown_and_close(self) -> None:
+        try:
+            await self.queue_manager.close_live_session()
+        except Exception:
+            traceback.print_exc()
+        QApplication.instance().quit()
 
     def _build_ui(self) -> None:
         container = QWidget()
@@ -114,18 +132,34 @@ class MainWindow(QMainWindow):
         self.force_recheck_checkbox = QCheckBox("Force live recheck")
         queue_layout.addWidget(self.force_recheck_checkbox, 2, 0, 1, 2)
 
-        self.capture_market_data_checkbox = QCheckBox("Collect market data (ESPRESSO category snapshot)")
+        self.capture_market_data_checkbox = QCheckBox("Collect market data (category/offer-code snapshot)")
         self.capture_market_data_checkbox.setChecked(True)
         self.capture_market_data_checkbox.setToolTip(
-            "Store the ESPRESSO category table snapshot in the database for later analysis."
+            "Store the category/offer-code table snapshot (ESPRESSO category table, "
+            "NCL category grid, or GoCCL offer-code comparison) in the database for later analysis."
         )
         queue_layout.addWidget(self.capture_market_data_checkbox, 3, 0, 1, 2)
+
+        self.capture_everything_checkbox = QCheckBox("Capture everything (full page HTML + network traffic)")
+        self.capture_everything_checkbox.setToolTip(
+            "For every page visited: save the full HTML, a best-effort structured extraction "
+            "(tables + label/value pairs), and every network request/response — all read-only, "
+            "written under data/pages/ and data/network_traffic.jsonl. Increases scan time and disk use."
+        )
+        queue_layout.addWidget(self.capture_everything_checkbox, 4, 0, 1, 2)
 
         self.clear_queue_button = QPushButton("Clear queue")
         self.clear_queue_button.clicked.connect(self._on_clear_queue)
         queue_layout.addWidget(self.clear_queue_button, 2, 2)
 
         layout.addLayout(queue_layout)
+
+        layout.addWidget(QLabel("Activity log (every automated browser action):"))
+        self.activity_log = QTextEdit()
+        self.activity_log.setReadOnly(True)
+        self.activity_log.setFixedHeight(120)
+        self.activity_log.setStyleSheet("font-family: Consolas, monospace; font-size: 11px;")
+        layout.addWidget(self.activity_log)
 
         self.queue_status_label = QLabel("0 pending, 0 running")
         self.queue_status_label.setStyleSheet("font-weight: bold;")
@@ -163,7 +197,12 @@ class MainWindow(QMainWindow):
         total = len(self.results)
         optimizations = sum(1 for r in self.results if r.status.value == "OPTIMIZATION")
         traps = sum(1 for r in self.results if r.status.value == "TRAP")
-        savings = sum(r.net_saving for r in self.results)
+        # Only OPTIMIZATION rows represent savings actually recommended.
+        # NO_SAVING rows carry a negative net_saving to mean "repricing
+        # would cost more, so we didn't recommend it" — summing those in
+        # would make "Total savings" go deeply negative even when real
+        # optimizations were found. Matches the CLI's own summary (main.py).
+        savings = sum(r.net_saving for r in self.results if r.status.value == "OPTIMIZATION")
         summary_text = (
             f"Bookings watched: {total}   "
             f"Optimizations: {optimizations}   "
@@ -191,23 +230,38 @@ class MainWindow(QMainWindow):
         self.login_status_label.setText("Login status: checking...")
         QApplication.processEvents()
 
-        args = type(
-            "Args",
-            (),
-            {"cruise_line": "ESPRESSO", "timeout_minutes": 15.0, "headless": False},
-        )
+        # Login and scanning now share one live browser page — running
+        # both at once would mean two coroutines driving the same
+        # Playwright Page concurrently, so Start is blocked until this
+        # finishes (mirrors the existing login_button lock during scans).
+        self.login_button.setEnabled(False)
+        self.start_button.setEnabled(False)
+
+        cruise_line = CruiseLine(self.cruise_line_selector.currentText())
         try:
-            print("GUI: calling _run_login_check")
-            await _run_login_check(args)
-            print("GUI: _run_login_check returned successfully")
-            self.login_status_label.setText("Login status: last checked OK")
-            self.status_label.setText("Login check complete.")
+            print("GUI: calling queue_manager.check_login")
+            # Uses the same shared browser session that Start will reuse —
+            # this window never closes and reopens the browser between
+            # login and scanning (see get_or_create_scraper), which is
+            # what avoids ESPRESSO's bot-detection flagging replayed
+            # session cookies in a fresh browser instance.
+            logged_in = await self.queue_manager.check_login(cruise_line, timeout_minutes=15.0)
+            print("GUI: queue_manager.check_login returned", logged_in)
+            if logged_in:
+                self.login_status_label.setText("Login status: last checked OK")
+                self.status_label.setText("Login check complete — browser stays open for scanning.")
+            else:
+                self.login_status_label.setText("Login status: timed out")
+                self.status_label.setText("Login check timed out — please try again.")
         except Exception as exc:
             print("GUI: _on_login_check exception:", exc)
             traceback.print_exc()
             self.login_status_label.setText("Login status: failed")
             self.status_label.setText(f"Login check failed: {exc}")
             QMessageBox.warning(self, "Login failed", str(exc))
+        finally:
+            self.login_button.setEnabled(True)
+            self.start_button.setEnabled(True)
 
     @Slot()
     def _add_bulk(self) -> None:
@@ -246,6 +300,19 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "No bookings", "Add at least one booking ID before starting the queue.")
             return
 
+        cruise_line_check = CruiseLine(self.cruise_line_selector.currentText())
+        if not self.queue_manager.has_live_session(cruise_line_check):
+            # Starting without a live session would fall back to a hidden
+            # headless browser reusing whatever stale session is on disk —
+            # exactly the failure mode this whole redesign exists to avoid.
+            QMessageBox.warning(
+                self, "Not logged in",
+                "Click \"Check login\" first and complete the login in the browser "
+                "window that opens, then click Start. Starting a scan without an "
+                "active login session runs it hidden in the background and will fail.",
+            )
+            return
+
         self.start_button.setEnabled(False)
         self.stop_button.setEnabled(True)
         self.clear_queue_button.setEnabled(False)
@@ -253,11 +320,18 @@ class MainWindow(QMainWindow):
         self.add_bulk_button.setEnabled(False)
         self.booking_input.setEnabled(False)
         self.bulk_input.setEnabled(False)
+        # Running "Check login" while a scan is active opens a second,
+        # separate browser session — ESPRESSO appears to only allow one
+        # active session per account, so that second login can knock the
+        # scan's already-running session out from under it, cascading
+        # into timeouts for every booking still queued.
+        self.login_button.setEnabled(False)
         self.status_label.setText("Starting queue processing...")
 
         cruise_line = CruiseLine(self.cruise_line_selector.currentText())
         force_live_recheck = self.force_recheck_checkbox.isChecked()
         capture_market_data = self.capture_market_data_checkbox.isChecked()
+        capture_everything = self.capture_everything_checkbox.isChecked()
 
         def on_state_change(snapshot) -> None:
             self._update_queue_view(snapshot)
@@ -276,6 +350,8 @@ class MainWindow(QMainWindow):
                 raw_dump_dir=str(Path("data")),
                 force_live_recheck=force_live_recheck,
                 capture_market_data=capture_market_data,
+                capture_everything=capture_everything,
+                on_action=self._on_action,
             )
             print("GUI: queue_manager.start_processing completed")
             self.status_label.setText("Queue processing complete.")
@@ -292,6 +368,7 @@ class MainWindow(QMainWindow):
             self.add_bulk_button.setEnabled(True)
             self.booking_input.setEnabled(True)
             self.bulk_input.setEnabled(True)
+            self.login_button.setEnabled(True)
             self._update_queue_view(self.queue_manager.get_snapshot())
 
     @Slot()
@@ -301,12 +378,31 @@ class MainWindow(QMainWindow):
         else:
             self.status_label.setText("No active queue to stop.")
 
+    def _on_action(self, entry: dict) -> None:
+        """Append one action-log entry (from the scraper) to the activity log panel."""
+        ts = entry.get("timestamp", "")
+        action = entry.get("action", "")
+        detail = {k: v for k, v in entry.items() if k not in ("timestamp", "action", "cruise_line")}
+        detail_str = " ".join(f"{k}={v}" for k, v in detail.items())
+        self.activity_log.append(f"[{ts}] {action}  {detail_str}")
+
+    @staticmethod
+    def _format_net_saving(net_saving: float) -> str:
+        """Spell out cost increases instead of a bare negative dollar
+        figure ("$-459.00") that reads as ambiguous — a negative
+        net_saving means repricing would cost more, not save less."""
+        if net_saving > 0:
+            return f"+${net_saving:.2f} saved"
+        if net_saving < 0:
+            return f"-${abs(net_saving):.2f} more expensive"
+        return "$0.00"
+
     def _append_result_row(self, result: BookingResult) -> None:
         row = self.results_table.rowCount()
         self.results_table.insertRow(row)
         self.results_table.setItem(row, 0, QTableWidgetItem(result.booking_id))
         self.results_table.setItem(row, 1, QTableWidgetItem(result.status.value))
-        self.results_table.setItem(row, 2, QTableWidgetItem(f"${result.net_saving:.2f}"))
+        self.results_table.setItem(row, 2, QTableWidgetItem(self._format_net_saving(result.net_saving)))
         self.results_table.setItem(row, 3, QTableWidgetItem(str(result.confidence)))
         color = self._color_for_status(result.status.value)
         for col in range(4):
@@ -341,7 +437,7 @@ class MainWindow(QMainWindow):
             self.results_table.insertRow(row)
             self.results_table.setItem(row, 0, QTableWidgetItem(result.booking_id))
             self.results_table.setItem(row, 1, QTableWidgetItem(result.status.value))
-            self.results_table.setItem(row, 2, QTableWidgetItem(f"${result.net_saving:.2f}"))
+            self.results_table.setItem(row, 2, QTableWidgetItem(self._format_net_saving(result.net_saving)))
             self.results_table.setItem(row, 3, QTableWidgetItem(str(result.confidence)))
             color = self._color_for_status(result.status.value)
             for col in range(4):

@@ -19,6 +19,7 @@ from pydantic import BaseModel, Field
 class CruiseLine(str, Enum):
     ESPRESSO = "ESPRESSO"
     NCL = "NCL"
+    GOCCL = "GOCCL"
 
 
 class BookingStatus(str, Enum):
@@ -27,7 +28,6 @@ class BookingStatus(str, Enum):
     NO_SAVING = "NO_SAVING"
     ERROR = "ERROR"
     WLT = "WLT"
-    CHECKING = "CHECKING"
     PAID_IN_FULL = "PAID_IN_FULL"
     SKIPPED_TODAY = "SKIPPED_TODAY"
 
@@ -38,35 +38,6 @@ class ScanJobStatus(str, Enum):
     COMPLETED = "COMPLETED"
     FAILED = "FAILED"
     STOPPED = "STOPPED"
-
-
-# ── Invoice ─────────────────────────────────────────────────────
-
-
-class InvoiceItem(BaseModel):
-    """A single line item from a cruise invoice."""
-
-    pax_id: str = ""
-    type: str = ""
-    name: str = ""
-    normalized_name: str = ""
-    amount: float = 0.0
-
-
-class Invoice(BaseModel):
-    """Full invoice with line items."""
-
-    items: list[InvoiceItem] = Field(default_factory=list)
-
-
-# ── NCL Addon ───────────────────────────────────────────────────
-
-
-class NclAddon(BaseModel):
-    """An addon scraped from the NCL summary page."""
-
-    name: str
-    qty: int = 1
 
 
 # ── Booking Result ──────────────────────────────────────────────
@@ -104,21 +75,6 @@ class BookingResult(BaseModel):
     checked_at: datetime = Field(default_factory=datetime.utcnow)
 
 
-# ── NCL Category ────────────────────────────────────────────────
-
-
-class NclCategory(BaseModel):
-    """A category from the NCL SeaWeb grid (VX._form_12)."""
-
-    category: str
-    res_total: float = 0.0
-    status: str = ""
-    has_availability: bool = False
-    cabin_available: int = 0
-    current_promo: str = ""
-    description: str = ""
-
-
 # ── Scan Job ────────────────────────────────────────────────────
 
 
@@ -139,16 +95,3 @@ class ScanJob(BaseModel):
     completed_at: Optional[datetime] = None
 
     model_config = {"from_attributes": True}
-
-
-# ── Price History ───────────────────────────────────────────────
-
-
-class PriceSnapshot(BaseModel):
-    """A single price check recorded over time."""
-
-    booking_id: str
-    cruise_line: CruiseLine
-    total: float
-    category: Optional[str] = None
-    checked_at: datetime = Field(default_factory=datetime.utcnow)

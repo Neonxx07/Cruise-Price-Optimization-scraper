@@ -11,7 +11,7 @@ import re
 from datetime import datetime
 
 from .confidence import calc_confidence
-from .models import BookingResult, BookingStatus, CruiseLine, InvoiceItem
+from .models import BookingResult, BookingStatus, CruiseLine
 
 
 # ── Utility Functions ───────────────────────────────────────────
@@ -45,6 +45,10 @@ ESPRESSO_FEE_TYPES = frozenset([
 ])
 
 _FEE_NAME_PREFIX_RE = re.compile(r"^(NCCF|NCF|PORT|TAX|FEE|GOVERNMENT|GRATUIT)")
+
+# Minimum ratio of (price drop) to (OBC lost) before a repricing that
+# forfeits OBC is treated as a genuine optimization rather than a wash.
+OBC_LOSS_MIN_RATIO = 3.0
 
 
 def _is_espresso_fee(item: dict) -> bool:
@@ -195,6 +199,18 @@ def calculate_espresso(raw_data: dict, booking_id: str, price_category: str | No
             # all-inclusive drink package is not a real optimization.
             status = BookingStatus.TRAP
             note = f"trap - losing ${round(lost_pkg_value)} perk for only ${round(net)} net{re_add_note}"
+        elif net > 0 and obc_change < 0 and price_drop < abs(obc_change) * OBC_LOSS_MIN_RATIO:
+            # Net is positive on paper, but a chunk of it is OBC being
+            # forfeited rather than a real fare reduction — confirmed
+            # against a real case: a $300 price drop that cost $250 of
+            # OBC (net $50) is only a ~1.2x margin, not a safe trade.
+            # Only worth recommending once the price drop clears the OBC
+            # being given up by OBC_LOSS_MIN_RATIO.
+            status = BookingStatus.NO_SAVING
+            note = (
+                f"no saving — ${round(price_drop)} drop costs ${round(abs(obc_change))} OBC "
+                f"(need {OBC_LOSS_MIN_RATIO:.0f}x){re_add_note}"
+            )
         elif net > 0:
             status = BookingStatus.OPTIMIZATION
             note = f"optimized ${round(net)}{re_add_note}"
@@ -381,6 +397,120 @@ def calculate_ncl(
         )
 
 
+# ── GoCCL Calculator ─────────────────────────────────────────────
+
+# GoCCL's automatic discovery only reads the *offer-code comparison*
+# screen — average-per-person prices grouped by stateroom type, not the
+# per-category, full-cabin-total GROSS AMOUNT that only appears on the
+# review screen after a human-reviewed preview_fare_code() run. So unlike
+# ESPRESSO/NCL (whose automatic check_booking reads a confirmed new
+# total), GoCCL's automatic scan can only surface a *candidate* — a
+# cheaper offer code at the same stateroom type — never a confirmed net
+# saving. Confidence is capped at 1 star specifically to signal that.
+GOCCL_CANDIDATE_CONFIDENCE = 1
+
+
+def calculate_goccl(
+    booking_id: str,
+    price_category: str | None,
+    current_stateroom_type: str,
+    current_offer_code: str,
+    current_price_gross: float,
+    available_offer_codes: list[dict],
+    guests_count: int = 2,
+) -> BookingResult:
+    """
+    Analyze a GoCCL (Carnival) booking's offer-code comparison and surface
+    the cheapest candidate offer code at the SAME stateroom type — GoCCL's
+    real comparison axis, since category/stateroom stays fixed and only
+    the fare/offer code varies.
+
+    This is an ESTIMATE, not a confirmed price: available_offer_codes
+    entries carry an "Average Per Person" price, while the booking's
+    current_price_gross is the full per-cabin total (guests x per-person
+    + taxes/fees/OBC). Multiplying per-person by guests_count approximates
+    the new gross but can't account for OBC changes, which GoCCL only
+    exposes after actually clicking through to a candidate (see
+    scraper/goccl.py's preview_fare_code — reserved for one human-reviewed
+    candidate at a time, never run unattended for every candidate found here).
+
+    Args:
+        booking_id: The booking ID.
+        price_category: Current category code (unchanged by this comparison).
+        current_stateroom_type: e.g. "BALCONY".
+        current_offer_code: The booking's current offer/rate code.
+        current_price_gross: Current booking's full gross total.
+        available_offer_codes: Offer-code comparison rows, each a dict with
+            "offer_code", "offer_name", "stateroom_type", "price_per_person".
+        guests_count: Number of guests on the booking (per-person -> gross).
+
+    Returns:
+        BookingResult with status, an estimated net_saving, and confidence
+        capped at GOCCL_CANDIDATE_CONFIDENCE — a candidate to verify by hand,
+        not a ready-to-act recommendation.
+    """
+    try:
+        candidates = [
+            o for o in available_offer_codes
+            if o.get("stateroom_type") == current_stateroom_type
+            and o.get("offer_code") != current_offer_code
+            and safe_float(o.get("price_per_person", 0)) > 0
+        ]
+
+        if not candidates:
+            return BookingResult(
+                cruise_line=CruiseLine.GOCCL,
+                status=BookingStatus.NO_SAVING,
+                note=f"no saving — no cheaper offer code found for {current_stateroom_type}",
+                booking_id=booking_id,
+                price_category=price_category,
+                old_total=round2(current_price_gross),
+                new_total=round2(current_price_gross),
+            )
+
+        cheapest = min(candidates, key=lambda o: safe_float(o.get("price_per_person", 0)))
+        old_total = round2(current_price_gross)
+        estimated_new_total = round2(safe_float(cheapest.get("price_per_person", 0)) * guests_count)
+        price_drop = round2(old_total - estimated_new_total)
+
+        if price_drop <= 0:
+            return BookingResult(
+                cruise_line=CruiseLine.GOCCL,
+                status=BookingStatus.NO_SAVING,
+                note="no saving — cheapest candidate offer code isn't actually lower once guest count is applied",
+                booking_id=booking_id,
+                price_category=price_category,
+                old_total=old_total,
+                new_total=estimated_new_total,
+            )
+
+        return BookingResult(
+            cruise_line=CruiseLine.GOCCL,
+            status=BookingStatus.OPTIMIZATION,
+            note=(
+                f"candidate ${round(price_drop)} — offer code '{cheapest.get('offer_code', '')}' "
+                f"({cheapest.get('offer_name', '')}) — UNCONFIRMED, run preview_fare_code to verify "
+                f"gross total + OBC before repricing"
+            ),
+            booking_id=booking_id,
+            price_category=price_category,
+            old_total=old_total,
+            new_total=estimated_new_total,
+            price_drop=price_drop,
+            net_saving=price_drop,
+            confidence=GOCCL_CANDIDATE_CONFIDENCE,
+        )
+
+    except Exception as e:
+        return BookingResult(
+            cruise_line=CruiseLine.GOCCL,
+            status=BookingStatus.ERROR,
+            error=str(e),
+            booking_id=booking_id,
+            price_category=price_category,
+        )
+
+
 # ── Helper Constructors ────────────────────────────────────────
 
 
@@ -398,6 +528,22 @@ def make_paid_in_full_result(
         cruise_line=cruise_line, status=BookingStatus.PAID_IN_FULL,
         note="💳 Fully paid — repricing unavailable",
         booking_id=booking_id, price_category=price_category, old_total=old_total,
+    )
+
+
+def make_no_price_change_result(
+    booking_id: str, price_category: str | None, cruise_line: CruiseLine, price: float = 0,
+) -> BookingResult:
+    """The category's price-quote total exactly matches the current price
+    — confirmed via the page's own displayed price (sb.summary.price.price
+    vs sb.summary.price.allocationPrice), not the reprice-modal API, which
+    returns a short, non-JSON body in exactly this scenario and was
+    previously misdiagnosed downstream as an expired token."""
+    return BookingResult(
+        cruise_line=cruise_line, status=BookingStatus.NO_SAVING,
+        note=f"no saving — price unchanged (${price:,.2f})",
+        booking_id=booking_id, price_category=price_category,
+        old_total=price, new_total=price,
     )
 
 
