@@ -2,7 +2,7 @@
 
 # ⚓ Cruise Price Intelligence System (Playwright + AI Optimization)
 
-**Automated repricing intelligence for Royal Caribbean, Celebrity & Norwegian Cruise Line**
+**Automated repricing intelligence for Royal Caribbean, Celebrity, Norwegian Cruise Line & Carnival (GoCCL)**
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](CONTRIBUTING.md)
@@ -31,7 +31,7 @@ Both share the **same core business logic** — detecting price drops, tracking 
 ```
 ┌─────────────────────────────────────────────────────┐
 │              Cruise Booking Portal                    │
-│         (ESPRESSO / NCL SeaWeb)                       │
+│      (ESPRESSO / NCL SeaWeb / GoCCL Navigator)         │
 └──────────────────┬──────────────────────────────────┘
                    │ Scrape prices
         ┌──────────┴──────────┐
@@ -73,7 +73,7 @@ Both share the **same core business logic** — detecting price drops, tracking 
 1. Clone this repo
 2. Open `chrome://extensions` → Enable **Developer Mode**
 3. Click **Load Unpacked** → select the `extension/` folder
-4. Log into your cruise portal (ESPRESSO or NCL SeaWeb)
+4. Log into your cruise portal (ESPRESSO, NCL SeaWeb, or GoCCL Navigator)
 5. Click the extension icon → paste booking numbers → Run Check
 
 ### Python Platform
@@ -114,6 +114,7 @@ python main.py scan --bookings "4097990,64756965" --cruise-line ESPRESSO -o resu
 | Royal Caribbean | ESPRESSO (CruisingPower) | ✅ | ✅ |
 | Celebrity Cruises | ESPRESSO (CruisingPower) | ✅ | ✅ |
 | Norwegian (NCL) | SeaWeb Agents | ✅ | ✅ |
+| Carnival | GoCCL Navigator | ✅ | ✅ |
 
 ---
 
@@ -125,7 +126,7 @@ We welcome contributions! See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
 
 ### Areas Where You Can Help
 
-- 🚢 **New cruise line adapters** (MSC, Carnival, Princess, etc.)
+- 🚢 **New cruise line adapters** (MSC, Princess, etc.)
 - 🧪 **Testing** — unit tests for the calculator engine
 - 🎨 **Extension UI** — dark mode, better UX
 - 📊 **Dashboard** — React frontend for the API

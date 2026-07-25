@@ -1,6 +1,6 @@
 # Cruise Intelligence System
 
-> Enterprise-grade repricing intelligence for Royal Caribbean, Celebrity & Norwegian Cruise Line.
+> Enterprise-grade repricing intelligence for Royal Caribbean, Celebrity, Norwegian Cruise Line & Carnival (GoCCL).
 
 Evolved from the CruiseIntel Chrome Extension into a scalable, production-ready Python system.
 
@@ -17,10 +17,10 @@ Evolved from the CruiseIntel Chrome Extension into a scalable, production-ready 
 │(APSched) │  (orchestration + persist)   │  (TTL-based)      │
 ├──────────┴──────────┬───────────────────┴───────────────────┤
 │                     │                                        │
-│  ┌─────────────┐   │   ┌──────────────┐                    │
-│  │  ESPRESSO   │   │   │     NCL      │                    │
-│  │  Scraper    │   │   │   Scraper    │  ← Playwright      │
-│  └─────────────┘   │   └──────────────┘                    │
+│  ┌───────────┐ ┌──────────┐ ┌───────────┐                  │
+│  │ ESPRESSO  │ │   NCL    │ │   GoCCL   │                  │
+│  │  Scraper  │ │ Scraper  │ │  Scraper  │  ← Playwright     │
+│  └───────────┘ └──────────┘ └───────────┘                  │
 │                     │                                        │
 ├─────────────────────┴────────────────────────────────────────┤
 │              Price Calculator + Confidence Scorer             │
@@ -87,7 +87,7 @@ python main.py scan --bookings "4097990,64756965" --cruise-line ESPRESSO -o resu
 
 ```
 ├── core/               # Business logic (calculator, confidence, models)
-├── scraper/            # Playwright scrapers (ESPRESSO, NCL)
+├── scraper/            # Playwright scrapers (ESPRESSO, NCL, GoCCL)
 ├── api/                # FastAPI server + routes
 ├── services/           # Orchestration, caching, CSV export
 ├── models/             # SQLAlchemy database models

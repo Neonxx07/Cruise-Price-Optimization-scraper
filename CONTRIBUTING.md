@@ -64,10 +64,11 @@ python main.py api
 
 Want to add support for a new cruise line? Here's how:
 
-1. **Extension:** Create `adapter_newline.js` following the pattern in `adapter_espresso.js`
-2. **Platform:** Create `platform/scraper/newline.py` extending `BaseScraper`
+1. **Extension:** Create `adapter_newline.js` following the pattern in `adapter_espresso.js` (or `adapter_goccl.js` for a read-only-discovery example)
+2. **Platform:** Create `platform/scraper/newline.py` extending `BaseScraper` (see `platform/scraper/goccl.py` for a recent worked example)
 3. **Calculator:** Add a `calculate_newline()` function in `platform/core/calculator.py`
-4. Update both READMEs
+4. Add the line to `CruiseLine` in `platform/core/models.py`, and wire it into `main.py`, `services/booking_service.py`, and `api/schemas.py`
+5. Update both READMEs
 
 ## Reporting Bugs
 
