@@ -13,6 +13,7 @@ from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
     QGridLayout,
+    QGroupBox,
     QHBoxLayout,
     QHeaderView,
     QLabel,
@@ -22,6 +23,7 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QMessageBox,
     QPushButton,
+    QSplitter,
     QTableWidget,
     QTableWidgetItem,
     QTextEdit,
@@ -78,59 +80,113 @@ class MainWindow(QMainWindow):
         self.login_status_label.setStyleSheet("color: #444444; font-weight: bold;")
         layout.addWidget(self.login_status_label)
 
-        top_layout = QGridLayout()
-        top_layout.setHorizontalSpacing(12)
-        top_layout.setVerticalSpacing(10)
+        # Two-pane layout: left = booking entry / queue / scraping log,
+        # right = controls / results — matches the intended screen split
+        # rather than one long stacked column.
+        splitter = QSplitter(Qt.Horizontal)
+        splitter.addWidget(self._build_left_pane())
+        splitter.addWidget(self._build_right_pane())
+        splitter.setStretchFactor(0, 2)
+        splitter.setStretchFactor(1, 3)
+        layout.addWidget(splitter, 1)
 
-        top_layout.addWidget(QLabel("Booking ID:"), 0, 0)
+        bottom_layout = QHBoxLayout()
+        self.export_button = QPushButton("Export report")
+        self.export_button.clicked.connect(self._on_export)
+        bottom_layout.addWidget(self.export_button)
+
+        self.status_label = QLabel("Ready")
+        self.status_label.setStyleSheet("color: #666666;")
+        bottom_layout.addWidget(self.status_label, 1)
+
+        layout.addLayout(bottom_layout)
+
+        self.setCentralWidget(container)
+
+    def _build_left_pane(self) -> QWidget:
+        """Booking entry, the queued booking list, and the scraping activity log."""
+        pane = QWidget()
+        layout = QVBoxLayout(pane)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(12)
+
+        booking_group = QGroupBox("Booking")
+        booking_layout = QGridLayout(booking_group)
+        booking_layout.setHorizontalSpacing(8)
+        booking_layout.setVerticalSpacing(8)
+
+        booking_layout.addWidget(QLabel("Booking ID:"), 0, 0)
         self.booking_input = QLineEdit()
         self.booking_input.returnPressed.connect(self._add_booking)
-        top_layout.addWidget(self.booking_input, 0, 1)
-
+        booking_layout.addWidget(self.booking_input, 0, 1)
         self.add_booking_button = QPushButton("Add to queue")
         self.add_booking_button.clicked.connect(self._add_booking)
-        top_layout.addWidget(self.add_booking_button, 0, 2)
+        booking_layout.addWidget(self.add_booking_button, 0, 2)
 
-        top_layout.addWidget(QLabel("Cruise Line:"), 1, 0)
+        booking_layout.addWidget(QLabel("Bulk (comma or newline separated):"), 1, 0, 1, 3)
+        self.bulk_input = QTextEdit()
+        self.bulk_input.setFixedHeight(80)
+        booking_layout.addWidget(self.bulk_input, 2, 0, 1, 3)
+        self.add_bulk_button = QPushButton("Add list")
+        self.add_bulk_button.clicked.connect(self._add_bulk)
+        booking_layout.addWidget(self.add_bulk_button, 3, 2)
+
+        layout.addWidget(booking_group)
+
+        list_group = QGroupBox("Booking list")
+        list_layout = QVBoxLayout(list_group)
+        self.queue_status_label = QLabel("0 pending, 0 running")
+        self.queue_status_label.setStyleSheet("font-weight: bold;")
+        list_layout.addWidget(self.queue_status_label)
+        self.queue_list = QListWidget()
+        list_layout.addWidget(self.queue_list, 1)
+        self.clear_queue_button = QPushButton("Clear queue")
+        self.clear_queue_button.clicked.connect(self._on_clear_queue)
+        list_layout.addWidget(self.clear_queue_button)
+
+        layout.addWidget(list_group, 1)
+
+        process_group = QGroupBox("The scraping process")
+        process_layout = QVBoxLayout(process_group)
+        self.activity_log = QTextEdit()
+        self.activity_log.setReadOnly(True)
+        self.activity_log.setStyleSheet("font-family: Consolas, monospace; font-size: 11px;")
+        process_layout.addWidget(self.activity_log)
+
+        layout.addWidget(process_group, 1)
+
+        return pane
+
+    def _build_right_pane(self) -> QWidget:
+        """Start/stop/login controls and the check results."""
+        pane = QWidget()
+        layout = QVBoxLayout(pane)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(12)
+
+        controls_group = QGroupBox("Start / Stop / Check login")
+        controls_layout = QGridLayout(controls_group)
+        controls_layout.setHorizontalSpacing(8)
+        controls_layout.setVerticalSpacing(8)
+
+        controls_layout.addWidget(QLabel("Cruise Line:"), 0, 0)
         self.cruise_line_selector = QComboBox()
         self.cruise_line_selector.addItems([c.value for c in CruiseLine])
-        top_layout.addWidget(self.cruise_line_selector, 1, 1)
+        controls_layout.addWidget(self.cruise_line_selector, 0, 1)
+        self.login_button = QPushButton("Check login")
+        self.login_button.clicked.connect(self._on_login_check)
+        controls_layout.addWidget(self.login_button, 0, 2)
 
         self.start_button = QPushButton("Start")
         self.start_button.clicked.connect(self._on_start)
-        top_layout.addWidget(self.start_button, 1, 2)
-
+        controls_layout.addWidget(self.start_button, 1, 0)
         self.stop_button = QPushButton("Stop")
         self.stop_button.clicked.connect(self._on_stop)
         self.stop_button.setEnabled(False)
-        top_layout.addWidget(self.stop_button, 0, 3)
-
-        self.login_button = QPushButton("Check login")
-        self.login_button.clicked.connect(self._on_login_check)
-        top_layout.addWidget(self.login_button, 1, 3)
-
-        layout.addLayout(top_layout)
-
-        self.summary_label = QLabel()
-        self.summary_label.setWordWrap(True)
-        self.summary_label.setFont(QFont("Arial", 10, QFont.Bold))
-        layout.addWidget(self.summary_label)
-
-        queue_layout = QGridLayout()
-        queue_layout.setHorizontalSpacing(12)
-        queue_layout.setVerticalSpacing(10)
-
-        queue_layout.addWidget(QLabel("Bulk booking IDs (comma or newline separated):"), 0, 0, 1, 2)
-        self.bulk_input = QTextEdit()
-        self.bulk_input.setFixedHeight(100)
-        queue_layout.addWidget(self.bulk_input, 1, 0, 1, 2)
-
-        self.add_bulk_button = QPushButton("Add list")
-        self.add_bulk_button.clicked.connect(self._add_bulk)
-        queue_layout.addWidget(self.add_bulk_button, 1, 2)
+        controls_layout.addWidget(self.stop_button, 1, 1)
 
         self.force_recheck_checkbox = QCheckBox("Force live recheck")
-        queue_layout.addWidget(self.force_recheck_checkbox, 2, 0, 1, 2)
+        controls_layout.addWidget(self.force_recheck_checkbox, 2, 0, 1, 3)
 
         self.capture_market_data_checkbox = QCheckBox("Collect market data (category/offer-code snapshot)")
         self.capture_market_data_checkbox.setChecked(True)
@@ -138,7 +194,7 @@ class MainWindow(QMainWindow):
             "Store the category/offer-code table snapshot (ESPRESSO category table, "
             "NCL category grid, or GoCCL offer-code comparison) in the database for later analysis."
         )
-        queue_layout.addWidget(self.capture_market_data_checkbox, 3, 0, 1, 2)
+        controls_layout.addWidget(self.capture_market_data_checkbox, 3, 0, 1, 3)
 
         self.capture_everything_checkbox = QCheckBox("Capture everything (full page HTML + network traffic)")
         self.capture_everything_checkbox.setToolTip(
@@ -146,27 +202,16 @@ class MainWindow(QMainWindow):
             "(tables + label/value pairs), and every network request/response — all read-only, "
             "written under data/pages/ and data/network_traffic.jsonl. Increases scan time and disk use."
         )
-        queue_layout.addWidget(self.capture_everything_checkbox, 4, 0, 1, 2)
+        controls_layout.addWidget(self.capture_everything_checkbox, 4, 0, 1, 3)
 
-        self.clear_queue_button = QPushButton("Clear queue")
-        self.clear_queue_button.clicked.connect(self._on_clear_queue)
-        queue_layout.addWidget(self.clear_queue_button, 2, 2)
+        layout.addWidget(controls_group)
 
-        layout.addLayout(queue_layout)
-
-        layout.addWidget(QLabel("Activity log (every automated browser action):"))
-        self.activity_log = QTextEdit()
-        self.activity_log.setReadOnly(True)
-        self.activity_log.setFixedHeight(120)
-        self.activity_log.setStyleSheet("font-family: Consolas, monospace; font-size: 11px;")
-        layout.addWidget(self.activity_log)
-
-        self.queue_status_label = QLabel("0 pending, 0 running")
-        self.queue_status_label.setStyleSheet("font-weight: bold;")
-        layout.addWidget(self.queue_status_label)
-
-        self.queue_list = QListWidget()
-        layout.addWidget(self.queue_list)
+        results_group = QGroupBox("Booking after check — status, no saving / price difference")
+        results_layout = QVBoxLayout(results_group)
+        self.summary_label = QLabel()
+        self.summary_label.setWordWrap(True)
+        self.summary_label.setFont(QFont("Arial", 10, QFont.Bold))
+        results_layout.addWidget(self.summary_label)
 
         self.results_table = QTableWidget(0, 4)
         self.results_table.setHorizontalHeaderLabels([
@@ -175,23 +220,11 @@ class MainWindow(QMainWindow):
         header = self.results_table.horizontalHeader()
         header.setSectionResizeMode(QHeaderView.Stretch)
         self.results_table.setAlternatingRowColors(True)
-        layout.addWidget(self.results_table)
+        results_layout.addWidget(self.results_table, 1)
 
-        bottom_layout = QGridLayout()
-        bottom_layout.setHorizontalSpacing(12)
-        bottom_layout.setVerticalSpacing(10)
+        layout.addWidget(results_group, 1)
 
-        self.export_button = QPushButton("Export report")
-        self.export_button.clicked.connect(self._on_export)
-        bottom_layout.addWidget(self.export_button, 0, 0)
-
-        self.status_label = QLabel("Ready")
-        self.status_label.setStyleSheet("color: #666666;")
-        bottom_layout.addWidget(self.status_label, 0, 1)
-
-        layout.addLayout(bottom_layout)
-
-        self.setCentralWidget(container)
+        return pane
 
     def _refresh_summary(self) -> None:
         total = len(self.results)
