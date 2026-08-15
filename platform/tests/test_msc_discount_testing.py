@@ -1,10 +1,10 @@
 """Tests for the live discount price-testing pipeline (2026-08-13,
-forensic investigation of bookings 3000026/74242969).
+forensic investigation of bookings 2000017/2000020).
 
 These validate the LOGIC of test_discount_candidate/_apply_discount_candidate/
 _wait_for_post_discount_price/generate_discount_candidates using fake
 Playwright objects -- never a live browser. The ground-truth regression
-case below uses the REAL numbers observed live on booking 3000026
+case below uses the REAL numbers observed live on booking 2000017
 ($2,588.72 -> $2,565.26 -> $23.46), fed into the pipeline as a MOCKED
 scenario -- never hardcoded into production logic. The point of every
 test here is that a dollar figure, or the absence of one, is only ever
@@ -291,7 +291,7 @@ def _patch_pipeline(monkeypatch, *, baseline_value="1,000.00", verification_valu
 
 
 @pytest.mark.asyncio
-async def test_regression_3000026_ground_truth_confirmed_optimization(monkeypatch):
+async def test_regression_2000017_ground_truth_confirmed_optimization(monkeypatch):
     """Real observed numbers from the live session: $2,588.72 -> $2,565.26.
     Fed in as a mocked scenario -- NOT hardcoded into test_discount_candidate
     itself, which only ever sees whatever its (mocked) dependencies return."""
@@ -302,7 +302,7 @@ async def test_regression_3000026_ground_truth_confirmed_optimization(monkeypatc
     )
     candidate = MscDiscountCandidate(label="SENIOR DISCOUNT", method=MscDiscountApplicationMethod.DROPDOWN_OPTION)
 
-    result = await msc_commands.test_discount_candidate({"page": FakePage()}, "3000026", candidate)
+    result = await msc_commands.test_discount_candidate({"page": FakePage()}, "2000017", candidate)
 
     assert result.status == MscDiscountTestStatus.CONFIRMED_OPTIMIZATION
     assert result.price_before == 2588.72
@@ -315,7 +315,7 @@ async def test_regression_3000026_ground_truth_confirmed_optimization(monkeypatc
 
 @pytest.mark.asyncio
 async def test_regression_price_source_recorded_for_diagnosability(monkeypatch):
-    """CONFIRMED REAL GAP this documents: a live retest of 3000026
+    """CONFIRMED REAL GAP this documents: a live retest of 2000017
     produced a DIFFERENT number ($2,559.00) than a human had separately
     observed live ($2,565.26), and there was no way to tell which of the
     two fallback strategies actually produced it. price_source must
@@ -323,7 +323,7 @@ async def test_regression_price_source_recorded_for_diagnosability(monkeypatch):
     _patch_pipeline(monkeypatch, post_price_evidence={"price_str": "900.00", "source": "category_listing", "text_excerpt": ""})
     candidate = MscDiscountCandidate(label="SENIOR DISCOUNT", method=MscDiscountApplicationMethod.DROPDOWN_OPTION)
 
-    result = await msc_commands.test_discount_candidate({"page": FakePage()}, "3000026", candidate)
+    result = await msc_commands.test_discount_candidate({"page": FakePage()}, "2000017", candidate)
 
     assert result.price_source == "category_listing"
 
@@ -336,7 +336,7 @@ async def test_regression_no_rate_tabs_no_longer_hard_fails_when_price_available
     _patch_pipeline(monkeypatch, tab_matched=False, post_price_evidence={"price_str": "900.00", "source": "price_breakdown", "text_excerpt": ""})
     candidate = MscDiscountCandidate(label="SENIOR DISCOUNT", method=MscDiscountApplicationMethod.DROPDOWN_OPTION)
 
-    result = await msc_commands.test_discount_candidate({"page": FakePage()}, "3000026", candidate)
+    result = await msc_commands.test_discount_candidate({"page": FakePage()}, "2000017", candidate)
 
     assert result.status in (MscDiscountTestStatus.CONFIRMED_OPTIMIZATION, MscDiscountTestStatus.CONFIRMED_NO_SAVINGS)
     assert result.price_after == 900.00
@@ -352,7 +352,7 @@ async def test_regression_evidence_never_discarded_on_post_price_not_found(monke
                      post_price_evidence={"price_str": None, "source": None, "text_excerpt": "nothing"})
     candidate = MscDiscountCandidate(label="SENIOR DISCOUNT", method=MscDiscountApplicationMethod.DROPDOWN_OPTION)
 
-    result = await msc_commands.test_discount_candidate({"page": FakePage()}, "3000026", candidate)
+    result = await msc_commands.test_discount_candidate({"page": FakePage()}, "2000017", candidate)
 
     assert result.status == MscDiscountTestStatus.POST_PRICE_NOT_FOUND
     assert result.price_before == 2588.72  # NOT None
@@ -366,7 +366,7 @@ async def test_discount_candidate_application_failed_preserves_baseline(monkeypa
     _patch_pipeline(monkeypatch, baseline_value="1,000.00", apply_success=False, apply_reason="no matching option")
     candidate = MscDiscountCandidate(label="SENIOR DISCOUNT", method=MscDiscountApplicationMethod.DROPDOWN_OPTION)
 
-    result = await msc_commands.test_discount_candidate({"page": FakePage()}, "3000026", candidate)
+    result = await msc_commands.test_discount_candidate({"page": FakePage()}, "2000017", candidate)
 
     assert result.status == MscDiscountTestStatus.DISCOUNT_APPLICATION_FAILED
     assert result.price_before == 1000.00
@@ -379,7 +379,7 @@ async def test_discount_candidate_confirm_failed(monkeypatch):
     _patch_pipeline(monkeypatch, confirm_success=False)
     candidate = MscDiscountCandidate(label="SENIOR DISCOUNT", method=MscDiscountApplicationMethod.DROPDOWN_OPTION)
 
-    result = await msc_commands.test_discount_candidate({"page": FakePage()}, "3000026", candidate)
+    result = await msc_commands.test_discount_candidate({"page": FakePage()}, "2000017", candidate)
 
     assert result.status == MscDiscountTestStatus.CONFIRM_FAILED
     assert result.application_success is True  # discount selection DID succeed
@@ -394,7 +394,7 @@ async def test_discount_candidate_occupancy_stalled_stops_before_applying(monkey
     _patch_pipeline(monkeypatch, occupancy_stalled=True)
     candidate = MscDiscountCandidate(label="SENIOR DISCOUNT", method=MscDiscountApplicationMethod.DROPDOWN_OPTION)
 
-    result = await msc_commands.test_discount_candidate({"page": FakePage()}, "3000026", candidate)
+    result = await msc_commands.test_discount_candidate({"page": FakePage()}, "2000017", candidate)
 
     assert result.status == MscDiscountTestStatus.OCCUPANCY_MISMATCH
     assert result.application_attempted is False
@@ -438,7 +438,7 @@ async def test_discount_candidate_identity_validation_failed_on_partnumber_chang
     monkeypatch.setattr(msc_commands, "_wait_for_post_discount_price", fake_wait_price)
 
     candidate = MscDiscountCandidate(label="SENIOR DISCOUNT", method=MscDiscountApplicationMethod.DROPDOWN_OPTION)
-    result = await msc_commands.test_discount_candidate({"page": page}, "3000026", candidate)
+    result = await msc_commands.test_discount_candidate({"page": page}, "2000017", candidate)
 
     assert result.status == MscDiscountTestStatus.IDENTITY_VALIDATION_FAILED
     assert result.actual_savings is None
@@ -450,7 +450,7 @@ async def test_regression_restoration_failed_never_reports_savings(monkeypatch):
     _patch_pipeline(monkeypatch, baseline_value="1,000.00", verification_value="1,050.00")
     candidate = MscDiscountCandidate(label="SENIOR DISCOUNT", method=MscDiscountApplicationMethod.DROPDOWN_OPTION)
 
-    result = await msc_commands.test_discount_candidate({"page": FakePage()}, "3000026", candidate)
+    result = await msc_commands.test_discount_candidate({"page": FakePage()}, "2000017", candidate)
 
     assert result.status == MscDiscountTestStatus.RESTORATION_FAILED
     assert result.actual_savings is None
@@ -464,7 +464,7 @@ async def test_discount_candidate_price_increase_is_confirmed_no_savings_not_hid
                      post_price_evidence={"price_str": "1,050.00", "source": "category_listing", "text_excerpt": ""})
     candidate = MscDiscountCandidate(label="SENIOR DISCOUNT", method=MscDiscountApplicationMethod.DROPDOWN_OPTION)
 
-    result = await msc_commands.test_discount_candidate({"page": FakePage()}, "3000026", candidate)
+    result = await msc_commands.test_discount_candidate({"page": FakePage()}, "2000017", candidate)
 
     assert result.status == MscDiscountTestStatus.CONFIRMED_NO_SAVINGS
     assert result.actual_savings == -50.00
@@ -476,7 +476,7 @@ async def test_discount_candidate_unchanged_price_is_confirmed_no_savings(monkey
                      post_price_evidence={"price_str": "1,000.00", "source": "category_listing", "text_excerpt": ""})
     candidate = MscDiscountCandidate(label="SENIOR DISCOUNT", method=MscDiscountApplicationMethod.DROPDOWN_OPTION)
 
-    result = await msc_commands.test_discount_candidate({"page": FakePage()}, "3000026", candidate)
+    result = await msc_commands.test_discount_candidate({"page": FakePage()}, "2000017", candidate)
 
     assert result.status == MscDiscountTestStatus.CONFIRMED_NO_SAVINGS
     assert result.actual_savings == 0.0
@@ -496,7 +496,7 @@ async def test_discount_candidate_session_expired_baseline(monkeypatch):
     monkeypatch.setattr(msc_commands, "auto_login", fake_auto_login)
     candidate = MscDiscountCandidate(label="SENIOR DISCOUNT", method=MscDiscountApplicationMethod.DROPDOWN_OPTION)
 
-    result = await msc_commands.test_discount_candidate({"page": FakePage()}, "3000026", candidate)
+    result = await msc_commands.test_discount_candidate({"page": FakePage()}, "2000017", candidate)
 
     assert result.status == MscDiscountTestStatus.INSUFFICIENT_DATA
     assert result.actual_savings is None
@@ -528,7 +528,7 @@ async def test_regression_session_expired_recovers_via_one_relogin_retry(monkeyp
     monkeypatch.setattr(msc_commands, "auto_login", fake_auto_login)
     candidate = MscDiscountCandidate(label="SENIOR DISCOUNT", method=MscDiscountApplicationMethod.DROPDOWN_OPTION)
 
-    result = await msc_commands.test_discount_candidate({"page": FakePage()}, "3000026", candidate)
+    result = await msc_commands.test_discount_candidate({"page": FakePage()}, "2000017", candidate)
 
     assert calls["login"] == 1
     assert result.price_before == 1000.00
@@ -543,7 +543,7 @@ async def test_discount_candidate_unexpected_exception_is_error_not_crash(monkey
     monkeypatch.setattr(msc_commands, "_lookup_one_booking", fake_lookup_raises)
     candidate = MscDiscountCandidate(label="SENIOR DISCOUNT", method=MscDiscountApplicationMethod.DROPDOWN_OPTION)
 
-    result = await msc_commands.test_discount_candidate({"page": FakePage()}, "3000026", candidate)
+    result = await msc_commands.test_discount_candidate({"page": FakePage()}, "2000017", candidate)
 
     assert result.status == MscDiscountTestStatus.ERROR
     assert result.actual_savings is None

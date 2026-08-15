@@ -9,7 +9,7 @@
 # is that human decision; it isn't a workaround, it's you choosing to
 # click "the fast way" instead of finding the button by hand.
 
-$dir = "."
+$dir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $commandPath = "$dir\data\msc_control\command.txt"
 $resultPath = "$dir\data\msc_control\result.txt"
 $logPath = "$dir\data\msc_control\last_confirm_result.log"

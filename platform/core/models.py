@@ -203,7 +203,7 @@ class MscBookingResult(BaseModel):
 
 # ── MSC Discount Price-Test ─────────────────────────────────────
 #
-# ADDED 2026-08-13, forensic investigation of bookings 3000026/74242969:
+# ADDED 2026-08-13, forensic investigation of bookings 2000017/2000020:
 # confirmed that evaluate_msc_booking()'s DISCOUNT_ADD/DISCOUNT_TIER_UPGRADE
 # checks can detect a discount is ELIGIBLE (Senior, Voyagers Club, a named
 # promo) but never determine what it's actually WORTH in dollars — MSC's
@@ -246,7 +246,7 @@ class MscDiscountCandidate(BaseModel):
 
 
 class MscDiscountTestStatus(str, Enum):
-    """EXPANDED 2026-08-13 after the first live test on 3000026 exposed
+    """EXPANDED 2026-08-13 after the first live test on 2000017 exposed
     two real bugs: (1) a hard requirement on rate-tab DOM presence that
     doesn't hold once a discount changes what MSC renders after Confirm,
     and (2) every early-return path collapsing to one generic
@@ -321,7 +321,7 @@ class MscDiscountTestResult(BaseModel):
     actual_savings: Optional[float] = None
     currency: str = "UNKNOWN"
 
-    # CONFIRMED REAL GAP, added 2026-08-13 after a live retest of 3000026
+    # CONFIRMED REAL GAP, added 2026-08-13 after a live retest of 2000017
     # produced a DIFFERENT price ($2,559.00) than a human had separately
     # observed live ($2,565.26) for the same discount on the same booking
     # — and this model had no way to tell which of
