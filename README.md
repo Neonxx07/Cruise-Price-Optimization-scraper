@@ -167,12 +167,22 @@ We welcome contributions! See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
 
 ---
 
-## Support This Project
+## 💖 Support This Project
+
+<div align="center">
 
 If this project saved you time or money, donations are welcome:
 
-- **USDC (Solana):** `HqGsXodbkTRcMUwaP3fs1LQ9XJneKBGewwJPh4P5QVAH`
-- **PayPal:** [paypal.me/neonx07](https://paypal.me/neonx07)
+[![Donate with PayPal](https://img.shields.io/badge/PayPal-Donate-00457C.svg?logo=paypal&logoColor=white)](https://paypal.me/neonx07)
+[![Donate USDC on Solana](https://img.shields.io/badge/USDC-Solana-9945FF.svg?logo=solana&logoColor=white)](#-support-this-project)
+
+**USDC (Solana):**
+
+```
+HqGsXodbkTRcMUwaP3fs1LQ9XJneKBGewwJPh4P5QVAH
+```
+
+</div>
 
 ---
 
