@@ -167,6 +167,15 @@ We welcome contributions! See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
 
 ---
 
+## Support This Project
+
+If this project saved you time or money, donations are welcome:
+
+- **USDC (Solana):** `HqGsXodbkTRcMUwaP3fs1LQ9XJneKBGewwJPh4P5QVAH`
+- **PayPal:** [paypal.me/neonx07](https://paypal.me/neonx07)
+
+---
+
 <div align="center">
 
 **Built for travel agents who want to save their clients money. ⚓**
