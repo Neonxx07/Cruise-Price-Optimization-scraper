@@ -19,12 +19,12 @@ from config.settings import settings
 from core.calculator import make_error_result, make_skipped_result
 from core.models import BookingResult, BookingStatus, CruiseLine, ScanJob, ScanJobStatus
 from models.database import BookingRecord, MarketDataRecord, PriceHistory, ScanJobRecord, async_session
-from scraper.base import BaseScraper
+from scraper.base import BaseScraper, is_dead_browser_error
 from scraper.espresso import EspressoScraper
 from scraper.goccl import GoCCLScraper
 from scraper.ncl import NclScraper
 from services.cache_service import CacheService
-from utils.logging import get_logger
+from utils.logging import get_logger, track_background_task
 
 logger = get_logger(__name__)
 
@@ -46,47 +46,84 @@ class BookingService:
         # keeping one continuous instance from login through every scan
         # avoids that entirely, matching the one run that worked end to end.
         self._live_scraper: BaseScraper | None = None
+        # See utils.logging.track_background_task — retains a strong
+        # reference to the fire-and-forget _run_batch task per scan so
+        # it can't be prematurely garbage-collected, and logs any
+        # exception that escapes it.
+        self._background_tasks: set = set()
 
     def _get_scraper(self, cruise_line: CruiseLine) -> BaseScraper:
-        """Factory: get the right scraper for the cruise line."""
+        """Factory: get the right scraper for the cruise line.
+
+        CONFIRMED REAL BUG 2026-08-12: this used to fall through to
+        EspressoScraper for anything that wasn't NCL/GOCCL — including
+        CruiseLine.MSC, which the GUI dropdown lists as a selectable
+        option (it iterates the whole CruiseLine enum) but which has NO
+        scraper here at all. MSC is driven entirely by the separate
+        msc_commands.py/msc_session_controller.py subsystem, not this
+        BaseScraper hierarchy. Selecting "MSC" here would have silently
+        opened ESPRESSO's portal and run ESPRESSO's automation against
+        MSC booking IDs instead. Failing loudly is strictly safer than
+        the previous silent misroute — this does not change behavior for
+        any cruise line that ever worked correctly through this factory."""
         if cruise_line == CruiseLine.NCL:
             return NclScraper()
         if cruise_line == CruiseLine.GOCCL:
             return GoCCLScraper()
+        if cruise_line == CruiseLine.MSC:
+            raise ValueError(
+                "MSC is not driven through this scraper pipeline — use the separate MSC "
+                "subsystem (msc_session_controller.py / msc_commands.py) instead."
+            )
         return EspressoScraper()
 
     @staticmethod
     def _is_dead_browser_error(exc: Exception) -> bool:
-        """Whether an exception means the underlying Playwright browser/
-        context/page died mid-scrape (as opposed to a normal portal-level
-        failure like a bad selector or a real API error). Seen in practice
-        as e.g. "Page.goto: Target page, context or browser has been
-        closed" — reusing the same scraper for the next booking would just
-        fail identically every time, so this is the signal to restart it."""
-        msg = str(exc).lower()
-        return "has been closed" in msg or "target closed" in msg
+        """Delegates to scraper.base.is_dead_browser_error — moved there
+        2026-08-13 so NclScraper/GoCCLScraper's check_booking() can share
+        the exact same detection instead of each risking their own drifted
+        copy. Kept as a method here since it's still called from within
+        this class below."""
+        return is_dead_browser_error(exc)
 
     def has_live_session(self, cruise_line: CruiseLine) -> bool:
         """Whether a browser session is already open for this cruise line
         (i.e. check_login has run) — Start should require this, since
         starting one fresh would fall back to a hidden headless browser
-        with whatever stale session is on disk."""
-        return self._live_scraper is not None and self._live_scraper.cruise_line == cruise_line
+        with whatever stale session is on disk.
+
+        Also confirms the browser/page behind it is still actually alive
+        (not just that _live_scraper is a non-None object) — a scraper
+        that crashed mid-scan (see _is_dead_browser_error) would otherwise
+        report a live session that's really a dead browser underneath.
+        """
+        return (
+            self._live_scraper is not None
+            and self._live_scraper.cruise_line == cruise_line
+            and self._live_scraper.is_alive
+        )
 
     @staticmethod
     def _login_base_url(cruise_line: CruiseLine) -> str:
-        """Where to land a fresh browser session for a manual login check."""
+        """Where to land a fresh browser session for a manual login check.
+
+        Same MSC fallthrough bug as _get_scraper — see its docstring."""
         if cruise_line == CruiseLine.NCL:
             return settings.ncl_search_url
         if cruise_line == CruiseLine.GOCCL:
             return settings.goccl_search_url
+        if cruise_line == CruiseLine.MSC:
+            raise ValueError(
+                "MSC is not driven through this scraper pipeline — use the separate MSC "
+                "subsystem (msc_session_controller.py / msc_commands.py) instead."
+            )
         return settings.espresso_home_url
 
     async def get_or_create_scraper(self, cruise_line: CruiseLine, headless: bool | None = None) -> BaseScraper:
         """Get the live, already-open scraper for this cruise line, or start
         a new one if none is open yet (or the cruise line changed)."""
         if self._live_scraper is not None:
-            if self._live_scraper.cruise_line == cruise_line:
+            if self._live_scraper.cruise_line == cruise_line and self._live_scraper.is_alive:
                 return self._live_scraper
             await self._live_scraper.stop()
             self._live_scraper = None
@@ -116,17 +153,24 @@ class BookingService:
         base_url = self._login_base_url(cruise_line)
         await scraper.navigate(base_url)
 
+        # Require the same non-login URL on two consecutive polls before
+        # declaring success — see the matching comment in main.py's
+        # _run_login_check for why a single check is unsafe (a momentary
+        # SSO/MFA redirect hop can look like "logged in" for one poll).
         deadline = time.monotonic() + timeout_minutes * 60
         poll_s = 5
+        stable_url: str | None = None
         while time.monotonic() < deadline:
             await asyncio.sleep(poll_s)
             if cruise_line in (CruiseLine.NCL, CruiseLine.GOCCL):
                 logged_in = "login" not in scraper.page.url.lower() and "signin" not in scraper.page.url.lower()
             else:
                 logged_in = await scraper._check_login()
-            if logged_in:
+            current_url = scraper.page.url
+            if logged_in and current_url == stable_url:
                 logger.info("login_check.success", cruise_line=cruise_line.value)
                 return True
+            stable_url = current_url if logged_in else None
             logger.info("login_check.waiting", cruise_line=cruise_line.value)
 
         logger.warning("login_check.timeout", cruise_line=cruise_line.value)
@@ -143,6 +187,7 @@ class BookingService:
         capture_everything: bool = False,
         on_action: Callable[[dict], None] | None = None,
         keep_browser_open: bool = False,
+        headless: bool | None = None,
     ) -> ScanJob:
         """
         Start a batch scan of booking IDs.
@@ -167,6 +212,11 @@ class BookingService:
                 the batch finishes, instead of starting a fresh browser and
                 closing it — used by the GUI so login and every scan share
                 one continuous session. CLI one-shot runs leave this False.
+            headless: Only applies when keep_browser_open is False (a
+                reused live scraper already has its own headless state from
+                whatever started it). None defers to settings.browser_headless
+                (headless); pass False to pop a real, visible browser window
+                for this scan so it can be watched instead of trusted blind.
 
         Returns:
             ScanJob with results populated as they complete.
@@ -186,11 +236,17 @@ class BookingService:
         # Save job to DB
         await self._save_job_to_db(job)
 
-        # Run in background
-        asyncio.create_task(self._run_batch(
+        # Run in background — track_background_task retains a strong
+        # reference (see its docstring: a fire-and-forget task with none
+        # is a real GC/lost-exception risk) and logs any exception that
+        # escapes _run_batch's own try/except (which already handles the
+        # normal failure paths — this is a last-resort net for anything
+        # that somehow gets past that).
+        task = asyncio.create_task(self._run_batch(
             job, on_progress, bypass_cache, raw_dump_dir, capture_market_data,
-            capture_everything, on_action, keep_browser_open,
+            capture_everything, on_action, keep_browser_open, headless,
         ))
+        track_background_task(self._background_tasks, task)
 
         return job
 
@@ -204,6 +260,7 @@ class BookingService:
         capture_everything: bool = False,
         on_action: Callable[[dict], None] | None = None,
         keep_browser_open: bool = False,
+        headless: bool | None = None,
     ) -> None:
         """Execute the batch scan."""
         if keep_browser_open:
@@ -218,7 +275,7 @@ class BookingService:
 
         try:
             if not keep_browser_open:
-                await scraper.start()
+                await scraper.start(headless=headless)
 
             for i, booking_id in enumerate(job.booking_ids):
                 if self._stop_flags.get(job.job_id):
@@ -265,10 +322,55 @@ class BookingService:
                             if keep_browser_open:
                                 self._live_scraper = scraper
                         except Exception as restart_error:
+                            # CONFIRMED REAL BUG, fixed 2026-08-13: this used
+                            # to only log the failure and let the for-loop
+                            # continue to the NEXT booking with `scraper`
+                            # still pointing at an object whose start() never
+                            # completed — every remaining booking would then
+                            # fail with a generic "Scraper not started" error
+                            # that _is_dead_browser_error can't recognize, so
+                            # the restart path could never re-trigger for the
+                            # rest of this batch. scraper.start() (see
+                            # scraper/base.py) now cleans up its own partial
+                            # state on failure, so there's no leaked process
+                            # from this specific attempt — but the batch
+                            # genuinely cannot continue without a working
+                            # browser. Stop here rather than silently
+                            # grinding through identical failures, and make
+                            # sure a stale, never-started scraper is never
+                            # left as the "live" one for a future scan to
+                            # pick up.
                             logger.error("batch.browser_restart_failed", error=str(restart_error))
+                            if keep_browser_open:
+                                # Whatever self._live_scraper currently
+                                # references (the old, already-.stop()'d
+                                # dead scraper, or nothing) is not a working
+                                # session — never leave a stale/dead
+                                # reference for a future scan to mistake
+                                # for a live one.
+                                self._live_scraper = None
+                            job.status = ScanJobStatus.FAILED
+                            job.results.append(result)
+                            job.progress_done = i + 1
+                            break
 
+                # CONFIRMED REAL BUG 2026-08-12: everything from here down
+                # through on_progress() used to run with no exception
+                # guard at all — a single DB write failure (e.g. SQLite
+                # "database is locked" under concurrent writers), a cache
+                # error, or an on_progress callback raising would propagate
+                # out of this entire for-loop into the outer except at the
+                # bottom of this function, marking the WHOLE job FAILED and
+                # abandoning every remaining booking — directly violating
+                # this project's own "one booking fails, the rest continue"
+                # design intent (already honored for the scrape itself via
+                # the try/except a few lines up). Each step below now fails
+                # on its own without taking the batch down with it.
                 if capture_market_data and scraper.last_market_data:
-                    await self._save_market_data_to_db(result, scraper.last_market_data)
+                    try:
+                        await self._save_market_data_to_db(result, scraper.last_market_data)
+                    except Exception as e:
+                        logger.error("batch.market_data_save_failed", booking_id=booking_id, error=str(e))
 
                 if result.status == BookingStatus.ERROR:
                     consecutive_failures += 1
@@ -277,17 +379,26 @@ class BookingService:
 
                 # Cache NO_SAVING results (skipped in bypass mode — see above)
                 if not bypass_cache and result.status == BookingStatus.NO_SAVING:
-                    await self.cache.set_no_saving(job.cruise_line.value, booking_id)
+                    try:
+                        await self.cache.set_no_saving(job.cruise_line.value, booking_id)
+                    except Exception as e:
+                        logger.error("batch.cache_save_failed", booking_id=booking_id, error=str(e))
 
                 job.results.append(result)
                 job.progress_done = i + 1
 
                 # Persist result
-                await self._save_result_to_db(result)
-                await self._save_price_history(result)
+                try:
+                    await self._save_result_to_db(result)
+                    await self._save_price_history(result)
+                except Exception as e:
+                    logger.error("batch.persist_failed", booking_id=booking_id, error=str(e))
 
                 if on_progress:
-                    on_progress(job)
+                    try:
+                        on_progress(job)
+                    except Exception as e:
+                        logger.error("batch.on_progress_failed", booking_id=booking_id, error=str(e))
 
                 # A burst of failures usually means the portal session/token
                 # state needs time to recover, not faster retries.
@@ -307,7 +418,11 @@ class BookingService:
                         settings.scraper_interbooking_delay_max_s,
                     ))
 
-            if job.status != ScanJobStatus.STOPPED:
+            # Also excludes FAILED now (2026-08-13 fix) — a batch that broke
+            # out of the loop above because the browser restart failed must
+            # stay FAILED, not be silently overwritten back to COMPLETED
+            # just because the for-loop exited without raising.
+            if job.status not in (ScanJobStatus.STOPPED, ScanJobStatus.FAILED):
                 job.status = ScanJobStatus.COMPLETED
 
         except Exception as e:
@@ -354,6 +469,42 @@ class BookingService:
             if cruise_line:
                 query = query.where(BookingRecord.cruise_line == cruise_line)
             result = await session.execute(query)
+            records = result.scalars().all()
+            return [
+                {
+                    "booking_id": r.booking_id,
+                    "cruise_line": r.cruise_line,
+                    "status": r.status,
+                    "net_saving": r.net_saving,
+                    "old_total": r.old_total,
+                    "new_total": r.new_total,
+                    "confidence": r.confidence,
+                    "price_category": r.price_category,
+                    "new_price_category": r.new_price_category,
+                    "note": r.note,
+                    "created_at": r.created_at.isoformat() if r.created_at else None,
+                }
+                for r in records
+            ]
+
+    async def get_bookings_by_id(self, booking_id: str) -> list[dict]:
+        """Fetch every check result for one specific booking ID.
+
+        CONFIRMED REAL BUG, fixed 2026-08-13: the API route this backs
+        used to call get_all_bookings() (limit=100, no cruise_line
+        filter, ordered by created_at desc) and filter the result
+        CLIENT-SIDE for a matching booking_id. Once the `bookings` table
+        grows past 100 total rows since a given booking was last
+        checked, that booking silently falls outside the 100-row window
+        and the route 404s a real, previously-checked booking. Queries
+        directly by booking_id instead — same correct pattern
+        get_price_history (just below) already used for PriceHistory."""
+        async with async_session() as session:
+            result = await session.execute(
+                select(BookingRecord)
+                .where(BookingRecord.booking_id == booking_id)
+                .order_by(BookingRecord.created_at.desc())
+            )
             records = result.scalars().all()
             return [
                 {

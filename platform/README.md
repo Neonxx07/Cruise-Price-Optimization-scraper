@@ -1,6 +1,6 @@
 # Cruise Intelligence System
 
-> Enterprise-grade repricing intelligence for Royal Caribbean, Celebrity, Norwegian Cruise Line & Carnival (GoCCL).
+> Enterprise-grade repricing intelligence for Royal Caribbean, Celebrity & Norwegian Cruise Line.
 
 Evolved from the CruiseIntel Chrome Extension into a scalable, production-ready Python system.
 
@@ -12,15 +12,15 @@ Evolved from the CruiseIntel Chrome Extension into a scalable, production-ready 
 ┌─────────────────────────────────────────────────────────────┐
 │                     FastAPI REST API                         │
 │           /api/scan  /api/bookings  /api/export              │
-├──────────┬──────────────────────────────┬───────────────────┤
-│ Scheduler│     Booking Service          │   Cache Service   │
-│(APSched) │  (orchestration + persist)   │  (TTL-based)      │
-├──────────┴──────────┬───────────────────┴───────────────────┤
+├──────────────────────────────────┬─────────────────────────┤
+│        Booking Service           │     Cache Service       │
+│   (orchestration + persist)      │     (TTL-based)         │
+├───────────────────┬──────────────┴─────────────────────────┤
 │                     │                                        │
-│  ┌───────────┐ ┌──────────┐ ┌───────────┐                  │
-│  │ ESPRESSO  │ │   NCL    │ │   GoCCL   │                  │
-│  │  Scraper  │ │ Scraper  │ │  Scraper  │  ← Playwright     │
-│  └───────────┘ └──────────┘ └───────────┘                  │
+│  ┌─────────────┐   │   ┌──────────────┐                    │
+│  │  ESPRESSO   │   │   │     NCL      │                    │
+│  │  Scraper    │   │   │   Scraper    │  ← Playwright      │
+│  └─────────────┘   │   └──────────────┘                    │
 │                     │                                        │
 ├─────────────────────┴────────────────────────────────────────┤
 │              Price Calculator + Confidence Scorer             │
@@ -50,7 +50,6 @@ Create a `.env` file (optional — all settings have defaults):
 BROWSER_HEADLESS=true
 BROWSER_USER_DATA_DIR=/path/to/chrome/profile
 LOG_LEVEL=INFO
-SCHEDULER_ENABLED=false
 ```
 
 ### 3. Run the API Server
@@ -87,11 +86,10 @@ python main.py scan --bookings "4097990,64756965" --cruise-line ESPRESSO -o resu
 
 ```
 ├── core/               # Business logic (calculator, confidence, models)
-├── scraper/            # Playwright scrapers (ESPRESSO, NCL, GoCCL)
+├── scraper/            # Playwright scrapers (ESPRESSO, NCL)
 ├── api/                # FastAPI server + routes
 ├── services/           # Orchestration, caching, CSV export
 ├── models/             # SQLAlchemy database models
-├── scheduler/          # APScheduler periodic jobs
 ├── utils/              # Retry, structured logging
 ├── config/             # Pydantic Settings (env-based)
 ├── main.py             # CLI entry point
@@ -152,7 +150,6 @@ pyinstaller --onefile --name cruise-intel run.py
 | Scraping | Playwright (async) |
 | API | FastAPI |
 | Database | SQLAlchemy 2.0 + SQLite/PostgreSQL |
-| Scheduling | APScheduler |
 | Logging | structlog (JSON) |
 | Config | pydantic-settings |
 | Packaging | PyInstaller |

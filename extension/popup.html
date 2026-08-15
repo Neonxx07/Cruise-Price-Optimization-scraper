@@ -27,7 +27,7 @@
   #results{display:flex;flex-direction:column;gap:7px;max-height:320px;overflow-y:auto;}
   .card{background:white;border-radius:9px;padding:10px 12px;border-left:4px solid #e2e8f0;box-shadow:0 1px 3px rgba(0,0,0,.06);animation:pop .2s ease;}
   @keyframes pop{from{opacity:0;transform:translateY(-3px)}to{opacity:1;transform:translateY(0)}}
-  .card.OPTIMIZATION{border-left-color:#10b981;} .card.TRAP{border-left-color:#f59e0b;}
+  .card.OPTIMIZATION{border-left-color:#10b981;} .card.UPGRADE_AVAILABLE{border-left-color:#a855f7;} .card.TRAP{border-left-color:#f59e0b;}
   .card.NO_SAVING,.card.WLT,.card.SKIPPED_TODAY{border-left-color:#94a3b8;} .card.ERROR{border-left-color:#ef4444;}
   .card.CHECKING{border-left-color:#3b82f6;} .card.PAID_IN_FULL{border-left-color:#8b5cf6;}
   .card-top{display:flex;justify-content:space-between;align-items:center;margin-bottom:4px;} .card-id{font-weight:700;font-size:13px;}
@@ -103,6 +103,7 @@
   <div id="summary">
     <div class="sum-grid">
       <div><div class="sum-num" style="color:#10b981" id="sOpt">0</div><div class="sum-lbl">Optimize</div></div>
+      <div><div class="sum-num" style="color:#8b5cf6" id="sUpg">0</div><div class="sum-lbl">Upgrade</div></div>
       <div><div class="sum-num" style="color:#f59e0b" id="sTrap">0</div><div class="sum-lbl">Trap</div></div>
       <div><div class="sum-num" style="color:#94a3b8" id="sNos">0</div><div class="sum-lbl">No saving</div></div>
       <div><div class="sum-num" style="color:#8b5cf6" id="sPaid">0</div><div class="sum-lbl">Paid full</div></div>

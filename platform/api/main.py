@@ -36,14 +36,25 @@ def create_app() -> FastAPI:
         lifespan=lifespan,
     )
 
-    # CORS — allow all for development, restrict in production
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origins=["*"],
-        allow_credentials=True,
-        allow_methods=["*"],
-        allow_headers=["*"],
-    )
+    # CONFIRMED REAL RISK, fixed 2026-08-13: this used to be
+    # allow_origins=["*"] + allow_credentials=True — see the detailed
+    # explanation on settings.cors_allowed_origins. Investigated first
+    # (per the fix instructions: don't touch this without checking
+    # actual reachability/usage): this API defaults to binding
+    # 127.0.0.1 only (settings.api_host), and confirmed nothing in this
+    # project's GUI/CLI/extension calls it over HTTP at all — so an
+    # empty allow-list (no cross-origin access) changes no existing
+    # functionality. Only enables credentialed CORS if origins are ever
+    # explicitly configured, since allow_credentials=True is meaningless
+    # (and FastAPI/Starlette will refuse it) paired with an empty list.
+    if settings.cors_allowed_origins:
+        app.add_middleware(
+            CORSMiddleware,
+            allow_origins=settings.cors_allowed_origins,
+            allow_credentials=True,
+            allow_methods=["*"],
+            allow_headers=["*"],
+        )
 
     app.include_router(router)
 

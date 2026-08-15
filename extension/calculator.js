@@ -38,6 +38,23 @@ function espressoGetPackages(items) {
   return items.filter(i => i.paxId === 'total' && safeFloat(i.amount) > 0 && !espressoIsFee(i));
 }
 
+// Sums CRUISE_PROMO-type invoice line amounts by normalized name, across
+// every passenger. Mirrors core/calculator.py's _get_promo_value_by_name():
+// CRUISE_PROMO lines are always tagged with a per-passenger paxId, never
+// "total", so espressoGetPackages() never sees them — this is the only way
+// to recover the real dollar value of a lost fare/promo code. Amounts are
+// typically negative (a discount), so losing one costs abs(amount) more.
+function espressoGetPromoValueByName(items) {
+  const values = {};
+  for (const i of items) {
+    if (normStr(i.type) !== 'CRUISE_PROMO') continue;
+    const name = normStr(i.name || i.normalizedName || '');
+    if (!name) continue;
+    values[name] = (values[name] || 0) + safeFloat(i.amount);
+  }
+  return values;
+}
+
 const NCL_ADDON_VALUES = {
   'wi-fi': 150, 'wifi': 150, 'internet': 150,
   'dining': 80, 'specialty dining': 80, 'restaurant': 80,
@@ -54,7 +71,11 @@ function nclAddonValue(addonName) {
   return 0;
 }
 
-const READDABLE_PATTERNS = [/email/i, /bonus/i, /promo/i, /loyalty/i, /coupon/i];
+// /sav/i added after mining a real 278-booking run (2026-07-31): an entire
+// "SAV/SAVE" family of fare codes (SAVEUPTO100 NRD, WEEKENDSAV NRD,
+// BOOKNOWSAVNRD, CANADA SAV, etc.) was being flagged "truly lost" despite
+// reading as the same kind of marketing promo as the patterns above.
+const READDABLE_PATTERNS = [/email/i, /bonus/i, /promo/i, /loyalty/i, /coupon/i, /sav/i];
 function isReAddable(fareName) { return READDABLE_PATTERNS.some(p => p.test(fareName)); }
 
 // Minimum ratio of (price drop) to (OBC lost) before a repricing that
@@ -103,11 +124,11 @@ function calculateESPRESSO(raw, bookingId, priceCategory) {
     const oldPkgs = espressoGetPackages(oldItems);
     const newPkgNames = new Set(espressoGetPackages(newItems).map(i => normStr(i.name || i.normalizedName || '')).filter(Boolean));
     const lostPkgs = oldPkgs.filter(i => { const n = normStr(i.name || i.normalizedName || ''); return n && !newPkgNames.has(n); });
-    const lostPkgValue = round2(lostPkgs.reduce((s, i) => s + safeFloat(i.amount), 0));
-    const lostPkgNames = lostPkgs.map(i => i.name || i.normalizedName || '').filter(Boolean);
+    let lostPkgValue = round2(lostPkgs.reduce((s, i) => s + safeFloat(i.amount), 0));
+    let lostPkgNames = lostPkgs.map(i => i.name || i.normalizedName || '').filter(Boolean);
 
-    const net = round2(priceDrop + obcChange - lostPkgValue);
-
+    // Fare analysis (computed before `net` — a truly-lost fare's real
+    // dollar cost needs to fold into lostPkgValue first).
     const normFare = s => normStr(s);
     const oldFareNames = (data.oldFares || []).map(f => f.name || '').filter(Boolean);
     const newFareNames = (data.newFares || []).map(f => f.name || '').filter(Boolean);
@@ -117,6 +138,23 @@ function calculateESPRESSO(raw, bookingId, priceCategory) {
     const reAddableFares = allLostFares.filter(f => isReAddable(f));
     const trulyLostFares = allLostFares.filter(f => !isReAddable(f));
     const gainedFares = newFareNames.filter(f => !oldFareSet.has(normFare(f)));
+
+    // A truly-lost fare (e.g. a BOGO discount) used to contribute $0 to
+    // netSaving — its real dollar value lives in CRUISE_PROMO invoice
+    // lines. Mirrors core/calculator.py's equivalent block.
+    const oldPromoValues = espressoGetPromoValueByName(oldItems);
+    const pricedLostFares = [];
+    for (const fareName of trulyLostFares) {
+      const promoAmount = oldPromoValues[normFare(fareName)];
+      if (promoAmount) pricedLostFares.push([fareName, Math.abs(round2(promoAmount))]);
+    }
+    const lostFareValue = round2(pricedLostFares.reduce((s, [, v]) => s + v, 0));
+    if (lostFareValue) {
+      lostPkgValue = round2(lostPkgValue + lostFareValue);
+      lostPkgNames = lostPkgNames.concat(pricedLostFares.map(([name, value]) => `${name} ($${value.toFixed(2)})`));
+    }
+
+    const net = round2(priceDrop + obcChange - lostPkgValue);
 
     const reAddNote = reAddableFares.length ? ' — re-add: ' + reAddableFares.join(', ') : '';
     let status, note;
@@ -235,11 +273,108 @@ function calculateGOCCL(bookingId, priceCategory, currentStateroomType, currentO
     return {
       cruiseLine: 'GOCCL', status: 'OPTIMIZATION',
       note: `candidate $${Math.round(priceDrop)} — offer code '${cheapest.offerCode || ''}' (${cheapest.offerName || ''}) — UNCONFIRMED, preview before repricing`,
-      bookingId, priceCategory, oldTotal, newTotal, priceDrop, obcChange: 0, netSaving: priceDrop,
+      bookingId, priceCategory,
+      // The candidate offer code — carried here (not a real category) so
+      // the popup's "Open Reprice Popup" button can pass it straight to
+      // fn_goccl_selectOfferAndContinue() via data-cat. Previously unset,
+      // so the popup fell back to priceCategory (the unchanged category
+      // code) and the auto-select silently failed to match any button.
+      newPriceCategory: cheapest.offerCode || '',
+      oldTotal, newTotal, priceDrop, obcChange: 0, netSaving: priceDrop,
       lostFares: [], gainedFares: [], reAddableFares: [], lostPkgNames: [], lostPkgValue: 0,
       confidence: GOCCL_CANDIDATE_CONFIDENCE, oldCruiseFare: 0, newCruiseFare: 0, fareChangePct: 0, error: null
     };
   } catch (e) { return { cruiseLine: 'GOCCL', status: 'ERROR', error: e.message, bookingId, priceCategory }; }
+}
+
+// ── Paid-in-Full Detection ─────────────────────────────────────
+// Mirrors core/calculator.py's is_paid_in_full(). Tolerance covers
+// rounding dust on the portal's own reconciled balance, not a real
+// remaining amount.
+// WIDENED 2026-08-04 from 1.5% to 5% — see the long comment above
+// PAID_IN_FULL_TOLERANCE_PCT in core/calculator.py for the full
+// rationale (booking 1000003, no natural cutoff in the real data,
+// this is a tunable business-risk choice, not a discovered fact).
+const PAID_IN_FULL_TOLERANCE_FLAT = 25.0;
+const PAID_IN_FULL_TOLERANCE_PCT = 0.05;
+function isPaidInFull(finalPaymentDue, totalPrice) {
+  if (finalPaymentDue == null) return false;
+  const tolerance = Math.max(PAID_IN_FULL_TOLERANCE_FLAT, totalPrice * PAID_IN_FULL_TOLERANCE_PCT);
+  return finalPaymentDue <= tolerance;
+}
+
+// ── Free-Upgrade Detection ──────────────────────────────────────
+// Mirrors core/calculator.py's ESPRESSO_ROOM_TYPE_RANK/find_upgrade_candidates().
+// HARD RULE: never suggest anything that could be a downgrade. Only ever
+// surfaces a STRICTLY higher room-type tier at or below the current
+// price — never a same-tier "cheaper" swap (a coarse room-type label can
+// hide a real downgrade — different deck/location/view). Always
+// human-reviewed before being acted on (BookingStatus.UPGRADE_AVAILABLE).
+//
+// CONFIRMED WRONG 2026-08-01, then fixed: findFreeUpgrade() used to compare
+// a candidate's category-table price directly against the booking's real
+// invoice TOTAL. ESPRESSO's own on-page disclaimer confirms the table
+// price is PER-PERSON, TRIPLE-OCCUPANCY — not a total — so that comparison
+// produced 6 false UPGRADE_AVAILABLE results in one run, all manually
+// confirmed not to exist. findUpgradeCandidates() below is now a FREE,
+// UNIT-SAFE pre-filter only (per-person vs. per-person, same table, same
+// booking — never against a total) — it decides nothing by itself. Every
+// candidate it returns must still be confirmed via a REAL
+// allocate()+repriceModalCheck() round trip (see background.js) before
+// ever being surfaced as an upgrade. See core/calculator.py's module
+// docstring for the full incident history.
+const ESPRESSO_ROOM_TYPE_RANK = {
+  'INTERIOR': 1,
+  'OUTSIDE': 2,
+  'BALCONY STATEROOM': 3,
+  'VERANDA': 3,
+  'SUITE/DELUXE': 4,
+  'SUITE': 4,
+};
+const ROW_PRICE_RE = /([\d,]+\.\d{2})/;
+const ROW_TYPE_RE = /\n\t([A-Za-z /]+?)\t\n/;
+function roomTypeFromRow(row) {
+  const m = ROW_TYPE_RE.exec(row.rowText || '');
+  return m ? normStr(m[1]) : null;
+}
+function priceFromRow(row) {
+  const m = ROW_PRICE_RE.exec(row.rowText || '');
+  return m ? safeFloat(m[1].replace(/,/g, '')) : null;
+}
+function findUpgradeCandidates(currentCategory, categoryRows) {
+  if (!currentCategory || !categoryRows || !categoryRows.length) return [];
+  const currentRow = categoryRows.find(r => r.category === currentCategory);
+  if (!currentRow) return [];
+  const currentType = roomTypeFromRow(currentRow);
+  const currentRank = currentType ? ESPRESSO_ROOM_TYPE_RANK[currentType] : undefined;
+  const currentPP = priceFromRow(currentRow);
+  if (currentRank == null || currentPP == null) return [];
+  const candidates = [];
+  for (const row of categoryRows) {
+    if (row.status !== 'AVL') continue;
+    const rtype = roomTypeFromRow(row);
+    const rank = rtype ? ESPRESSO_ROOM_TYPE_RANK[rtype] : undefined;
+    if (rank == null || rank <= currentRank) continue;
+    const pp = priceFromRow(row);
+    if (pp == null || pp > currentPP) continue;
+    candidates.push({ category: row.category, roomType: rtype, tablePerPersonPrice: pp });
+  }
+  candidates.sort((a, b) => a.tablePerPersonPrice - b.tablePerPersonPrice);
+  return candidates;
+}
+// upgrade.price must be a REAL, ESPRESSO-confirmed total (from
+// fn_espresso_readTopPrices() after a real allocate() call in
+// background.js) — never a category-table estimate.
+function makeUpgradeAvailableResult(bookingId, priceCategory, cruiseLine, oldTotal, upgrade) {
+  return {
+    cruiseLine, status: 'UPGRADE_AVAILABLE',
+    note: `🆙 Confirmed free upgrade: ${priceCategory} → ${upgrade.category} (${upgrade.roomType}) at $${upgrade.price.toFixed(2)} — human review required`,
+    bookingId, priceCategory, newPriceCategory: upgrade.category,
+    oldTotal, newTotal: upgrade.price, priceDrop: round2(oldTotal - upgrade.price), obcChange: 0,
+    netSaving: round2(oldTotal - upgrade.price),
+    lostFares: [], reAddableFares: [], gainedFares: [], lostPkgNames: [], lostPkgValue: 0,
+    confidence: 0, oldCruiseFare: 0, newCruiseFare: 0, fareChangePct: 0, error: null,
+  };
 }
 
 function makeWLTResult(bookingId, priceCategory, cruiseLine) { return { cruiseLine, status: 'WLT', note: 'WLT - waitlisted', bookingId, priceCategory, netSaving: 0, oldTotal: 0, newTotal: 0, priceDrop: 0, obcChange: 0, lostFares: [], gainedFares: [], reAddableFares: [], lostPkgNames: [], lostPkgValue: 0, confidence: 0, error: null }; }

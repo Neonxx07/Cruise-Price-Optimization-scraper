@@ -11,17 +11,33 @@ aiosqlite>=0.19.0
 # Scraping
 playwright>=1.40.0
 
-# Scheduling
-apscheduler>=3.10.4
-
 # Logging
 structlog>=23.2.0
 
+# MSC credential storage (Windows Credential Manager, DPAPI-encrypted) --
+# imported unconditionally by msc_commands.py, msc_save_credentials.py,
+# msc_clear_credentials.py. CONFIRMED REAL GAP, fixed 2026-08-13: this
+# was missing entirely -- a fresh `pip install -r requirements.txt`
+# followed by running any MSC script raised ModuleNotFoundError.
+keyring>=24.0.0
+
 # Utilities
+# httpx: no direct `import httpx` anywhere in this project's own code
+# (confirmed via project-wide grep, 2026-08-13 audit) -- kept rather
+# than removed because FastAPI/Starlette's own TestClient depends on it
+# (confirmed: importing fastapi.testclient triggers a real httpx import),
+# so removing it would break `python -m pytest` the moment any test uses
+# TestClient. Not dead weight, just not imported BY NAME in this repo.
 httpx>=0.25.0
 python-dotenv>=1.0.0
 
 # Export
+# python-multipart: no direct import found (no UploadFile/File(...) usage
+# in api/routes.py), but kept rather than removed -- FastAPI historically
+# treats this as an implicit dependency for form/file-upload support, and
+# there's no clear signal it's genuinely impossible to need later. Revisit
+# if this project ever adds an upload endpoint or confirms it truly isn't
+# pulled in by FastAPI itself.
 python-multipart>=0.0.6
 openpyxl>=3.1.0
 

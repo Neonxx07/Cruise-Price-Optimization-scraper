@@ -22,11 +22,16 @@ def export_results_csv(results: list[BookingResult]) -> str:
     output = io.StringIO()
     writer = csv.writer(output, quoting=csv.QUOTE_ALL)
 
-    # Header
+    # Header — Price Drop/OBC Change/Lost Fares/Re-addable Fares/Gained
+    # Fares appended at the end (existing columns kept in their original
+    # order/position for anyone already relying on it): the Excel export
+    # already had these, the CSV export didn't, and there was no reason
+    # for the two to disagree on what's available.
     writer.writerow([
         "Booking ID", "Cruise Line", "Status", "Net Saving",
         "Old Total", "New Total", "Category", "New Category",
         "Note", "Lost Packages", "Confidence", "Checked At",
+        "Price Drop", "OBC Change", "Lost Fares", "Re-addable Fares", "Gained Fares",
     ])
 
     # Data rows
@@ -44,6 +49,11 @@ def export_results_csv(results: list[BookingResult]) -> str:
             "|".join(r.lost_pkg_names),
             r.confidence,
             r.checked_at.isoformat() if r.checked_at else "",
+            f"{r.price_drop:.2f}",
+            f"{r.obc_change:.2f}",
+            "|".join(r.lost_fares),
+            "|".join(r.re_addable_fares),
+            "|".join(r.gained_fares),
         ])
 
     return output.getvalue()

@@ -33,7 +33,6 @@ CruiseIntel Optimization is an internal repricing-intelligence system built for 
    - [main.py — CLI](#mainpy--cli)
    - [easy_menu.py — console menu](#easy_menupy--console-menu)
    - [api/ — FastAPI server](#api--fastapi-server)
-   - [scheduler/jobs.py — APScheduler](#schedulerjobspy--apscheduler)
    - [config/settings.py](#configsettingspy)
    - [utils/ — logging and retry](#utils--logging-and-retry)
    - [Build, packaging, and environment](#build-packaging-and-environment)
@@ -41,7 +40,8 @@ CruiseIntel Optimization is an internal repricing-intelligence system built for 
 7. [Bug History / Lessons Learned](#bug-history--lessons-learned)
 8. [Known Open Issues](#known-open-issues)
 9. [Setup & Operation](#setup--operation)
-10. [Roadmap](#roadmap)
+10. [MSC Cruises Reference](#msc-cruises-reference)
+11. [Roadmap](#roadmap)
 
 ---
 
@@ -66,7 +66,6 @@ Cruise-Price-Optimization-Extension-main/
     ├── models/                  database.py — SQLAlchemy ORM schema (SQLite by default)
     ├── gui/                     PySide6 + qasync desktop scanner application
     ├── api/                     FastAPI REST server (designed, currently unused by the real workflow)
-    ├── scheduler/                APScheduler jobs (wired up, never invoked)
     ├── config/                  settings.py — pydantic-settings configuration
     ├── utils/                   logging.py (structlog), retry.py (retry_async)
     ├── main.py                  CLI entry point (api / login / scan / watch subcommands)
@@ -79,7 +78,7 @@ Cruise-Price-Optimization-Extension-main/
 
 ### Why two parallel implementations exist
 
-The Chrome extension is the lightweight, zero-install-friction tool an individual agent uses for ad-hoc, one-off checks directly in their browser, reusing whatever session cookies are already in that browser profile. The Python platform exists for everything the extension architecturally cannot do well: unattended batch/overnight runs across many bookings, a real database for historical price tracking, CSV/Excel exports with richer columns, a desktop GUI for less technical staff, and a documented (if not yet wired up) path to a multi-user API server and scheduler. Both were built against the same portals and had to solve the same problems (session/token management, WLT detection, paid-in-full detection, package/OBC loss accounting), so the Python platform is described throughout its own source as a direct "port" of the extension's logic — `core/calculator.py`'s docstring literally says "Ported from calculator.js", `scraper/espresso.py` says "Ported from adapter_espresso.js", `scraper/ncl.py` says "Ported from adapter_ncl.js", and `services/booking_service.py` says its orchestration loop "is the enterprise equivalent of background.js runBatch()".
+The Chrome extension is the lightweight, zero-install-friction tool an individual agent uses for ad-hoc, one-off checks directly in their browser, reusing whatever session cookies are already in that browser profile. The Python platform exists for everything the extension architecturally cannot do well: unattended batch/overnight runs across many bookings, a real database for historical price tracking, CSV/Excel exports with richer columns, a desktop GUI for less technical staff, and a documented (if not yet wired up) path to a multi-user API server. Both were built against the same portals and had to solve the same problems (session/token management, WLT detection, paid-in-full detection, package/OBC loss accounting), so the Python platform is described throughout its own source as a direct "port" of the extension's logic — `core/calculator.py`'s docstring literally says "Ported from calculator.js", `scraper/espresso.py` says "Ported from adapter_espresso.js", `scraper/ncl.py` says "Ported from adapter_ncl.js", and `services/booking_service.py` says its orchestration loop "is the enterprise equivalent of background.js runBatch()".
 
 ### Shared business-logic concepts
 
@@ -1033,7 +1032,7 @@ Menu options: (1) **Log into ESPRESSO** — hardcoded ESPRESSO, no choice; (2) *
 
 ### api/ — FastAPI server
 
-`api/main.py` — `create_app()`: `FastAPI(title=settings.app_name, version=settings.app_version, ..., lifespan=lifespan)`. CORS middleware: `allow_origins=["*"]`, `allow_credentials=True`, `allow_methods=["*"]`, `allow_headers=["*"]` (comment: "allow all for development, restrict in production"). `lifespan`: startup calls `setup_logging(...)` then `await init_db()`; shutdown is a bare comment with **no actual cleanup code** — `start_scheduler()`/`stop_scheduler()` are never called here or anywhere in this path. Module-level `app = create_app()` — the `uvicorn api.main:app` target.
+`api/main.py` — `create_app()`: `FastAPI(title=settings.app_name, version=settings.app_version, ..., lifespan=lifespan)`. CORS middleware: `allow_origins=["*"]`, `allow_credentials=True`, `allow_methods=["*"]`, `allow_headers=["*"]` (comment: "allow all for development, restrict in production"). `lifespan`: startup calls `setup_logging(...)` then `await init_db()`; shutdown is a bare comment with **no actual cleanup code**. Module-level `app = create_app()` — the `uvicorn api.main:app` target.
 
 `api/routes.py` — `router = APIRouter(prefix="/api")`. `_booking_service = BookingService()` instantiated once at import time, shared across all requests (no `Depends()` anywhere).
 
@@ -1049,28 +1048,6 @@ Menu options: (1) **Log into ESPRESSO** — hardcoded ESPRESSO, no choice; (2) *
 | POST | `/api/export/csv` | only supports export-by-`job_id`; `ExportRequest.cruise_line` field exists but is **never read** by the handler; response filename is always the static string `cruiseintel_export.csv` regardless of job |
 
 `api/schemas.py` — Pydantic v2 request/response models: `ScanRequest` (`booking_ids: list[str]` 1–100 items, `cruise_line` pattern `^(ESPRESSO|NCL)$` default `"ESPRESSO"`), `StopScanRequest`, `ExportRequest`, `BookingResponse`, `ScanJobResponse`, `PriceHistoryEntry`, `HealthResponse`.
-
-### scheduler/jobs.py — APScheduler
-
-Docstring: *"Periodic task scheduler using APScheduler. Runs background jobs like periodic price checks and cache cleanup."*
-
-`_cleanup_expired_cache()`: calls `cache_service.cleanup_expired()`, logs the removed count if > 0.
-
-`_periodic_check()` — confirmed **stub/placeholder**, docstring quoted:
-```
-Periodic price check for watched bookings.
-
-This is a placeholder — in production, you would:
-1. Query a "watchlist" table for bookings to re-check
-2. Run them through the scraper
-3. Store updated results
-4. Send notifications if savings are found
-```
-Body is a single line: `logger.info("scheduler.periodic_check", msg="Periodic check triggered (no watchlist configured)")`. It does nothing else.
-
-`start_scheduler()`: idempotent; always registers `cache_cleanup` (every 6 hours); additionally registers `periodic_check` (every `settings.scheduler_interval_minutes`, default 60) only if `settings.scheduler_enabled` (default `False`). `stop_scheduler()`: shuts down gracefully if a scheduler instance exists.
-
-**Confirmed dead code, repo-wide**: a search for `start_scheduler|stop_scheduler` across all of `platform/` returns only the definition in `jobs.py` and the re-export in `scheduler/__init__.py`. Nothing else — not `api/main.py`'s `lifespan`, not `main.py`, not `easy_menu.py`, not any service — ever calls either function. See [Known Open Issues](#known-open-issues).
 
 ### config/settings.py
 
@@ -1096,8 +1073,6 @@ Body is a single line: `logger.info("scheduler.periodic_check", msg="Periodic ch
 | `scraper_cooldown_seconds` | `120.0` | Cooldown duration |
 | `proxy_url` / `proxy_username` / `proxy_password` | `""` | Proxy support (design-ready, not required) |
 | `cache_ttl_hours` | `12` | Cache TTL |
-| `scheduler_enabled` | `False` | Gates the (never-invoked) `periodic_check` job |
-| `scheduler_interval_minutes` | `60` | Interval for the dead periodic-check job |
 | `espresso_home_url` | `https://secure.cruisingpower.com/home` | ESPRESSO landing/login page |
 | `espresso_base_url` | `https://secure.cruisingpower.com/espresso/protected/reservations.do` | ESPRESSO reservations base |
 | `ncl_search_url` | `https://seawebagents.ncl.com/tva/search/` | NCL SeaWeb search URL |
@@ -1149,7 +1124,7 @@ if __name__ == "__main__":
     main()
 ```
 
-`requirements.txt` (all minimum-version, none pinned exactly): `fastapi>=0.104.0`, `uvicorn[standard]>=0.24.0`, `pydantic>=2.5.0`, `pydantic-settings>=2.1.0`, `sqlalchemy>=2.0.23`, `aiosqlite>=0.19.0`, `playwright>=1.40.0`, `apscheduler>=3.10.4`, `structlog>=23.2.0`, `httpx>=0.25.0`, `python-dotenv>=1.0.0`, `python-multipart>=0.0.6`, `openpyxl>=3.1.0`, `pyinstaller>=6.2.0`. **`PySide6`/`qasync` are NOT listed** — installed separately, only by `START_GUI.bat`.
+`requirements.txt` (all minimum-version, none pinned exactly): `fastapi>=0.104.0`, `uvicorn[standard]>=0.24.0`, `pydantic>=2.5.0`, `pydantic-settings>=2.1.0`, `sqlalchemy>=2.0.23`, `aiosqlite>=0.19.0`, `playwright>=1.40.0`, `structlog>=23.2.0`, `httpx>=0.25.0`, `python-dotenv>=1.0.0`, `python-multipart>=0.0.6`, `openpyxl>=3.1.0`, `pyinstaller>=6.2.0`. **`PySide6`/`qasync` are NOT listed** — installed separately, only by `START_GUI.bat`.
 
 `START.bat` — CLI/easy_menu launcher: repo-local `venv\`, generic `python` launcher, installs only `requirements.txt`, runs `easy_menu.py`, unconditional `pause` at the end (even on success).
 
@@ -1223,6 +1198,24 @@ The first attempt at implementing the fix above read the displayed price **befor
 
 **Why this matters for future maintainers**: this is exactly the kind of mistake a future re-implementation (a new cruise-line adapter, a rewritten scraper, an AI-driven scraping layer per the roadmap) could repeat, because the wrong version *looks* like a reasonable optimization ("why redo the expensive API calls if we can tell from the page there's no change?"). The general lesson, stated architecturally: **when raw `fetch()` calls bypass a framework's own state-update mechanism (Angular, React, or otherwise), any read of that framework's rendered state must happen strictly after the real network calls that would have triggered a re-render — never before, and never as a gate that skips those calls.** A pre-emptive check against stale framework state is worse than no check at all, because it fails silently and confidently, masking exactly the results the whole system exists to find.
 
+### 6. Free-upgrade detection compared a per-person table rate against a real invoice TOTAL — every result was a false positive
+
+The original `find_free_upgrade()` (`core/calculator.py`/`calculator.js`) flagged `UPGRADE_AVAILABLE` whenever a higher-tier category's row in the scraped availability table showed a price at or below the booking's current invoice total. This shipped, ran in production, and every single result it produced was wrong — six were manually checked against the real portal by the project owner and none held up, and the mistake reached his manager before it was caught. **Root cause**: the availability table's price is per-person, triple-occupancy (confirmed via ESPRESSO's own on-page disclaimer text), while the invoice total it was compared against is the whole booking's real dollar total — an apples-to-oranges unit mismatch that happened to produce plausible-looking numbers often enough to pass casual review.
+
+**The fix — two stages, no estimation anywhere**:
+1. `find_upgrade_candidates()` (`core/calculator.py`) / `findUpgradeCandidates()` (`calculator.js`): a free, unit-safe pre-filter that only ever compares the *candidate's* per-person table rate against the *current category's own* per-person table rate — same table, same booking, same units on both sides. This decides nothing about whether a candidate is real; it only avoids spending a network round trip on candidates that are obviously not competitive even at this coarse level. Measured against 155 real category tables: cuts round trips by 95.8% (862 → 36).
+2. `_confirm_candidate_total()` (`scraper/espresso.py`) / inline in `background.js`: for each candidate that survives the filter, runs the exact same `allocate()` + `showRepriceModalCheck()` round trip already trusted for OPTIMIZATION/TRAP, then reads ESPRESSO's own rendered `sb.summary.price.allocationPrice` (via the pre-existing `read_top_prices()`) as the real, confirmed total for that category — never a table estimate. Only a confirmed total that is actually `<= old_total` is ever surfaced.
+
+A calibrated-estimate approach (deriving an implied per-booking multiplier from the current category's own row, then applying it to candidates without a real network round trip) was tested against the same 6 known false positives and correctly rejected 4 of them — but still let 2 through as false "savings," a ~15-16% margin of error being enough to flip the sign on close cases. **Conclusion, confirmed empirically, not assumed: no estimation-based approach is safe enough for this feature. Only a real confirmed round trip is.** Do not reintroduce a version of this check that skips the real `allocate()`/`repriceModalCheck` confirmation step, no matter how well-calibrated the shortcut appears.
+
+One more thing discovered while building the fix: `showRepriceModalCheck` can return `{"key": "skipRepriceModal"}` (this booking can't *commit* a reprice into this category — a price-program restriction) while `allocationPrice` still updates to the real confirmed total regardless. These are different questions — "can I confirm this reprice" vs. "what would this category actually cost" — and only the second one matters for deciding whether something is a genuine upgrade.
+
+### 7. Group bookings looked broken, turned out to be a one-off network blip — confirmed working via captured data, no code change needed
+
+Two bookings (1000001, 1000002) failed a full batch run with `#reservationid`-visibility timeouts, and both turned out to be **group bookings** (page title "Group Booking Summary" instead of the individual-booking "Reservation Summary"). That correlation looked causal at first — worth investigating rather than assuming, per this project's standing rule of checking captured data before concluding anything. The captured snapshot for 1000001 showed one real oddity: the top-of-page reservation-status widget's Angular binding never rendered (literal `{{sb.reservation.status...}}` template text instead of a real value), while everything else on the same page — price, guests, offers — rendered correctly. On the very next retry, the session briefly bounced to `/login` entirely.
+
+**Investigated on the next full run, with zero code changes**: both bookings went through the identical flow used for individual bookings — `_read_category()` (`#currentPriceCat`), click "Categories", read the category table, allocate + `showRepriceModalCheck` — and produced clean, correct, real results: 1000001 came back `NO_SAVING`/"Booking restriction — price program change not allowed" (the existing skip_reprice sentinel), and 1000002 came back `WLT`/"WLT - waitlisted" (the existing WLT sentinel). **Conclusion: group bookings are already fully supported by the existing flow — no special-casing needed.** The original failure was an isolated `Failed to fetch` network error on the reprice API call for 1000001, which then cascaded into the next booking's search also timing out — ordinary transient noise (the same category as any other isolated `ERROR` result), not a structural incompatibility with group-booking pages. The broken top-status widget is purely cosmetic display and isn't read by any scraper logic, so its rendering failure has no functional effect either way.
+
 ---
 
 ## Known Open Issues
@@ -1237,11 +1230,19 @@ The following are **unresolved as of this writing** — documented so they are n
 
 2. **The CSV export is missing the `Lost Fares` / `Re-addable Fares` / `Gained Fares` columns** that the Excel export already includes. `services/csv_export.py` never references `result.lost_fares`, `result.re_addable_fares`, or `result.gained_fares` at all — only `lost_pkg_names` ("Lost Packages") makes it into the CSV. This is a feature gap, not a correctness bug, but it means CSV-only workflows lose visibility into fare-level re-addability that the same booking's Excel report would show.
 
-3. **`platform/scheduler/jobs.py` is fully wired and importable but never actually invoked anywhere in the running application.** A repo-wide search for `start_scheduler`/`stop_scheduler` finds only the function definitions in `jobs.py` itself and the re-export in `scheduler/__init__.py` — not `api/main.py`'s `lifespan`, not `main.py`, not `easy_menu.py`, not any service. The scheduler is never started, so `cache_cleanup` and `periodic_check` never run in practice. Separately, `_periodic_check` — the one job with any real intent behind it (periodic watchlist checking) — is an explicit placeholder that does nothing beyond logging a message; its docstring spells out the four steps a real implementation would need.
+3. ~~`platform/scheduler/jobs.py` is fully wired and importable but never actually invoked anywhere in the running application.`~~ **Resolved 2026-08-11**: the entire `platform/scheduler/` subsystem (APScheduler-based `cache_cleanup` job plus the `_periodic_check` stub) was deleted as dead code after confirming a repo-wide search for `start_scheduler`/`stop_scheduler` found no callers anywhere — not `api/main.py`'s `lifespan`, not `main.py`, not `easy_menu.py`, not any service. It no longer exists in the codebase; do not reintroduce it.
 
 4. **`platform/api/` (the FastAPI server) is complete, working, and documented, but is not used by the project owner's actual workflow.** The CLI, desktop GUI, and Chrome extension are the real, in-use tools; the REST API exists as a designed-but-currently-unused subsystem, one layer of the platform's own roadmap (see below) rather than part of daily operation today.
 
 5. **`easy_menu.py`'s `menu_scan()`/`menu_watch()` build a `SimpleNamespace` missing the `capture_market_data`/`capture_everything` attributes** that `_run_scan`/`_run_watch` access directly (no `getattr` default). This is a latent `AttributeError` risk — the console-menu path could crash on first use of these attributes if the underlying CLI functions are ever changed to actually branch on them without an explicit default.
+
+6. **This document predates the GoCCL (Go Celebrity/RCL... third-line) scraper/adapter and does not cover it.** Treat `scraper/`, `extension/adapter_goccl.js`, and the GUI/CLI code itself as authoritative over this document for anything GoCCL-related until this doc gets a real pass for that cruise line.
+
+7. **Paid-in-Full tolerance rule may be stricter than what "paid in full" means in practice.** `is_paid_in_full()` (`core/calculator.py`) treats a booking as paid in full only when `final_payment_due <= max($25, 1.5% of total_price)`. Real case found 2026-08-03: booking 1000003 has $370.84 still due (final payment not due for 9 months) on an $8,892.68 total — above the tolerance, so it correctly fell through to normal OPTIMIZATION scoring under the rule as designed, but the project owner flagged it as a booking that should have been caught. Needs the project owner's actual definition of "paid in full" for a case like this before the tolerance is changed — do not widen it on assumption.
+
+8. **Celebrity's "SAILAGAIN NRD" promo ($150 OBC) vs. "SAVEUPTO100 NRD" (-$100 fare discount) — substitution rule not yet verified against captured data.** Of 128 captured Celebrity bookings, only 2 currently show SailAgain applied (both Celebrity Reflection), 66 show SaveUpTo100 instead. The project owner's claim — that SailAgain gets manually added via the portal's "Get Promo Codes" lookup when SaveUpTo100 doesn't apply — has not yet been checked live against the portal. No detection/flagging logic should be built for this until that live check happens.
+
+9. **`run_persistent_watchlist_scan.py` does a full re-scan on restart, not a true resume — investigated 2026-08-13, deliberately not implemented.** A hard process kill mid-scan loses all progress: `last_hash = None` at startup means the very next loop iteration treats the current watchlist as "changed" and rescans the entire deduped list from index 0, and `ScanJobRecord.progress_done` is only ever written once, in `_run_batch`'s `finally` block at the very *end* of a batch — a killed process leaves no usable mid-scan checkpoint even for a future resume-aware implementation to read. No evidence found anywhere in this project's history that "resume after crash" was ever an explicit requirement; the real existing mitigation against redundant work is the 12h NO_SAVING TTL cache, and watch-runs already pass `bypass_cache=True` (this script exists specifically to re-check the same bookings repeatedly). Not implemented because a safe checkpoint mechanism needs to distinguish "this booking's result was durably persisted before the crash" from "this booking was in-flight, outcome unknown" — getting that wrong risks silently skipping a real booking or double-processing one, which is worse than the current simple (if wasteful) full-rescan behavior.
 
 ---
 
@@ -1274,7 +1275,6 @@ Setup: `python -m venv venv; source venv/bin/activate (or venv\Scripts\activate 
 BROWSER_HEADLESS=true
 BROWSER_USER_DATA_DIR=/path/to/chrome/profile
 LOG_LEVEL=INFO
-SCHEDULER_ENABLED=false
 ```
 Login always opens a visible browser regardless of `BROWSER_HEADLESS` (see [Bug History](#bug-history--lessons-learned) item 2); scans/watches respect the configured headless setting once a login session exists.
 
@@ -1301,6 +1301,137 @@ Produces `dist/cruise-intel(.exe)`. For standalone distribution, set `BROWSER_US
 
 ---
 
+## MSC Cruises Reference
+
+**Status: actively evolving, not a frozen spec like the ESPRESSO/NCL sections above.** MSC support is a third cruise-line target built from scratch starting 2026-08-09, architecturally distinct enough from ESPRESSO/NCL that it does not reuse `BookingResult`/`calculate_espresso`/`calculate_ncl` — it has its own models (`MscBookingResult`, `MscCheck`, `MscOpportunityType`, `MscCheckStatus` in `core/models.py`) and its own calculator (`core/calculator_msc.py`). This section documents what's been confirmed against the real portal and real client bookings so far; treat anything marked "not yet confirmed" as exactly that.
+
+### Why MSC is a different shape of problem than ESPRESSO/NCL
+
+On ESPRESSO and NCL, an agent (human or automation) can compare categories *and* commit a reprice in the same booking session — the one dangerous action to guard is a single "commit" button/click. **On MSC, the agent can never reprice directly, from either side, ever.** The real workflow: open the real booking, start a dummy/practice "Book Same Departure" flow for the identical sailing (creates no real reservation, needs no cleanup), compare its price/discounts against the real booking, and if there's an opportunity, **call MSC by phone** — only a human MSC agent on the other end can actually apply anything. This means the usual "never click the commit-equivalent button" boundary doesn't map onto MSC the same way: the real point-of-no-return is a phone call, not a button, so the automation-side risk profile is different (lower, in that specific respect) even though the portal itself still has flow-advancing buttons that Claude Code's own auto-mode safety classifier blocks by default (see the permission-rule note below).
+
+Price (the base/shelf rate) and discount (senior/Voyagers/military/promo %) move independently on MSC — a real opportunity can exist in the discount dimension even when the price dimension shows nothing or looks like a trap, and vice versa. **Three independent opportunity types must be checked on every booking, never collapsed into one "is the total lower" comparison:**
+1. **Price-match** — today's base price (before discount) is lower than the customer's current locked-in base price.
+2. **Discount-add** — the base price/rate isn't worth switching, but a discount the booking doesn't currently have could be added on top of the existing rate.
+3. **Discount-tier-upgrade** — the booking already has a discount, but a better tier of the *same* discount type is available today (e.g. swap a 10% military tier for 15%, keep everything else identical).
+
+Encoded in `evaluate_msc_booking()` (`core/calculator_msc.py`), returning one `MscCheck` per type rather than a single collapsed status.
+
+### Portal architecture
+
+`www.mscbook.com` — IBM WebSphere Commerce (WCS), URL pattern `/webapp/wcs/stores/servlet/<CommandName>`, not a modern SPA. Auth is session cookies plus a per-request `authAgentId`/`authAgencyId`/hashed `authPassword` triplet sent on every backend call. Unlike ESPRESSO, **multiple tabs against the same login are usually safe** as long as the browser/session itself stays open — but see the cookie-conflict caveat below; this safety is not absolute under load.
+
+Real endpoints confirmed via network capture (not guessed):
+- `AjaxOpenBookingDetailsCmd` — booking lookup by number.
+- `CabinSelectionView` (GET) — the categories/cabin picker page; shows several "Cruise & Add On" promo tabs (e.g. "FLASH SALE CRUISE ONLY", "DRINKS AND WIFI INCLUDED") whose active one (`cs-price-code-box ... active`) determines which price is shown for a given category — comparing across the wrong tab silently produces a badly wrong delta (confirmed real case: an apparent $654 gap that was actually $26 once the correct tab was matched). Tab matching uses keyword-overlap (ignoring filler words like "flash"/"sale"/"cruise"/"only") since exact/substring matching fails on real cases.
+- `PenaltyDateCmd`, `DiningResidualAvailabilityCmd`, `SetMultiSecureCookieCmd`, `MSCCardVerifierCmd` — supporting lookups in the pre-Confirm sequence.
+- **`DiscountPaxTypeCmd`** — fires automatically on every dummy-booking page load; returns the complete per-sailing discount catalog as structured JSON. **This is the single most important endpoint discovered so far** — see its own subsection below.
+- **`CabinSelectionConfirmCmd`** — the real POST behind the "CONFIRM AND PROCEED" button; reveals today's category/price grid. Full param list includes `authAgentId`, `authPassword` (hashed), `authAgencyId`, `CruiseID`, `shipCode`, `NoofAdults`/`NoofChildren`/`NoofKids`/`NoofNeonati`, `hasPaxtypeDiscount`, `PaxType`, `hasMscClub`, `adultAges`, `discCode`, `codScontoMSCClubVoyager` — the last several are how a discount selection (e.g. `MSVG15W`) and a Voyagers Club membership entry get submitted together in one request (see below). Two real error responses: `_ERR_INVALID_COOKIE` (multi-tab cookie conflict) and `_ERR_DIDNT_LOGON`/errorCode 2510 (idle-session timeout — critically, this specific error causes the portal's own client-side JS to automatically fire a `Logoff` request, invalidating the whole session even though the page looked logged-in moments before).
+- `CruiseCabinLockCmd` / `CabinSelectionAddCabinOrder` — believed to be the real cabin-lock/add-to-order commit steps; not yet confirmed whether these fire during the harmless dummy-booking flow or only on a real booking. Treated as the ESPRESSO-"Continue with New Rate" equivalent (never trigger automatically) until proven otherwise.
+
+**Reliability caveat, confirmed via a real incident**: opening multiple tabs against one login can trigger a real backend `_ERR_INVALID_COOKIE` conflict *within* a single valid session (not just when a duplicate login kicks the whole session) — and the resulting corruption is **silent**: a tab kept displaying a completely different sailing/passenger with no visible error banner. This is why the current architecture defaults to a single-tab sequential flow (`stage_booking:<id>` → `confirm_and_proceed` → `harvest_staged_booking`) rather than the earlier multi-tab batching (`open_batch_tabs`/`harvest_batch_tabs`, now capped at `MAX_BATCH_TABS = 1` and marked legacy).
+
+### `DiscountPaxTypeCmd` — the real backend discount catalog, per sailing
+
+Discovered 2026-08-11 by reading response bodies already sitting in `data/msc_control/network_capture.jsonl` (previously only `request_post_data` had ever been parsed from these captures — the response body itself had never been read). This call fires automatically as part of every dummy-booking page load, at no extra risk and with no extra click, and returns the exact structured data the portal's own JavaScript uses to populate every discount-related UI element on the page (the "Additional Discounts" dropdown, the Voyagers Club/crown modal, everything). Response shape:
+
+```json
+{
+  "DtsGetDiscountPaxTypeResponse": {
+    "paxType": [
+      {
+        "discCd": "MSCCLUB5",
+        "discDesc": "Voyagers Club 5%",
+        "paxDesc": "Voyagers Club 5%",
+        "discRate": "5",
+        "club": "Yes",
+        "isInv": "false",
+        "chargeList": "CAB,CHD,SNG,SRN,SUP,SUR",
+        "clazz": "<comma-separated list of rate/promo codes this discount is valid against>",
+        "rules": "NumMinAdt:1;NumMaxAdt:10;...;Cumulability:Yes;NumMinCab:1;NumMaxCab:99;CabinPos:"
+      }
+    ]
+  }
+}
+```
+
+Field meanings confirmed from real data:
+- `discCd`/`paxType` — the actual internal discount code (e.g. `MSCCLUB5`, `SENIOR25`, `MILITARYUS`, `TODAY10`, `MSVG10W`, `MSVG15W`).
+- `discDesc`/`newdiscDesc` — the label shown on-screen (dropdown text, receipt line). **Can diverge sharply from the program's real name** — see MSVG below.
+- `paxDesc` — a secondary label; for `MSVG10W`/`MSVG15W` this is the ONLY field that says `"Voyagers Selection WELCOME"` — `discDesc` for the same entries says `"SPECIAL OFFER 10%"`/`"SPECIAL OFFER 15%"`.
+- `discRate` — numeric percentage as a string. Senior discount (`SENIOR25`) shows `"0"` here despite genuinely being 5% or 10% in practice — its real rate is applied elsewhere, not disclosed in this field (see `isInv` below and the itemized-breakdown method used to back out the real senior rate).
+- `club` — `"Yes"` iff MSC Voyagers Club membership is required (confirmed on `MSCCLUB5` and both `MSVG10W`/`MSVG15W`; `"No"` on `MILITARYUS`, `SENIOR25`, `TODAY10`).
+- `isInv` — `"true"` on `SENIOR25`, `TODAY10`, `MSVG10W`, `MSVG15W`; `"false"` on `MSCCLUB5` and the two `MILITARYUS` tiers. Working theory (not fully confirmed): marks a rate as computed/variable rather than a flat literal `discRate`, consistent with senior's real-world rate depending on cabin category rather than being flat.
+- `rules` — semicolon-delimited key:value pairs; includes `AgeAdt:65` for `SENIOR25` (matches the confirmed 65+ eligibility rule), and critically **`Cumulability:Yes`/`Cumulability:No`** — the machine-readable version of "combinable/not combinable." `MILITARYUS` (both tiers) = `Cumulability:No` (matches the confirmed single-select "Additional Discounts (not combinable)" dropdown group). `MSCCLUB5`, `SENIOR25`, `MSVG10W`, `MSVG15W`, `TODAY10` = `Cumulability:Yes`. **Open question, not yet resolved**: this flag doesn't by itself explain a verbally-stated rule that Voyagers Selection/Exclusive don't combine with senior discount, since both are independently flagged `Cumulability:Yes` — the real exclusion (if real) may be UI-enforced, or scoped to `clazz`/rate-code compatibility rather than pairwise discount compatibility, or applied downstream at pricing time. Needs a live test: submit `SENIOR25`+`MSVG15W` together the way a real captured request already submitted `MSVG15W`+`MSCCLUB5` together (see next paragraph) and see whether the backend accepts or rejects it.
+
+**"Voyagers Selection" identified with certainty**: discount codes `MSVG10W` (10%) and `MSVG15W` (15%) — real, currently-open client bookings already confirmed to have this available on their sailing: booking 3000022 (`MSVG15W`) and booking 3000023 (both `MSVG10W` and `MSVG15W`). A **real, already-captured `CabinSelectionConfirmCmd` request** (HTTP 200, booking 3000022) shows the two codes submitted together — `PaxType=MSVG15WMSCCLUB5&hasPaxtypeDiscount=true&hasMscClub=true&discCode=MSVG15W&codScontoMSCClubVoyager=MSCCLUB5` — direct, real evidence that Voyagers Selection combines with the base 5% Club discount at the API level, not just per public MSC marketing copy. ("Voyagers Exclusive," the other program taught by the project owner, has not yet turned up under any name in any of the 9 sailings' catalogs captured so far — either no captured sailing currently qualifies, since public docs tie it to a 12-months-before-departure booking-date condition rather than a sailing property, or it surfaces through different logic entirely. Not yet confirmed either way.)
+
+**Confirmed live in the real DOM (2026-08-11, booking 3000023's crown modal)** — this is genuinely inside the "Add promo and/or MSC Voyagers Club discount" modal (the crown icon), not the main "Additional Discounts" dropdown:
+```html
+<input type="checkbox" name="switch-npm" id="mscVoyageSwitch">
+<span class="switch-label font-weight-bold">SPECIAL OFFER 15%</span>
+<div class="voyagerNotAvailable text-danger d-none">Voyages Selection is not available with selected discount</div>
+<div class="multicabinDisableVoyager d-none">The Voyager Selection is available only for single cabin booking</div>
+```
+The `voyagerNotAvailable` div is real, front-end-enforced mutual exclusivity between Voyagers Selection and whichever item is currently selected in the main dropdown (confirms the "not combinable with senior discount" rule as a genuine UI constraint — this exclusion is NOT visible in `DiscountPaxTypeCmd`'s `Cumulability` field, which shows `Yes` for `SENIOR25` and `MSVG15W` independently; it lives in front-end JS layered on top of the backend catalog). The `multicabinDisableVoyager` div is a previously-unknown rule — Voyagers Selection is single-cabin-booking-only — that doesn't obviously map to the `NumMinCab`/`NumMaxCab` fields in the backend `rules` string, meaning the DOM has real eligibility constraints the JSON catalog doesn't fully disclose; do not treat the backend `rules` field as a complete picture. Automation should check `#mscVoyageSwitch`'s sibling `.switch-label` text for `"SPECIAL OFFER"` to detect an active offer, and check whether `.voyagerNotAvailable`/`.multicabinDisableVoyager` have lost their `d-none` class (rather than assuming the offer always applies) before relying on it.
+
+**Implemented and tested 2026-08-11**: `_extract_discount_catalog(response_body)` (`msc_commands.py`) parses this into `{disc_cd, label, program_name, rate_pct, requires_club, cumulable, is_variable, age_min}` per entry — verified against real captured data. `_capture_msc_response` now takes an optional `state` dict and stashes the parsed catalog into `state["discount_catalog_by_booking"][booking_id]` the moment a `DiscountPaxTypeCmd` response arrives, wired into both the manual `stage_booking` command and the new fully-automated `check_booking`/`check_booking_batch` flow below. `core/models.py` gained a fourth `MscOpportunityType.VOYAGERS_SELECTION`, and `core/calculator_msc.py`'s `_check_voyagers_selection()` identifies the offer via `program_name` (NOT `label`/`discDesc`, which never mentions "Voyagers" at all) and attaches the confirmed not-combinable-with-Senior caveat when appropriate — end-to-end tested against real 3000023 data, correctly surfacing `MSVG15W (15%) OPPORTUNITY`.
+
+### The fully-automated single-call flow: `check_booking`/`check_booking_batch`
+
+Added 2026-08-11 in response to "make this actually run" — collapses what used to be three to five separate manual commands (`lookup_booking` → `stage_booking` → Neon's manual Confirm click → `harvest_staged_booking` → a separate offline `msc_run_calculator.py` run) into one call per booking: `check_booking:<id>` runs lookup → stage → the Confirm click (now safe to automate — see the permission-rule note below) → harvest with rate-tab matching → all four opportunity checks, and appends the result to `data/msc_control/live_check_results.jsonl`. `check_booking_batch:<id1,id2,...>` loops a comma-separated list with 1.5s pacing between bookings (mirroring the ESPRESSO/NCL extension's `runBatch` pacing), one failure doesn't stop the rest, and automatically retries once via `relogin` if the session went idle mid-check. This is now the recommended way to check any booking — the older `stage_booking`/`confirm_and_proceed`/`harvest_staged_booking` three-command sequence still exists and still works, but `check_booking` is strictly less manual for the same result.
+
+`msc_run_calculator.py` (the offline, read-only reprocessing script) also now passes `discount_catalog`/`has_voyagers` through from already-captured `rate_check_data.jsonl` records, and writes a `calculator_results.csv` alongside its JSONL output for easy review.
+
+### Data hygiene tooling
+
+`msc_dedupe_data.py` (re-runnable) collapses `booking_data.jsonl`/`rate_check_data.jsonl` to their latest entry per booking_id — correctness was never at risk (`msc_run_calculator.py`'s loader already applied last-write-wins semantics when reading), this is pure disk/readability hygiene. Deliberately excludes `network_capture.jsonl` and `live_check_results.jsonl`, which are append-only audit logs where every individual entry is real history, not a superseded snapshot.
+
+### Discount mechanics confirmed against real bookings
+
+- **Voyagers Club discount**: flat 5% (`MSCCLUB5`), applies once per cabin/booking regardless of how many Voyagers members are in it (two Gold members in one cabin still only get 5%, confirmed directly). Applies to both the cruise fare (CAB) and the non-commissionable fare/NCF (SRN) line, compounding multiplicatively with senior discount when both apply.
+- **Senior discount**: 5% for Inside/Outside/Ocean View, **10% for Balcony/Suite/Yacht Club** (confirmed via real SRN math: `$79.20 / $88.00 = 0.90` exactly on a Balcony booking) — requires every passenger in the cabin to be 65+. Never gets its own disclosure line in the itemized Price Breakdown (see `isInv` above); detected instead by comparing the SRN line against the standard undiscounted NCF-by-length table (7 nights = $182.00, 4 nights = $88.00, 3 nights = $66.00 — non-linear, not a flat per-diem rate).
+- **Group Rate bookings are hard-capped at 5%** — never a higher discount tier, and the individual-rate "Book Same Departure" dummy search doesn't even offer the Group Rate program as a comparable tab, so a Group-Rate real booking can't be directly rate-compared at all; discount-tier opportunities on these are capped at the flat Voyagers 5%.
+- **A discount-add opportunity must always be compared against the booking's remaining Due Amount** — if the discount's dollar value meets or exceeds Due Amount, applying it by phone could clear the balance entirely and produce a refund of the difference, not just reduce a future payment. Never report a discount-add finding without this cross-reference.
+- **A far-future placeholder departure date (year ≥ ~2045) means the sailing is cancelled/postponed, 100% of the time** — MSC rebooks cancelled sailings onto absurd future dates rather than marking the booking cancelled. A generic "Future Cruise Credit" banner, by contrast, is not itself a cancellation signal (appears on plenty of live, normal bookings) — only the literal `Departure- Arrival:` date field is reliable. When this banner appears on an otherwise-live booking, it represents real onboard credit that survives a price-match reprice (does not need to be treated as at-risk).
+- **Cancellation detection is now TWO independent checks, not one.** The far-future-placeholder rule above (`_is_placeholder_departure`, `msc_commands.py`) was confirmed to MISS a real case, booking 3000012 (2026-08-12): a plain outright cancellation with a perfectly normal departure date (09/21/2026), so the placeholder-year check never fired, and the booking's garbage $0.00 Booking Value/Due Amount sailed straight through the pipeline as a nonsense "opportunity." A second, structurally independent detector was added to close this: `_is_explicitly_cancelled(text)` regexes the flattened page text for the literal status word `CANCEL` printed right after the booking number, or a `"REINSTATE BOOKING"` action button (the confirmed replacement for the normal "CANCEL BOOKING" button on an already-cancelled booking); `_read_booking_status_badge(page)` independently queries the DOM's `.BookingStatus` element directly for its visible text. Both are checked together (`_is_explicitly_cancelled(text) or "CANCEL" in (status_badge or "")`) — either one alone is sufficient to flag `explicitly_cancelled`. **The DOM badge's CSS class cannot be trusted at all**: MSC renders it as `<div class="BookingStatus StatusConfirmed"><span class="text-uppercase">Canceled</span></div>` — the class is literally `StatusConfirmed` even when the visible text says "Canceled," so only the text content is read, never the class name. `_check_booking_msc`/`_stage_booking_for_confirm` check both `cancelled_or_postponed_placeholder` and `explicitly_cancelled` before ever clicking "Book Same Departure."
+
+### Two-tab concurrent checking: `check_booking_batch2`
+
+Added 2026-08-11 at the project owner's direct request ("mscbook does allow that") on top of the single-tab-sequential default. `check_booking_batch2:<id1,id2,...>` (`msc_commands.py`) splits a booking-ID list into two interleaved halves (even indices / odd indices, not two contiguous blocks — this keeps both tabs' expected finish times close together instead of one tab racing ahead and idling) and runs `_check_booking_msc` against them truly concurrently via `asyncio.gather`, one tab each. This does NOT fully eliminate the multi-tab cookie-conflict risk described above (a real 2026-08-10 incident showed even 2 tabs against the same login can trigger a silent `_ERR_INVALID_COOKIE`-style conflict) — it's mitigated two ways rather than prevented outright: (1) the per-booking capture-listener bookkeeping (`current_staging_booking_id_by_page`) is keyed by `id(page)` rather than one shared value, so the automation's own code can no longer cross-tag a network response from tab A as belonging to tab B's booking; (2) `_check_booking_msc` fingerprints the sailing's `partNumber` (parsed out of the `CabinSelectionView` URL) immediately after staging, then re-checks it after the Confirm click — if MSC's own backend ever serves a session-confused response under concurrent load, this surfaces as an explicit `sailing_identity_mismatch` result (with both the expected and actual `partNumber` included) rather than silently persisting wrong data. If mismatches turn up in practice, the documented fallback is to drop back to the single-tab `check_booking_batch`.
+
+### Paid-in-full detection: the $15 threshold and overpayment handling
+
+Direct instruction from the project owner, 2026-08-12: "paid in full" for MSC is broader than an exact $0.00 Due Amount. `_is_paid_in_full(due_amount, is_overpayment, threshold)` (`msc_commands.py`) treats a booking as paid in full when any of: (1) Due Amount is a small non-zero residual under the threshold — "if it is less than 15$ it is paid in full"; (2) the field is labeled "Overpayment" instead of "Due Amount" (the client has paid more than the current total — paid-in-full and then some); (3) a negative Due Amount figure (e.g. `-$50.00`), in case MSC ever renders it that way instead of swapping the label (built defensively, not yet confirmed against a real example). The threshold itself lives in `core/models.py` as `MSC_PAID_IN_FULL_DUE_THRESHOLD = 15.00` — a single source of truth so `calculator_msc.py`'s `_due_amount_context_note` wording can't drift out of sync with the detection logic. `_extract_booking_essentials` (`msc_commands.py`) parses `is_overpayment`/`overpayment_amount` off the booking summary text alongside the ordinary Due Amount regex.
+
+This feeds a hard business rule in `core/calculator_msc.py`'s `_check_price_match`: a paid-in-full booking can **never** get a `PRICE_MATCH` opportunity — MSC does not allow repricing a booking that's already fully paid off — checked first, before any price data is even inspected, via an `is_paid_in_full` short-circuit straight to `NO_OPPORTUNITY`. Critically, this gate is scoped to `PRICE_MATCH` only: `DISCOUNT_ADD`, `DISCOUNT_TIER_UPGRADE`, and `VOYAGERS_SELECTION` are completely unaffected by `is_paid_in_full` and can still report real opportunities on a paid-in-full booking (adding/upgrading a discount reduces what's owed or produces a client refund, which is a different mechanism than a price-match repricing).
+
+### Rate-tab matching: `_select_matching_tab`'s five tiers
+
+`_select_matching_tab(rate_name, tabs)` (`msc_commands.py`, pulled out of `_match_rate_tab` specifically so it's unit-testable against real rate-name/tab-list examples without a live page) decides which of a fresh listing's promo tabs (`.cs-price-code-box`) is the same product as the booking's own rate program, before trusting any price read from that tab. **Brochure Rate tabs are filtered out before any tier runs** — `_is_brochure_rate(tab)` is a hard rule stated directly by the project owner 2026-08-12: Brochure Rate strips out the agency's commission entirely, so it is never a valid comparison target regardless of price, even if it happens to show the lowest number. Confirmed via external research that MSC's own published fare-tier language treats EB/Best Price Today/Brochure/Promo as genuinely distinct pricing tiers, not just naming variants.
+
+Once Brochure tabs are excluded, the first tier below that finds a confident match wins:
+1. **Exact match** (case-insensitive).
+2. **Substring match**, either direction — real rate names are sometimes truncated/reworded slightly between the booking's detail page and the listing's tab labels.
+3. **Keyword-subset match** — ignores generic filler words ("flash", "sale", "cruise", "only", etc.) and matches if every one of the rate name's distinctive words appears in the tab label. Closes a real gap (booking 3000023, 2026-08-10): "DRINKS AND WIFI INCLUDED" doesn't substring-match "FLASH SALE DRINKS AND WIFI" even though they're the same product.
+4. **Amenity-signature exact match** — compares only the amenity-inclusion words (`drinks`/`wifi`/`obc`) and requires an exact set match, not a subset either direction (a drinks+wifi tab is a genuinely different, cheaper product than drinks+wifi+obc). Confirmed real ground truth, booking 3000015 (2026-08-12): "BALCONY UPGRADE DRINKS WIFI" describes a category-upgrade promo whose words never appear in any tab, but its real comparable product (drinks+wifi) maps directly to "FLASH SALE DRINKS AND WIFI."
+5. **Cruise-only-tier fallback** — direct instruction from the project owner, 2026-08-12 ("epic europe escape to sea etc are all the same," confirmed via external research that these are standard, interchangeable MSC marketing campaign names, not different products). When the rate name has no amenity words at all and exactly one non-Brochure tab is also amenity-free, they're treated as the same underlying commissionable rate regardless of campaign name. More than one such tab is genuinely ambiguous and is left unmatched rather than guessed.
+
+When no tab matches at all (the booking's own rate/promo genuinely isn't offered today, a real and current situation, not a matching-algorithm failure), `_capture_all_tab_prices` clicks through every remaining non-Brochure tab and records today's price for the booking's category under each one as unconfirmed reference data — never fed into `PRICE_MATCH` as if it were a confirmed comparison.
+
+### Occupancy auto-correction: `_fix_occupancy`/`_compute_required_occupancy`
+
+MSC's dummy "Book Same Departure" occupancy screen prices four independent age tiers (Adult 18+, Child 12-17, Kids 2-11, Infant 0-1) but only auto-fills the ADULT count from the real booking. `_compute_required_occupancy(passengers)` (`msc_commands.py`) buckets each real passenger's age into the correct tier and also returns the sorted list of ages within Child/Kids/Infant, since MSC requires each of those slots' *exact* age selected individually via its own `#age-{cabin}-{tier}-{index}` dropdown — a correct headcount alone is not sufficient to get a real price. `_fix_occupancy(page, passengers)` reads the screen's current per-tier counts, clicks the `+`/`-` counter the right number of times per tier to reach the required count, then fills each Child/Kids/Infant slot's age dropdown, before any price is captured.
+
+This closes two confirmed real bugs, both discovered 2026-08-12: booking 3000024 (2 adults + 3 kids ages 6/8/10) landed the dummy booking on Adult=2/Child=0/Kids=0/Infant=0, silently dropping all 3 kids, so a 2-guest quote was compared against the real 5-guest total and looked like a genuine $1,929.61 price-match opportunity that was actually just missing passengers; booking 3000011 additionally needed the infant tier wired up the same way (its own age select, options `'0'`/`'1'`), which had initially been left out after only child/jrchild were fixed. `_fix_occupancy` also has a safety guard: an empty `passengers` list means passenger extraction failed (a timing race), not that the booking genuinely has zero guests — trusting it once started clicking the adult count down toward zero on a real 2-adult booking (3000009), stopped only by MSC's own UI floor; an empty list is now always treated as "don't touch occupancy at all."
+
+### Auto-login and the auto-mode permission exception
+
+Credentials are stored in Windows Credential Manager via the `keyring` Python library (DPAPI-encrypted), never typed into chat — `msc_save_credentials.py`/`msc_clear_credentials.py` are run directly by the project owner, using `getpass()`. `auto_login(page)` in `msc_commands.py` handles the two-button "LOG IN" DOM quirk (a header trigger button and the modal's real submit button share the same visible text; the submit button must be found scoped to the form containing the password field) and is wired into both initial session start and an on-demand `relogin` command for recovering idle-timeout logouts without a full controller restart.
+
+**The "CONFIRM AND PROCEED" click** (the real UI action behind `CabinSelectionConfirmCmd`) is a flow-advancing, commit-shaped button that Claude Code's own auto-mode safety classifier blocks from automatic interaction by default — this held even after extensive verification that the underlying action never modifies a real reservation. The durable fix (2026-08-11): the project owner added a narrowly-scoped `autoMode.allow` rule to his own `~/.claude/settings.json` (Claude cannot edit this file for itself — the same classifier blocks that too, by design) permitting automatic clicks specifically via the `confirm_and_proceed` command in this exact file. Confirmed working end-to-end live. The rule's wording references the specific file path — if this logic is ever moved (e.g. into a future `scraper/msc.py`), the permission rule needs the project owner to update it; the exception does not silently follow the code.
+
+---
+
 ## Roadmap
 
 ### Documented scalability roadmap (`platform/README.md`)
@@ -1316,3 +1447,4 @@ Produces `dist/cruise-intel(.exe)`. For standalone distribution, set `BROWSER_US
 - **Additional cruise lines under consideration**: the **OneSource** portal, which covers **Princess**, **Cunard**, and **Holland America**; and **Silversea**, which is understood to sit under the existing **CruisingPower/ESPRESSO** umbrella rather than requiring a wholly separate adapter. Both are candidates for the next wave of cruise-line coverage, following the existing 4-step recipe documented in `CONTRIBUTING.md` (extension adapter → platform scraper → `calculate_<line>()` in `core/calculator.py` → README updates).
 - **Evolving the smart cache from purely time-based to price-anchored**: as detailed in [Business Logic Reference](#business-logic-reference), the current cache (both `chrome.storage`'s `{ts}` shape and the platform's `CacheEntry.expires_at`) tracks only presence and expiry, not the price that was seen at cache-write time. The stated direction is to store the last-known price alongside the TTL so that a cache entry can be invalidated *early* — before its 12-hour TTL lapses — if market prices for that sailing are detected to have moved. This has **not been implemented**; `CacheEntry.value_json` already exists in the schema (currently unused, always `"{}"`) as a ready-made place to eventually store such a payload.
 - **Making scraping more resilient and eventually AI-driven for new portals**: the current selector-based approach (with dual old/new-selector fallbacks, as in the Mantine migration fix) is fragile against portal redesigns by construction. The stated longer-term direction is to move toward more resilient, less brittle scraping — potentially AI-assisted element/flow discovery — particularly to make onboarding new cruise-line portals (OneSource, and any future line) faster and less dependent on hand-written, portal-specific selectors that break on every UI refresh.
+- **An LLM-based watcher layer on top of the (already-deterministic) MSC scanning pipeline** *(proposed 2026-08-12, not yet built)*: the idea is a model that continuously reviews scan output from the eventual continuously-scanning MSC server and surfaces what's worth the project owner's attention — not a replacement for the rule-based price/discount math in `core/calculator_msc.py`, which stays deterministic precisely because it has to be verifiably correct, not just usually right. This fits the project's existing safety model without changing it: no automated action on MSC ever commits anything today (every real change is still a phone call), so an always-watching layer only changes *when* a finding gets surfaced (on a schedule, rather than only when asked) — it does not introduce a new class of automated action. Deliberately deferred — build this only after the underlying continuously-scanning server itself exists (see the near-term MSC batch-checking priorities above), not before.

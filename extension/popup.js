@@ -7,6 +7,28 @@ function parseBookings(raw) {
   return raw.split(/[\n,]+/).map(s => s.trim().replace(/\D/g, '')).filter(s => s.length >= 5 && s.length <= 12);
 }
 
+// CONFIRMED REAL RISK, fixed 2026-08-13: several fields interpolated
+// into card.innerHTML/panel.innerHTML template literals below come
+// straight from cruise-portal-scraped text (category codes, package/
+// addon names, error messages, notes) with no escaping at all. bookingId
+// is already sanitized to digits-only at the input boundary
+// (parseBookings above), but these other fields are not -- if a
+// category code, package name, or note ever contained HTML/script-like
+// text (a malformed or compromised portal page), it would render
+// unescaped in this extension's own privileged popup context. Escaping
+// is a no-op for every normal value these fields actually take today
+// (none legitimately contain <, >, &, ", ' ) -- this only changes
+// behavior for the pathological case it's meant to close.
+function escapeHtml(value) {
+  if (value === null || value === undefined) return '';
+  return String(value)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
 function setStatus(msg, color) {
   const el = document.getElementById('statusMsg');
   el.textContent = msg; el.style.display = msg ? 'block' : 'none'; el.style.color = color || '#64748b';
@@ -30,7 +52,7 @@ function addCard(bookingId, status, data) {
   const card = document.createElement('div');
   card.id = 'card_' + bookingId; card.className = 'card ' + status;
 
-  const badges = { OPTIMIZATION: '✅ Optimization', TRAP: '⚠️ Trap', NO_SAVING: '⏭ No saving', ERROR: '❌ Error', WLT: '⏭ WLT', CHECKING: 'Checking', PAID_IN_FULL: '💳 Paid in Full', SKIPPED_TODAY: '⏩ Cached' };
+  const badges = { OPTIMIZATION: '✅ Optimization', UPGRADE_AVAILABLE: '🆙 Upgrade available', TRAP: '⚠️ Trap', NO_SAVING: '⏭ No saving', ERROR: '❌ Error', WLT: '⏭ WLT', CHECKING: 'Checking', PAID_IN_FULL: '💳 Paid in Full', SKIPPED_TODAY: '⏩ Cached' };
   const badgeCl = data?.cruiseLine || cruiseLine;
   const cl = badgeCl === 'NCL' ? '<span class="ncl-badge">NCL</span>'
     : badgeCl === 'GOCCL' ? '<span class="goccl-badge">GOCCL</span>' : '';
@@ -42,12 +64,13 @@ function addCard(bookingId, status, data) {
 
   let savingHtml = '';
   if (status === 'OPTIMIZATION') savingHtml = `OPTIMIZATION $${(data?.netSaving || 0).toFixed(2)}`;
+  else if (status === 'UPGRADE_AVAILABLE') savingHtml = `🆙 Upgrade to ${escapeHtml(data?.newPriceCategory) || '?'} — no price increase — review before repricing`;
   else if (status === 'TRAP') savingHtml = `TRAP — net impact $${(data?.netSaving || 0).toFixed(2)}`;
   else if (status === 'NO_SAVING') savingHtml = (data?.netSaving || 0) < 0 ? `Price UP $${Math.abs(data.netSaving).toFixed(2)}` : 'No change';
   else if (status === 'WLT') savingHtml = 'Waitlisted — skipped';
   else if (status === 'PAID_IN_FULL') savingHtml = '💳 Fully paid — repricing blocked';
-  else if (status === 'SKIPPED_TODAY') savingHtml = data?.note || 'Checked recently — cached';
-  else savingHtml = (data?.error || 'Unknown error').substring(0, 80);
+  else if (status === 'SKIPPED_TODAY') savingHtml = escapeHtml(data?.note) || 'Checked recently — cached';
+  else savingHtml = escapeHtml((data?.error || 'Unknown error').substring(0, 80));
 
   let confHtml = '';
   if (data?.confidence && status === 'OPTIMIZATION') {
@@ -60,18 +83,24 @@ function addCard(bookingId, status, data) {
 
   let priceHtml = '';
   if (data?.oldTotal) {
-    const catInfo = data.priceCategory ? ` · Cat: ${data.priceCategory}${data.newPriceCategory ? ' → ' + data.newPriceCategory : ''}` : '';
+    const catInfo = data.priceCategory ? ` · Cat: ${escapeHtml(data.priceCategory)}${data.newPriceCategory ? ' → ' + escapeHtml(data.newPriceCategory) : ''}` : '';
     priceHtml = `<div class="card-prices">$${data.oldTotal.toFixed(2)} → $${(data.newTotal || data.oldTotal).toFixed(2)}${catInfo}</div>`;
   }
 
-  let pkgHtml = data?.lostPkgNames?.length ? `<div class="card-pkg-loss">⚠️ Lost package: <b>${data.lostPkgNames.join(', ')}</b> ($${(data.lostPkgValue || 0).toFixed(2)} deducted)</div>` : '';
+  let pkgHtml = data?.lostPkgNames?.length ? `<div class="card-pkg-loss">⚠️ Lost package: <b>${escapeHtml(data.lostPkgNames.join(', '))}</b> ($${(data.lostPkgValue || 0).toFixed(2)} deducted)</div>` : '';
 
-  const noteHtml = data?.note ? `<div class="card-note"><div><div class="note-label">HubSpot note</div><div class="note-text">${data.note}</div></div><button class="copy-btn" data-note="${data.note.replace(/"/g, '&quot;')}">Copy</button></div>` : '';
+  // data-note uses the same escapeHtml as the visible text (not just a
+  // quote-only replace) -- browsers entity-decode attribute values on
+  // read regardless of which characters were escaped, so the copy-btn's
+  // click handler still gets back the exact original note text via
+  // .dataset.note; this is strictly more complete than the old
+  // quotes-only escaping, not a behavior change for legitimate notes.
+  const noteHtml = data?.note ? `<div class="card-note"><div><div class="note-label">HubSpot note</div><div class="note-text">${escapeHtml(data.note)}</div></div><button class="copy-btn" data-note="${escapeHtml(data.note)}">Copy</button></div>` : '';
 
   let actionHtml = '';
   if (!['CHECKING', 'ERROR', 'SKIPPED_TODAY', 'PAID_IN_FULL'].includes(status)) {
     const bCL = data?.cruiseLine || cruiseLine;
-    const targetCat = data?.newPriceCategory || data?.priceCategory || '';
+    const targetCat = escapeHtml(data?.newPriceCategory || data?.priceCategory || '');
     let mainBtn = '';
     if (status === 'OPTIMIZATION') mainBtn = `<button class="optimize-btn" data-booking="${bookingId}" data-cl="${bCL}" data-cat="${targetCat}">⚡ Open Reprice Popup</button>`;
     actionHtml = `<div class="card-actions">${mainBtn}<button class="view-btn" data-booking="${bookingId}" data-cl="${bCL}">🌐 View in Portal</button></div>`;
@@ -86,6 +115,7 @@ function addCard(bookingId, status, data) {
 function updateSummary(res) {
   const opts = res.filter(r => r.status === 'OPTIMIZATION');
   document.getElementById('sOpt').textContent = opts.length;
+  document.getElementById('sUpg').textContent = res.filter(r => r.status === 'UPGRADE_AVAILABLE').length;
   document.getElementById('sTrap').textContent = res.filter(r => r.status === 'TRAP').length;
   document.getElementById('sNos').textContent = res.filter(r => ['NO_SAVING', 'WLT', 'SKIPPED_TODAY'].includes(r.status)).length;
   document.getElementById('sPaid').textContent = res.filter(r => r.status === 'PAID_IN_FULL').length;
@@ -102,7 +132,7 @@ function renderAllCards(res) {
 function renderLog() {
   const panel = document.getElementById('logPanel');
   if (!logData.length) { panel.innerHTML = '<div style="color:#475569">No log yet.</div>'; return; }
-  panel.innerHTML = logData.map(e => `<div><span style="color:#475569">${e.time}</span> <span style="color:${e.status === 'OK' ? '#4ade80' : e.status === 'ERROR' ? '#f87171' : '#fbbf24'}">[${e.status}]</span> <span style="color:#7dd3fc">${e.bookingId}</span> <span style="color:#e2e8f0">${e.step}</span>: <span style="color:#cbd5e1">${e.detail}</span></div>`).join('');
+  panel.innerHTML = logData.map(e => `<div><span style="color:#475569">${escapeHtml(e.time)}</span> <span style="color:${e.status === 'OK' ? '#4ade80' : e.status === 'ERROR' ? '#f87171' : '#fbbf24'}">[${escapeHtml(e.status)}]</span> <span style="color:#7dd3fc">${escapeHtml(e.bookingId)}</span> <span style="color:#e2e8f0">${escapeHtml(e.step)}</span>: <span style="color:#cbd5e1">${escapeHtml(e.detail)}</span></div>`).join('');
   panel.scrollTop = panel.scrollHeight;
 }
 

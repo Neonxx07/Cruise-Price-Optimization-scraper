@@ -29,7 +29,7 @@ from core.calculator import calculate_goccl, make_error_result
 from core.models import BookingResult, CruiseLine
 from utils.logging import get_logger
 
-from .base import BaseScraper
+from .base import BaseScraper, is_dead_browser_error
 
 logger = get_logger(__name__)
 
@@ -70,7 +70,22 @@ class GoCCLScraper(BaseScraper):
 
     def __init__(self, guests_count: int | None = None):
         super().__init__()
+        # CONFIRMED REAL BUG, fixed 2026-08-13: guests_count used to always
+        # silently be settings.goccl_default_guests_count for every booking
+        # (every real caller — main.py, services/booking_service.py —
+        # constructs this class with no argument), with no distinction
+        # between "this booking really has 2 guests" and "we never checked."
+        # No live GoCCL capture has ever confirmed a real per-booking guest-
+        # count field in window.initialData (see read_current_price_and_selection
+        # below — it reads gross/rate/category/stateroom_type only), so this
+        # does NOT guess a new selector for it. guests_count_verified tracks
+        # whether the caller actually supplied a real, confirmed count
+        # (only ever True if a FUTURE caller passes one) — it stays False
+        # for every current call site, and core.calculator.calculate_goccl
+        # uses it to make that assumption visible in the result's note
+        # instead of presenting an unverified guest count as settled fact.
         self.guests_count = guests_count if guests_count is not None else settings.goccl_default_guests_count
+        self.guests_count_verified = guests_count is not None
 
     async def search_booking(self, booking_number: str) -> None:
         self.log_action("navigate", booking_id=booking_number, url=settings.goccl_search_url)
@@ -90,68 +105,107 @@ class GoCCLScraper(BaseScraper):
         await self.dump_page_snapshot(booking_number, "after_search")
 
     async def read_current_price_and_selection(self) -> dict:
-        """Reads the current booking's price, offer code, category, and stateroom type
-        from the booking summary bar. Selectors confirmed via DevTools Recorder export."""
-        gross_text = await self.page.inner_text("span.price__number")
-        current_price = self._parse_price(gross_text)
+        """Reads the current booking's price, offer/rate code, category, and
+        stateroom type from window['initialData'] — a JSON blob the booking
+        page embeds on load with the full invoice/rate/category detail (same
+        pattern as NCL's window.__preloaded_data).
 
-        offer_code = await self.page.inner_text(
-            "[data-component='category-rate-header-rate-name']"
-        )
-        category_value = await self.page.inner_text(
-            "article.booking-details-bar__category--category span.booking-details-bar__category-value"
-        )
-        stateroom_type = await self.page.inner_text(
-            "span.booking-details-bar__category-metaname"
-        )
+        The CSS selectors this replaced (recorded via DevTools) didn't match
+        anything on a real live booking: confirmed against booking DEMO02
+        that "[data-component='category-rate-header-rate-name']" and
+        "booking-details-bar__category*" don't exist anywhere on the page —
+        the rate/offer code in particular is never rendered as visible text
+        at all, only present in this JSON (data.rate.code)."""
+        data = await self.page.evaluate("() => window.initialData")
+        if not data:
+            raise RuntimeError("window.initialData not found on page — booking summary may not have loaded")
+
+        gross = ((data.get("invoiceSummary") or {}).get("grossAmount") or {}).get("amount")
+        rate = data.get("rate") or {}
+        category = data.get("category") or {}
+        stateroom_type = category.get("stateroomType") or {}
+
+        if gross is None:
+            # CONFIRMED REAL RISK, fixed 2026-08-13: this used to silently
+            # default to 0.0 — old_total=0.0 flowing straight into
+            # calculate_goccl would make every candidate look like a
+            # negative-infinity "price_drop", either fabricating a huge
+            # fake OPTIMIZATION or masking a real one. Refuse to guess.
+            raise RuntimeError(
+                "GoCCL window.initialData has no readable invoiceSummary.grossAmount.amount "
+                "— refusing to treat this booking's total as $0"
+            )
 
         return {
-            "current_price_gross": current_price,
-            "current_offer_code": offer_code.strip(),
-            "current_category": category_value.strip(),
-            "current_stateroom_type": stateroom_type.strip(),
+            "current_price_gross": float(gross),
+            "current_offer_code": rate.get("code") or "",
+            "current_category": category.get("code") or "",
+            "current_stateroom_type": stateroom_type.get("name") or "",
         }
 
     async def open_modify_booking(self) -> None:
-        modify_btn = self.page.get_by_role("link", name="Modify Booking")
+        # Confirmed against a real booking: this is an <a> with no href
+        # attribute (data-component="blue-bar-link-label"), so it never
+        # gets the implicit ARIA "link" role get_by_role("link", ...)
+        # requires — it just times out finding nothing. Text match doesn't
+        # depend on role/href, so it works regardless of how the element
+        # is implemented under the hood.
+        modify_btn = self.page.get_by_text("Modify Booking", exact=True)
         await modify_btn.wait_for(state="visible")
         await modify_btn.click()
         await self.page.wait_for_load_state("networkidle")
 
     async def open_change_offer_rate(self) -> None:
-        change_rate_btn = self.page.get_by_role("button", name=re.compile("Change Offer/Rate", re.IGNORECASE))
-        await change_rate_btn.wait_for(state="visible")
+        # Same accessible-role caveat as open_modify_booking above — try
+        # role-based first (works if this one really is a <button>), fall
+        # back to a plain text match if not.
+        try:
+            change_rate_btn = self.page.get_by_role("button", name=re.compile("Change Offer/Rate", re.IGNORECASE))
+            await change_rate_btn.wait_for(state="visible", timeout=5000)
+        except Exception:
+            change_rate_btn = self.page.get_by_text(re.compile("Change Offer/Rate", re.IGNORECASE))
+            await change_rate_btn.wait_for(state="visible")
         await change_rate_btn.click()
         await self.page.wait_for_selector("section.rate__container, div[class*='rate']")
 
     async def read_offer_code_comparison(self) -> list[OfferCodeOption]:
-        """Reads the offer-code comparison screen. Confirmed container:
-        section.rate__container, with stateroom-type prices as numbered buttons
-        (1=Upper/Lower, 2=Interior, 3=Ocean View, 4=Balcony, 5=Suite — order
-        confirmed from a recorded click on button index 4 landing on Balcony)."""
-        stateroom_order = ["UPPER_LOWER", "INTERIOR", "OCEAN_VIEW", "BALCONY", "SUITE"]
+        """Reads the offer-code comparison screen.
 
-        offer_rows = await self.page.query_selector_all("section.rate__container > div > div")
+        Confirmed against a real booking (DEMO02): each offer is a
+        div.rate-code-tile carrying data-rate-code/data-rate-name directly
+        as attributes, and each stateroom-type price is a
+        button.rate-code-tile__price-button carrying data-rate-meta-name/
+        data-rate-meta-price/data-rate-meta-soldout. Reading these
+        attributes directly is exact and order-independent.
+
+        This replaced an earlier button-index-position guess (a fixed
+        ["UPPER_LOWER","INTERIOR","OCEAN_VIEW","BALCONY","SUITE"] list
+        assumed to line up with button order) that silently misaligned
+        columns whenever a cell was sold out/N-A and shifted the index —
+        confirmed against real data: it reported a "BALCONY" candidate
+        that was actually an OCEAN VIEW price, a stateroom downgrade
+        masquerading as a same-category fare-code swap.
+        """
+        tiles = await self.page.query_selector_all("div.rate-code-tile")
         results = []
-        for row in offer_rows:
-            name_el = await row.query_selector("h6, .offer-name")
-            offer_name = (await name_el.inner_text()).strip() if name_el else ""
-            code_el = await row.query_selector(".offer-code, [data-component='offer-code']")
-            offer_code = (await code_el.inner_text()).strip() if code_el else ""
+        for tile in tiles:
+            offer_code = (await tile.get_attribute("data-rate-code")) or ""
+            offer_name = (await tile.get_attribute("data-rate-name")) or ""
 
-            buttons = await row.query_selector_all("button")
-            for idx, button in enumerate(buttons):
-                if idx >= len(stateroom_order):
-                    break
-                price_el = await button.query_selector("span.price__number")
-                if not price_el:
+            price_buttons = await tile.query_selector_all("button.rate-code-tile__price-button")
+            for button in price_buttons:
+                sold_out = (await button.get_attribute("data-rate-meta-soldout")) == "true"
+                if sold_out:
                     continue
-                price_text = await price_el.inner_text()
+                stateroom_name = (await button.get_attribute("data-rate-meta-name")) or ""
+                price_attr = await button.get_attribute("data-rate-meta-price")
+                if not price_attr:
+                    continue
                 results.append(OfferCodeOption(
                     offer_name=offer_name,
                     offer_code=offer_code,
-                    stateroom_type=stateroom_order[idx],
-                    price_per_person=self._parse_price(price_text),
+                    stateroom_type=stateroom_name,
+                    price_per_person=self._parse_price(price_attr),
                 ))
         return results
 
@@ -234,6 +288,7 @@ class GoCCLScraper(BaseScraper):
                 current_price_gross=current["current_price_gross"],
                 available_offer_codes=[o.__dict__ for o in offer_codes],
                 guests_count=self.guests_count,
+                guests_count_verified=self.guests_count_verified,
             )
             logger.info("goccl.result", booking_id=booking_id, status=result.status.value, net=result.net_saving)
             self.log_action("result", booking_id=booking_id, status=result.status.value, net_saving=result.net_saving)
@@ -243,6 +298,15 @@ class GoCCLScraper(BaseScraper):
             logger.error("goccl.error", booking_id=booking_id, error=str(e))
             self.log_action("error", booking_id=booking_id, error=str(e))
             await self.dump_failure_snapshot(booking_id, "check_booking_failed", str(e))
+            # CONFIRMED REAL RISK, fixed 2026-08-13: same defect as NCL's
+            # check_booking (see scraper/ncl.py) — swallowing every
+            # exception here, including a dead browser/page/crash,
+            # permanently defeated BookingService's restart mechanism for
+            # GoCCL. Re-raise dead-browser-shaped exceptions so the caller
+            # can actually recover; every other real portal-level failure
+            # still becomes an ordinary ERROR result exactly as before.
+            if is_dead_browser_error(e):
+                raise
             return make_error_result(booking_id, current_category, CruiseLine.GOCCL, str(e))
 
     @staticmethod
