@@ -6,7 +6,7 @@ critical point Neon corrected early on — price and discount are
 INDEPENDENT levers, not one "is the total lower" comparison. A real
 opportunity can exist purely in the discount dimension even when the price
 dimension is a dead end (see the confirmed real example on booking
-3000005 in msc_project_knowledge.md: today's plain price was actually
+2000001 in msc_project_knowledge.md: today's plain price was actually
 HIGHER, but a better discount tier — 15% replacing an existing 10%, with
 the 5% Voyagers stacking on top of either — was a genuine, separate win).
 
@@ -38,7 +38,7 @@ This module never guesses past what the data actually supports — each
 check independently reports INSUFFICIENT_DATA rather than a false
 NO_OPPORTUNITY when a required input wasn't captured.
 
-CONFIRMED LIVE 2026-08-11, booking 3000024: Voyagers Exclusive belongs
+CONFIRMED LIVE 2026-08-11, booking 2000015: Voyagers Exclusive belongs
 on the same "never discloses itself" list as senior discount (below) —
 a Voyagers Club membership was added to this real booking (visible via
 its Passenger Details gaining an "MSC Voyagers Club: ... - Gold" line
@@ -51,7 +51,7 @@ Exclusive is silent the same way senior discount is; detect it the same
 way — SRN math against the standard-NCF-by-length table — never by
 searching for disclosure text.
 
-KNOWN OPEN LIMITATION, found testing against booking 3000021: senior
+KNOWN OPEN LIMITATION, found testing against booking 2000012: senior
 discount never gets an explicit "Discount Description"/"MSC Club
 Discount" disclosure line the way named promos and the flat Voyagers 5%
 do (confirmed in msc_commands.py's _extract_discounts docstring). That
@@ -322,7 +322,7 @@ def _check_discount_add(
     # counts the same as an explicitly disclosed "club"/"named" discount
     # here — a discount already reducing the price, regardless of
     # whether it prints a disclosure line, means don't recommend adding
-    # ANOTHER one on top (confirmed real bug 2026-08-11: booking 3000024
+    # ANOTHER one on top (confirmed real bug 2026-08-11: booking 2000015
     # got recommended "add a discount" minutes after a real 9.75% was
     # already applied, purely because it never discloses itself in text).
     already_has_any_discount = any(d.get("kind") in ("club", "named", "implied") for d in current_discounts)
@@ -544,7 +544,7 @@ def _check_voyagers_selection(
             note="a 'SPECIAL OFFER' discount is already disclosed on this booking — likely Voyagers Selection already applied (not yet confirmed against a real applied example, verify by hand if in doubt)",
         )
 
-    # ADDED 2026-08-11, booking 3000024: an "implied" (SRN-math) entry
+    # ADDED 2026-08-11, booking 2000015: an "implied" (SRN-math) entry
     # proves SOME undisclosed discount is already on this booking, but
     # NOT confidently which one — could be senior, Exclusive, Selection
     # itself, or some combination. Confidently recommending "add
@@ -709,7 +709,7 @@ def evaluate_msc_booking(
     # doesn't succeed), while [] means "captured, and genuinely no
     # discount was disclosed." Confirmed real bug, first live batch run
     # 2026-08-11: collapsing None into [] here made a booking that
-    # genuinely already had a real discount applied (3000016, SPECIAL
+    # genuinely already had a real discount applied (2000010, SPECIAL
     # OFFER 15% + MSCCLUB5) get reported as a false DISCOUNT_ADD/
     # VOYAGERS_SELECTION "opportunity" on 3 of 5 identical repeated
     # checks, purely because the Price Breakdown modal hadn't finished

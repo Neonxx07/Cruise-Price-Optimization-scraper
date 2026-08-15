@@ -2,7 +2,7 @@
 
 # ⚓ Cruise Price Intelligence System (Playwright + AI Optimization)
 
-**Automated repricing intelligence for Royal Caribbean, Celebrity & Norwegian Cruise Line**
+**Automated repricing intelligence for Royal Caribbean, Celebrity, Norwegian, Carnival & MSC Cruises**
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](CONTRIBUTING.md)
@@ -31,7 +31,7 @@ Both share the **same core business logic** — detecting price drops, tracking 
 ```
 ┌─────────────────────────────────────────────────────┐
 │              Cruise Booking Portal                    │
-│         (ESPRESSO / NCL SeaWeb)                       │
+│    (ESPRESSO / NCL SeaWeb / GoCCL / MSC Book)         │
 └──────────────────┬──────────────────────────────────┘
                    │ Scrape prices
         ┌──────────┴──────────┐
@@ -73,7 +73,7 @@ Both share the **same core business logic** — detecting price drops, tracking 
 1. Clone this repo
 2. Open `chrome://extensions` → Enable **Developer Mode**
 3. Click **Load Unpacked** → select the `extension/` folder
-4. Log into your cruise portal (ESPRESSO or NCL SeaWeb)
+4. Log into your cruise portal (ESPRESSO, NCL SeaWeb, or GoCCL)
 5. Click the extension icon → paste booking numbers → Run Check
 
 ### Python Platform
@@ -87,9 +87,11 @@ playwright install chromium
 # Start the API server (opens Swagger docs at /docs)
 python main.py api
 
-# Or run a CLI scan
-python main.py scan --bookings "4097990,64756965" --cruise-line ESPRESSO -o results.csv
+# Or run a CLI scan (--cruise-line: ESPRESSO, NCL, or GOCCL)
+python main.py scan --bookings "1234567,7654321" --cruise-line ESPRESSO -o results.csv
 ```
+
+MSC uses a separate, session-driven workflow rather than a one-shot CLI scan — see [`DOCUMENTATION.md`](DOCUMENTATION.md#msc-cruises-reference) and `platform/msc_session_controller.py`.
 
 ---
 
@@ -114,6 +116,19 @@ python main.py scan --bookings "4097990,64756965" --cruise-line ESPRESSO -o resu
 | Royal Caribbean | ESPRESSO (CruisingPower) | ✅ | ✅ |
 | Celebrity Cruises | ESPRESSO (CruisingPower) | ✅ | ✅ |
 | Norwegian (NCL) | SeaWeb Agents | ✅ | ✅ |
+| Carnival (GoCCL) | GoCCL | ✅ | ✅ |
+| MSC Cruises | MSC Book | — | ✅ |
+
+> **MSC is architecturally different from the rest.** MSC never allows a direct in-portal reprice — the platform surfaces price-match, discount-add, and discount-tier-upgrade opportunities, but applying any of them requires an agent to call MSC by phone. See [`DOCUMENTATION.md`](DOCUMENTATION.md#msc-cruises-reference) for the full reference.
+
+---
+
+## Documentation
+
+- [`DOCUMENTATION.md`](DOCUMENTATION.md) — full technical reference: architecture, every selector/constant/function, business logic, storage schema, bug history, known open issues, and the MSC-specific reference
+- [`RECREATE_PROMPT.md`](RECREATE_PROMPT.md) — a self-contained prompt that can rebuild the whole system from scratch
+- [`CONTRIBUTING.md`](CONTRIBUTING.md) — guidelines for adding a new cruise line or otherwise contributing
+- [`HOW_TO_CHECK_A_BOOKING.md`](HOW_TO_CHECK_A_BOOKING.md) — the plain-English manual process the ESPRESSO automation is based on
 
 ---
 
@@ -125,7 +140,7 @@ We welcome contributions! See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
 
 ### Areas Where You Can Help
 
-- 🚢 **New cruise line adapters** (MSC, Carnival, Princess, etc.)
+- 🚢 **New cruise line adapters** (Princess, Holland America, Silversea, etc.)
 - 🧪 **Testing** — unit tests for the calculator engine
 - 🎨 **Extension UI** — dark mode, better UX
 - 📊 **Dashboard** — React frontend for the API

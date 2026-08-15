@@ -13,7 +13,7 @@ from core.models import MSC_PAID_IN_FULL_DUE_THRESHOLD, MscCheckStatus
 
 
 def test_explicitly_cancelled_detects_status_word():
-    text = "Booking\n-\n3000012\nCANCELED\nBooking Value\n$0.00\n"
+    text = "Booking\n-\n2000006\nCANCELED\nBooking Value\n$0.00\n"
     assert m._is_explicitly_cancelled(text) is True
 
 
@@ -23,7 +23,7 @@ def test_explicitly_cancelled_detects_reinstate_button():
 
 
 def test_explicitly_cancelled_false_on_normal_confirmed_booking():
-    text = "Booking\n-\n3000014\nCONFIRMED\nBooking Value\n$966.89\n"
+    text = "Booking\n-\n2000008\nCONFIRMED\nBooking Value\n$966.89\n"
     assert m._is_explicitly_cancelled(text) is False
 
 
@@ -31,7 +31,7 @@ def test_regression_explicitly_cancelled_does_not_false_positive_on_random_text(
     """Must not fire on ordinary page text that merely contains the word
     'cancel' in an unrelated context (e.g. a 'CANCEL BOOKING' button that
     exists on every live booking, cancelled or not)."""
-    text = "Booking\n-\n3000024\nCONFIRMED\nBooking Value\n$6,174.81\nCANCEL BOOKING\n"
+    text = "Booking\n-\n2000015\nCONFIRMED\nBooking Value\n$6,174.81\nCANCEL BOOKING\n"
     assert m._is_explicitly_cancelled(text) is False
 
 
@@ -51,7 +51,7 @@ def test_is_paid_in_full(due_amount, is_overpayment, expected):
 
 
 def test_regression_overpayment_real_example():
-    """Real captured example, booking 3000021: 'Overpayment\\n$0.02'."""
+    """Real captured example, booking 2000012: 'Overpayment\\n$0.02'."""
     text = "Booking Value\n$2,190.54\n(Price includes all tax and fees)\nOverpayment\n$0.02\nPrice Breakdown >"
     ess = m._extract_booking_essentials(text)
     assert ess["is_overpayment"] is True
@@ -67,7 +67,7 @@ def test_tab_match_exact():
 
 
 def test_regression_amenity_signature_match_neons_real_example():
-    """Real ground truth from Neon, booking 3000015: 'BALCONY UPGRADE
+    """Real ground truth from Neon, booking 2000009: 'BALCONY UPGRADE
     DRINKS WIFI' is the same product as 'FLASH SALE DRINKS AND WIFI'."""
     target, reason = m._select_matching_tab(
         "BALCONY UPGRADE DRINKS WIFI",
