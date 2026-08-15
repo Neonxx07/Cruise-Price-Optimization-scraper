@@ -12,6 +12,7 @@ from pathlib import Path
 from openpyxl import Workbook
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 
+from core.calculator import total_optimization_savings
 from core.models import BookingResult
 
 COLS = [
@@ -23,7 +24,11 @@ COLS = [
 ]
 
 _FILLS = {
-    "OPTIMIZATION": PatternFill("solid", fgColor="C6EFCE"),   # green
+    "OPTIMIZATION": PatternFill("solid", fgColor="C6EFCE"),      # green
+    # Deliberately distinct from OPTIMIZATION's green: a category upgrade
+    # always needs human review before switching (different physical
+    # room/deck), unlike a confirmed same-category OPTIMIZATION.
+    "UPGRADE_AVAILABLE": PatternFill("solid", fgColor="D9D2E9"), # light purple
     "TRAP": PatternFill("solid", fgColor="FFEB9C"),           # amber
     "NO_SAVING": PatternFill("solid", fgColor="F2F2F2"),      # grey
     "ERROR": PatternFill("solid", fgColor="FFC7CE"),          # red
@@ -32,8 +37,8 @@ _FILLS = {
     "SKIPPED_TODAY": PatternFill("solid", fgColor="DDEBF7"),  # light blue
 }
 _SORT_ORDER = {
-    "OPTIMIZATION": 0, "TRAP": 1, "WLT": 2, "PAID_IN_FULL": 3,
-    "NO_SAVING": 4, "SKIPPED_TODAY": 5, "ERROR": 6,
+    "OPTIMIZATION": 0, "UPGRADE_AVAILABLE": 1, "TRAP": 2, "WLT": 3,
+    "PAID_IN_FULL": 4, "NO_SAVING": 5, "SKIPPED_TODAY": 6, "ERROR": 7,
 }
 _HDR_FILL = PatternFill("solid", fgColor="1F3864")
 _HDR_FONT = Font(bold=True, color="FFFFFF", name="Calibri", size=10)
@@ -112,11 +117,12 @@ def export_results_excel(results: list[BookingResult], path: str | Path) -> None
         return sum(1 for r in results if r.status.value == status)
 
     opts = [r for r in results if r.status.value == "OPTIMIZATION"]
-    total_saved = sum(r.net_saving for r in opts)
+    total_saved = total_optimization_savings(results)
 
     summary_rows = [
         ("Total Checked", len(results)),
         ("Optimizations", len(opts)),
+        ("Upgrades Available", count("UPGRADE_AVAILABLE")),
         ("Traps", count("TRAP")),
         ("WLT", count("WLT")),
         ("Paid In Full", count("PAID_IN_FULL")),

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import re
 from datetime import datetime
+from decimal import Decimal, ROUND_HALF_UP
 
 from .confidence import calc_confidence
 from .models import BookingResult, BookingStatus, CruiseLine
@@ -18,7 +19,19 @@ from .models import BookingResult, BookingStatus, CruiseLine
 
 
 def safe_float(value) -> float:
-    """Safely parse any value to float, defaulting to 0."""
+    """Safely parse any value to float, defaulting to 0.
+
+    CONFIRMED REAL RISK, flagged 2026-08-13 audit: this collapses "genuinely
+    zero" and "missing/malformed, couldn't be read at all" into the same
+    0.0 — for a SUM over many optional line items (package amounts, promo
+    values), one bad entry silently contributing $0 to a running total is
+    a defensible, conservative degradation, which is why this function is
+    kept as-is and still used for those callers. It must NOT be used for a
+    single required top-level figure that directly becomes old_total/
+    new_total (see safe_float_or_none below, and _get_total's docstring)
+    — there, a parse failure needs to be distinguishable from a real $0,
+    since a wrongly-defaulted-to-zero total can silently produce a fake
+    "optimization" or a fake "trap" instead of surfacing as unknown."""
     try:
         result = float(value)
         return 0.0 if result != result else result  # NaN check
@@ -26,9 +39,103 @@ def safe_float(value) -> float:
         return 0.0
 
 
+def safe_float_or_none(value) -> float | None:
+    """Like safe_float, but a missing/malformed value returns None instead
+    of silently becoming 0.0 — for the specific, narrow set of callers
+    (see _get_total) where a REQUIRED figure's parse failure must never be
+    indistinguishable from a real, legitimate zero amount. A genuine 0
+    input still returns 0.0 here, never None — this only changes what
+    happens when the value can't be read at all."""
+    if value is None:
+        return None
+    try:
+        result = float(value)
+        return None if result != result else result  # NaN check
+    except (TypeError, ValueError):
+        return None
+
+
 def round2(x) -> float:
-    """Round to 2 decimal places."""
-    return round(safe_float(x) * 100) / 100
+    """Round to 2 decimal places, ROUND-HALF-UP.
+
+    CONFIRMED INTENDED CONVENTION (2026-08-13 audit): this module's own
+    docstring says it was "ported from calculator.js", whose round2 is
+    `Math.round(x*100)/100`. The old Python implementation,
+    `round(x*100)/100`, used Python's builtin `round()`, which uses
+    round-HALF-TO-EVEN ("banker's rounding") — a real, silent divergence
+    from the reference implementation this file claims to be a port of.
+
+    Uses Python's `ROUND_HALF_UP` (ties round away from zero), which
+    matches Excel/Google Sheets — the actual reconciliation partner for
+    this tool's spreadsheet exports. Note this is NOT bit-identical to
+    JS's `Math.round` on a NEGATIVE tie specifically: JS rounds a tie
+    toward +infinity (`Math.round(-2.5) === -2`), while ROUND_HALF_UP
+    rounds away from zero (`round2(-2.5) == -3`, matching Excel's
+    `ROUND(-2.5,0)`). Real dollar inputs here are never negative before
+    subtraction, and a subtraction landing exactly on a negative half-
+    cent tie is vanishingly rare — documenting this precisely rather
+    than silently picking one behavior, since it's the one place this
+    fix doesn't have a single unambiguous "correct" answer.
+
+    Also fixes a separate, compounding bug: the old implementation
+    multiplied a float by 100 and rounded that float, which inherits
+    binary floating-point representation error (e.g. 1.005 * 100 ==
+    100.49999999999999, not 100.5 — round(100.49999999999999) == 100,
+    silently returning 1.00 instead of the correct 1.01). Converting via
+    `Decimal(str(value))` — the string round-trip, NOT `Decimal(value)`
+    directly — sidesteps this: Python's float-to-str conversion already
+    produces the shortest decimal string that round-trips to the same
+    float, so `Decimal(str(1.005))` is the clean decimal 1.005, not its
+    messy binary expansion.
+
+    Verified byte-identical to the old implementation for every
+    "normal" 2-decimal-or-fewer dollar value real scraped prices
+    actually take (1332.46, 50.00, 37.50, 0.01, etc. — see
+    test_calculator.py) — this only changes the answer for the rare
+    exact-half-cent tie / float-representation-error inputs the old
+    implementation got wrong."""
+    value = safe_float(x)
+    return float(Decimal(str(value)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
+
+
+def total_optimization_savings(results) -> float:
+    """The one safe way to sum `net_saving` across many BookingResults.
+
+    KNOWN LIMITATION, flagged 2026-08-13 (Phase 0 correctness audit): this
+    does NOT filter by BookingResult.currency. Every result summed here is
+    still implicitly treated as USD regardless of whether its currency was
+    actually verified ("UNKNOWN" is the honest default for NCL/GoCCL/MSC
+    today — see core/models.py). Deliberately not filtered in this phase,
+    to avoid silently dropping results from an existing total (a real
+    behavior change) before there's a considered policy for what to DO
+    with an unknown-currency result — that decision belongs to the
+    Intelligence layer, not this fix. Recording currency honestly on each
+    result is this phase's job; do not assume this sum is currency-safe.
+
+    CONFIRMED INTENDED SEMANTICS (2026-08-13 audit): `net_saving` is
+    deliberately a raw, signed net-difference figure —
+    `price_drop + obc_change - lost_pkg_value` (ESPRESSO) or
+    `price_drop - lost_addon_value` (NCL) — not a value that's already
+    gated to "only when recommended." This is confirmed intentional, not
+    an oversight: DOCUMENTATION.md's own GUI section already documents
+    that NO_SAVING rows can carry a *negative* net_saving (a price
+    increase), and this project's own two trap checks below
+    (package-trap, OBC-loss-ratio) can just as legitimately produce a
+    *positive* net_saving on a TRAP/NO_SAVING row — that's the entire
+    point of those checks: catching a "win" that's smaller than what's
+    being given up, not a case where no such number exists at all.
+
+    The ONLY safe way to read this field in aggregate is to filter to
+    OPTIMIZATION status first — summing across all statuses would
+    silently count a rejected trap or a correctly-declined OBC trade as
+    if it were a real dollar win. Every real consumer in this codebase
+    (main.py, run_persistent_watchlist_scan.py, gui/windows.py,
+    services/excel_export.py) already applied exactly this filter
+    independently before this helper existed — this just gives all four
+    one shared, impossible-to-forget implementation instead of four
+    separately-maintained copies of the same filter. Extracting this
+    does not change any of their existing results."""
+    return sum(r.net_saving for r in results if r.status.value == "OPTIMIZATION")
 
 
 def norm_str(s: str | None) -> str:
@@ -42,9 +149,23 @@ ESPRESSO_FEE_TYPES = frozenset([
     "VACATION_TOTAL", "OBC_TOTAL", "PORT_CHARGE", "PORT_EXPENSES",
     "GOVERNMENT_TAX", "TAXES_AND_FEES", "NCF", "NCCF", "CRUISE",
     "CRUISEFARE", "GRATUITIES", "TAX", "FEE",
+    # Found mining a real 278-booking run (2026-07-31): these are invoice
+    # structure/summary rows (subtotals, running totals, balance, deposit),
+    # not real packages/perks. They weren't observed causing a live
+    # misclassification (their names stay stable between old/new invoices)
+    # but are excluded defensively now that we know they exist.
+    "VACATION_SUBTOTAL", "VACATION_WITHOUT_COMPONENTS_SUBTOTAL",
+    "VACATION_WITHOUT_COMPONENTS_TOTAL", "VACATION_NETTOTAL",
+    "TAX_TOTAL", "COMPONENT", "BALANCE", "DEPOSIT", "DEPOSIT_TOTAL",
 ])
 
 _FEE_NAME_PREFIX_RE = re.compile(r"^(NCCF|NCF|PORT|TAX|FEE|GOVERNMENT|GRATUIT)")
+
+# Invoice item types seen in real data that aren't handled above and aren't
+# expected either — logged once per distinct value so a future data-mining
+# pass isn't the only way to notice a new one appearing.
+_KNOWN_NON_FEE_TYPES = frozenset(["", "CRUISE_PROMO"])
+_logged_unknown_types: set[str] = set()
 
 # Minimum ratio of (price drop) to (OBC lost) before a repricing that
 # forfeits OBC is treated as a genuine optimization rather than a wash.
@@ -61,14 +182,56 @@ def _is_espresso_fee(item: dict) -> bool:
         return True
     if " OBC" in name or name.endswith("OBC") or name.startswith("OBC "):
         return True
+    if item_type and item_type not in _KNOWN_NON_FEE_TYPES and item_type not in _logged_unknown_types:
+        # A genuinely new invoice item type we haven't seen and classified
+        # before — surface it instead of silently guessing, so a future gap
+        # like this one gets noticed from a single log line instead of
+        # needing another full manual data-mining pass.
+        _logged_unknown_types.add(item_type)
+        import logging
+        logging.getLogger(__name__).warning(
+            "espresso.unknown_invoice_type type=%r name=%r", item_type, item.get("name"),
+        )
     return False
 
 
-def _get_total(items: list[dict], fee_type: str) -> float:
-    """Get the total-row amount for a specific fee type."""
+def _get_promo_value_by_name(items: list[dict]) -> dict[str, float]:
+    """Sum CRUISE_PROMO-type invoice line amounts by normalized name, across
+    every passenger. Confirmed against real data: CRUISE_PROMO lines are
+    always tagged with a per-passenger paxId, never "total" (0 of 1,616
+    real instances checked), so this is the only way to recover the real
+    dollar value of a lost fare/promo code — oldFares/newFares only ever
+    carries the name, never an amount. Amounts are typically negative
+    (a discount), so losing one costs the client abs(amount) more."""
+    values: dict[str, float] = {}
+    for item in items:
+        if norm_str(item.get("type", "")) != "CRUISE_PROMO":
+            continue
+        name = norm_str(item.get("name", "") or item.get("normalizedName", ""))
+        if not name:
+            continue
+        values[name] = values.get(name, 0.0) + safe_float(item.get("amount", 0))
+    return values
+
+
+def _get_total(items: list[dict], fee_type: str) -> float | None:
+    """Get the total-row amount for a specific fee type.
+
+    CONFIRMED REAL RISK, fixed 2026-08-13: previously used safe_float,
+    which silently returned 0.0 both when no matching row exists at all
+    (a real, legitimate "this fee type doesn't apply here" — e.g. no
+    OBC_TOTAL row when a booking genuinely has no OBC) AND when a matching
+    row IS found but its `amount` field is missing/malformed (real data
+    corruption — a wrong invoice value from the portal). Those are
+    different facts. Now: no matching row -> 0.0 (unchanged, still a
+    legitimate zero). A matching row whose amount can't be parsed -> None
+    (NEW — the caller must treat this as unknown, never as a real $0),
+    since VACATION_TOTAL/OBC_TOTAL feed directly into old_total/new_total/
+    net_saving and a silently-wrong zero here can fabricate a fake
+    optimization or a fake trap."""
     for item in items:
         if item.get("paxId") == "total" and norm_str(item.get("type", "")) == fee_type:
-            return safe_float(item.get("amount", 0))
+            return safe_float_or_none(item.get("amount"))
     return 0.0
 
 
@@ -117,7 +280,21 @@ _READDABLE_PATTERNS = [
     re.compile(r"promo", re.IGNORECASE),
     re.compile(r"loyalty", re.IGNORECASE),
     re.compile(r"coupon", re.IGNORECASE),
+    # Found mining a real 278-booking run (2026-07-31): an entire "SAV/SAVE"
+    # family of fare codes (SAVEUPTO100 NRD, WEEKENDSAV NRD, BOOKNOWSAVNRD,
+    # CANADA SAV NRD — 140+ combined occurrences) was falling through to
+    # "truly lost" despite reading as the same kind of marketing promo as
+    # the patterns above.
+    re.compile(r"sav", re.IGNORECASE),
 ]
+
+# BOGO60/BOGO75 NRD is the single most common lost fare in real data (536
+# occurrences in one 278-booking run) and is deliberately NOT classified
+# re-addable or truly-lost here — whether a buy-one-get-one offer can
+# realistically be re-applied after a reprice is a real-world judgment call
+# this project doesn't have an answer for yet, not a coding gap. Until
+# confirmed, it's priced (via _get_promo_value_by_name below) and treated as
+# truly lost, the conservative default — never silently ignored.
 
 
 def _is_re_addable(fare_name: str) -> bool:
@@ -153,6 +330,22 @@ def calculate_espresso(raw_data: dict, booking_id: str, price_category: str | No
         old_obc = _get_total(old_items, "OBC_TOTAL")
         new_obc = _get_total(new_items, "OBC_TOTAL")
 
+        # CONFIRMED REAL RISK, fixed 2026-08-13: these four figures directly
+        # become old_total/new_total/net_saving — a None here means a
+        # VACATION_TOTAL/OBC_TOTAL row was FOUND but its amount could not be
+        # parsed (real data corruption, not "this fee doesn't apply" — see
+        # _get_total's docstring). Silently treating that as $0 could
+        # fabricate a fake OPTIMIZATION (missing new_total looks like a
+        # 100%-off price) or a fake TRAP. Never guess here — report ERROR,
+        # the existing "don't trust this result" channel, exactly like any
+        # other malformed-response failure this function already raises for.
+        if old_total is None or new_total is None or old_obc is None or new_obc is None:
+            raise ValueError(
+                "invoice total/OBC amount could not be parsed from the portal response "
+                "(VACATION_TOTAL or OBC_TOTAL row present but its amount field was missing "
+                "or malformed) — refusing to guess a $0 substitute"
+            )
+
         price_drop = round2(old_total - new_total)
         obc_change = round2(new_obc - old_obc)
 
@@ -176,9 +369,8 @@ def calculate_espresso(raw_data: dict, booking_id: str, price_category: str | No
             if i.get("name") or i.get("normalizedName")
         ]
 
-        net = round2(price_drop + obc_change - lost_pkg_value)
-
-        # Fare analysis
+        # Fare analysis (moved before `net` — a truly-lost fare's real
+        # dollar cost now needs to fold into lost_pkg_value first)
         old_fare_names = [f.get("name", "") for f in (data.get("oldFares") or []) if f.get("name")]
         new_fare_names = [f.get("name", "") for f in (data.get("newFares") or []) if f.get("name")]
         new_fare_set = set(norm_str(f) for f in new_fare_names)
@@ -187,6 +379,26 @@ def calculate_espresso(raw_data: dict, booking_id: str, price_category: str | No
         re_addable_fares = [f for f in all_lost_fares if _is_re_addable(f)]
         truly_lost_fares = [f for f in all_lost_fares if not _is_re_addable(f)]
         gained_fares = [f for f in new_fare_names if norm_str(f) not in old_fare_set]
+
+        # A truly-lost fare (e.g. a BOGO discount) used to contribute $0 to
+        # net_saving — its real dollar value lives in CRUISE_PROMO invoice
+        # lines, tracked separately from the name-only oldFares list, and
+        # was never being cross-referenced. Confirmed against real data:
+        # losing a BOGO60/75 NRD fare is worth $394-$2,833 (avg ~$1,756).
+        old_promo_values = _get_promo_value_by_name(old_items)
+        priced_lost_fares = []
+        for fare_name in truly_lost_fares:
+            promo_amount = old_promo_values.get(norm_str(fare_name))
+            if promo_amount:
+                priced_lost_fares.append((fare_name, abs(round2(promo_amount))))
+        lost_fare_value = round2(sum(v for _, v in priced_lost_fares))
+        if lost_fare_value:
+            lost_pkg_value = round2(lost_pkg_value + lost_fare_value)
+            lost_pkg_names = lost_pkg_names + [
+                f"{name} (${value:.2f})" for name, value in priced_lost_fares
+            ]
+
+        net = round2(price_drop + obc_change - lost_pkg_value)
 
         # Status determination
         re_add_note = (" — re-add: " + ", ".join(re_addable_fares)) if re_addable_fares else ""
@@ -268,19 +480,36 @@ NCL_ADDON_VALUES: dict[str, int] = {
     "excursion": 50, "shore": 50,
 }
 
-_DOLLAR_PATTERN = re.compile(r"\$(\d+)")
+_DOLLAR_PATTERN = re.compile(r"(?:\$|usd\s*)\s*([\d,]+(?:\.\d{1,2})?)")
 
 
-def _ncl_addon_value(addon_name: str | None) -> int:
-    """Estimate dollar value of an NCL addon by its name."""
+def _ncl_addon_value(addon_name: str | None) -> float:
+    """Estimate dollar value of an NCL addon by its name.
+
+    CONFIRMED REAL BUG, fixed 2026-08-13: the old regex `\\$(\\d+)` only
+    matched a literal '$' immediately followed by digits — no decimal
+    point, no thousands separator. A real addon literally named
+    "$149.99 Beverage Package" matched only "149", silently discarding
+    the ".99" and UNDERSTATING the addon's real value by up to $0.99.
+    Since lost_addon_value is SUBTRACTED in `net = price_drop -
+    lost_addon_value`, understating it OVERSTATES net — the opposite of
+    conservative (the wrong direction for a value meant to represent
+    what the client is giving up). Now also accepts a comma thousands
+    separator ("$1,249.99") and a bare "USD 149.99" prefix (no $ sign at
+    all), while still falling back to the keyword-based
+    NCL_ADDON_VALUES estimate table when no dollar figure appears in the
+    name at all. Returns float, not int, to preserve cents."""
     lower = (addon_name or "").lower()
     match = _DOLLAR_PATTERN.search(lower)
     if match:
-        return int(match.group(1))
+        try:
+            return float(match.group(1).replace(",", ""))
+        except ValueError:
+            pass  # regex guarantees digits/commas/one decimal point, but never trust a parse blindly
     for key, val in NCL_ADDON_VALUES.items():
         if key in lower:
-            return val
-    return 0
+            return float(val)
+    return 0.0
 
 
 # ── NCL Calculator ──────────────────────────────────────────────
@@ -418,6 +647,7 @@ def calculate_goccl(
     current_price_gross: float,
     available_offer_codes: list[dict],
     guests_count: int = 2,
+    guests_count_verified: bool = False,
 ) -> BookingResult:
     """
     Analyze a GoCCL (Carnival) booking's offer-code comparison and surface
@@ -434,6 +664,29 @@ def calculate_goccl(
     scraper/goccl.py's preview_fare_code — reserved for one human-reviewed
     candidate at a time, never run unattended for every candidate found here).
 
+    CONFIRMED REAL BUG, fixed 2026-08-13: `guests_count` used to always be
+    `settings.goccl_default_guests_count` (a global default of 2), with no
+    way to tell a genuinely-2-guest booking apart from "we never checked."
+    Real captured data (booking DEMO01) shows this default directly
+    flipping OPTIMIZATION/NO_SAVING classification via the guests_count
+    multiplication below — for any booking whose real occupancy isn't 2,
+    the dollar magnitude (and potentially the classification itself) can
+    be wrong. No real per-booking guest-count field has been confirmed
+    anywhere in GoCCL's `window.initialData` (no live capture with such a
+    field exists to verify a selector against — see scraper/goccl.py), so
+    this function does NOT guess one. Instead, `guests_count_verified`
+    makes the existing assumption explicit rather than silently invisible:
+    when False (today's only real caller path), every note this function
+    returns that depends on `guests_count` says so plainly, so a human
+    reviewing the result knows the dollar figure — and, for the NO_SAVING
+    branch below, the absence of one — rests on an unverified assumption,
+    not a confirmed fact. This does not change old_total, new_total,
+    price_drop, net_saving, or status for any existing caller (all of
+    which already pass no argument here, i.e. `guests_count_verified`
+    already defaulted to being unverified in every real call site before
+    this parameter existed) — it only makes the pre-existing assumption
+    visible in the note text instead of silent.
+
     Args:
         booking_id: The booking ID.
         price_category: Current category code (unchanged by this comparison).
@@ -443,6 +696,10 @@ def calculate_goccl(
         available_offer_codes: Offer-code comparison rows, each a dict with
             "offer_code", "offer_name", "stateroom_type", "price_per_person".
         guests_count: Number of guests on the booking (per-person -> gross).
+        guests_count_verified: Whether `guests_count` was actually read from
+            this specific booking's own data (True) or is an assumed
+            default (False). Never invent a True here — only set it when
+            the caller genuinely confirmed the real occupancy.
 
     Returns:
         BookingResult with status, an estimated net_saving, and confidence
@@ -468,6 +725,11 @@ def calculate_goccl(
                 new_total=round2(current_price_gross),
             )
 
+        guest_note = (
+            "" if guests_count_verified
+            else f" [guest count UNVERIFIED — assumed {guests_count}; confirm real occupancy before trusting this figure]"
+        )
+
         cheapest = min(candidates, key=lambda o: safe_float(o.get("price_per_person", 0)))
         old_total = round2(current_price_gross)
         estimated_new_total = round2(safe_float(cheapest.get("price_per_person", 0)) * guests_count)
@@ -477,7 +739,10 @@ def calculate_goccl(
             return BookingResult(
                 cruise_line=CruiseLine.GOCCL,
                 status=BookingStatus.NO_SAVING,
-                note="no saving — cheapest candidate offer code isn't actually lower once guest count is applied",
+                note=(
+                    "no saving — cheapest candidate offer code isn't actually lower "
+                    f"once guest count is applied{guest_note}"
+                ),
                 booking_id=booking_id,
                 price_category=price_category,
                 old_total=old_total,
@@ -490,10 +755,18 @@ def calculate_goccl(
             note=(
                 f"candidate ${round(price_drop)} — offer code '{cheapest.get('offer_code', '')}' "
                 f"({cheapest.get('offer_name', '')}) — UNCONFIRMED, run preview_fare_code to verify "
-                f"gross total + OBC before repricing"
+                f"gross total + OBC before repricing{guest_note}"
             ),
             booking_id=booking_id,
             price_category=price_category,
+            # The candidate offer code — carried here (not a real category)
+            # so the UI's "Open Reprice Popup" action can pass it straight
+            # to preview_fare_code()/fn_goccl_selectOfferAndContinue()
+            # without a separate field or a second round-trip. Previously
+            # left unset, which meant the popup fell back to price_category
+            # (the unchanged category code) and the auto-select silently
+            # failed to match any offer-code button.
+            new_price_category=cheapest.get("offer_code"),
             old_total=old_total,
             new_total=estimated_new_total,
             price_drop=price_drop,
@@ -509,6 +782,138 @@ def calculate_goccl(
             booking_id=booking_id,
             price_category=price_category,
         )
+
+
+# ── ESPRESSO Free-Upgrade Detection ─────────────────────────────
+#
+# HARD PROJECT RULE: never suggest downgrading the customer. Not a
+# tolerance, not a judgment call — a flat rule. This module went through
+# THREE rejected designs before landing here:
+#   1. Compared the current category's price against the cheapest ANY
+#      available category, no type filter — produced nonsense (a $73k
+#      Suite "beaten" by a $6k Ocean View). Self-caught, wrong.
+#   2. Compared against the cheapest available category of the SAME broad
+#      room-type label (e.g. Veranda vs Veranda) — found real matches, but
+#      even one coarse label can span different decks/locations/views a
+#      "cheaper" swap wouldn't reveal, which is still a real downgrade
+#      wearing a same-type disguise. Rejected explicitly — do not resurrect.
+#   3. REJECTED 2026-08-01, CONFIRMED WRONG AGAINST REAL DATA: compared a
+#      strictly-higher-tier candidate's category-table price directly
+#      against the booking's real invoice TOTAL. Produced 6 false
+#      UPGRADE_AVAILABLE results in one run (bookings 1000004, 1000005,
+#      3000036, 3000037, 3000038, 3000039) that were manually checked and
+#      found not to exist. Root cause: ESPRESSO's own on-page disclaimer
+#      confirms the category table's price is PER-PERSON, TRIPLE-OCCUPANCY
+#      — not a total — so comparing it to a whole-booking total is an
+#      apples-to-oranges comparison that makes almost anything look
+#      falsely cheaper. Every one of the 6, when actually confirmed via a
+#      real allocate()+repriceModalCheck() round trip (see below), turned
+#      out to cost MORE than staying put (by $401-$5,459). Do not resurrect
+#      a design that compares a table price directly to a total.
+#   4. CURRENT VERSION: a real, ESPRESSO-confirmed number, not an estimate.
+#      find_upgrade_candidates() below is a FREE, UNIT-SAFE pre-filter —
+#      it only ever compares the table's per-person rate for a candidate
+#      against the table's per-person rate for the CURRENT category (same
+#      table, same booking, same units both sides) — never against the
+#      total. It decides nothing on its own; it only narrows down which
+#      candidates are worth spending a real confirmation round trip on
+#      (measured against 155 real captured category tables: cuts the
+#      round-trip count by 95.8%, from 862 down to 36). The actual
+#      accept/reject decision is made by scraper/espresso.py's
+#      _confirm_candidate_total(), which runs the exact same
+#      allocate()+repriceModalCheck() sequence already trusted for
+#      OPTIMIZATION/TRAP, and reads back ESPRESSO's own rendered
+#      sb.summary.price.allocationPrice — a real whole-dollar total,
+#      confirmed live 2026-08-01 to update correctly even when
+#      repriceModalCheck itself returns "skipRepriceModal" (that key means
+#      "this booking can't commit a reprice," not "no price was computed" —
+#      the allocation price still reflects the real total either way).
+#      make_upgrade_available_result() is only ever called with that real
+#      confirmed number, never a table estimate.
+
+# Tier ranking for ESPRESSO's category-table room-type labels. Web-verified
+# 2026-07-31: Royal Caribbean's public 4-tier hierarchy (Interior/Ocean
+# View/Balcony/Suite) matches exactly. Celebrity's public hierarchy is more
+# granular (Concierge Class/AquaClass sit between Veranda and Suite) but
+# neither label has been observed in this portal's category table yet — if
+# one appears, confirm how it's actually labeled here before trusting this
+# ranking for it. "SUITE/DELUXE" vs "SUITE" is ESPRESSO-internal
+# terminology with no public source to confirm ordering — deliberately
+# ranked EQUAL until confirmed, so neither is ever treated as an upgrade
+# over the other.
+ESPRESSO_ROOM_TYPE_RANK: dict[str, int] = {
+    "INTERIOR": 1,
+    "OUTSIDE": 2,
+    "BALCONY STATEROOM": 3,
+    "VERANDA": 3,
+    "SUITE/DELUXE": 4,
+    "SUITE": 4,
+}
+
+_ROW_PRICE_RE = re.compile(r"([\d,]+\.\d{2})")
+_ROW_TYPE_RE = re.compile(r"\n\t([A-Za-z /]+?)\t\n")
+
+
+def _room_type_from_row(row: dict) -> str | None:
+    m = _ROW_TYPE_RE.search(row.get("rowText", "") or "")
+    return norm_str(m.group(1)) if m else None
+
+
+def _price_from_row(row: dict) -> float | None:
+    m = _ROW_PRICE_RE.search(row.get("rowText", "") or "")
+    return safe_float(m.group(1).replace(",", "")) if m else None
+
+
+def find_upgrade_candidates(
+    current_category: str | None,
+    category_rows: list[dict],
+) -> list[dict]:
+    """FREE, UNIT-SAFE pre-filter only — decides nothing by itself. Returns
+    AVAILABLE categories in a strictly higher room-type tier than the
+    current one, whose per-person table rate is <= the current category's
+    OWN per-person table rate (same table, same booking — the only
+    apples-to-apples comparison the table data supports). Sorted cheapest
+    (by table rate) first, so a caller confirming candidates one at a time
+    checks the most promising one first.
+
+    This does NOT mean any of these are real upgrades — the table's price
+    is per-person/triple-occupancy, not a total (see module docstring
+    above). Every candidate returned here still needs a real
+    allocate()+repriceModalCheck() confirmation (scraper/espresso.py's
+    _confirm_candidate_total()) before it can ever be surfaced as
+    UPGRADE_AVAILABLE. This function exists purely to avoid spending a
+    real round trip on candidates that are obviously not competitive even
+    at the coarse per-person level.
+    """
+    if not current_category or not category_rows:
+        return []
+
+    current_row = next(
+        (r for r in category_rows if r.get("category") == current_category), None,
+    )
+    if current_row is None:
+        return []
+    current_type = _room_type_from_row(current_row)
+    current_rank = ESPRESSO_ROOM_TYPE_RANK.get(current_type) if current_type else None
+    current_pp = _price_from_row(current_row)
+    if current_rank is None or current_pp is None:
+        return []
+
+    candidates = []
+    for row in category_rows:
+        if row.get("status") != "AVL":
+            continue
+        rtype = _room_type_from_row(row)
+        rank = ESPRESSO_ROOM_TYPE_RANK.get(rtype) if rtype else None
+        if rank is None or rank <= current_rank:
+            continue
+        pp = _price_from_row(row)
+        if pp is None or pp > current_pp:
+            continue
+        candidates.append({"category": row.get("category"), "room_type": rtype, "table_per_person_price": pp})
+
+    candidates.sort(key=lambda c: c["table_per_person_price"])
+    return candidates
 
 
 # ── Helper Constructors ────────────────────────────────────────
@@ -580,3 +985,75 @@ def make_error_result(
         note=error_msg, error=error_msg,
         booking_id=booking_id, price_category=price_category,
     )
+
+
+def make_upgrade_available_result(
+    booking_id: str, price_category: str | None, cruise_line: CruiseLine,
+    old_total: float, upgrade: dict,
+) -> BookingResult:
+    """A strictly-higher-tier category is available for the same or less
+    money than the client is already paying. `upgrade["price"]` must be a
+    REAL, ESPRESSO-confirmed total (from scraper/espresso.py's
+    _confirm_candidate_total()) — never a category-table estimate; see the
+    ESPRESSO Free-Upgrade Detection module docstring for why. Always a
+    candidate for human review before switching (a category change is a
+    different physical room/deck, never auto-selected), but unlike other
+    candidate signals in this project, there's no scenario where acting on
+    this one harms the customer — it's an upgrade by construction, and
+    confirmed real, not estimated."""
+    return BookingResult(
+        cruise_line=cruise_line, status=BookingStatus.UPGRADE_AVAILABLE,
+        note=(
+            f"confirmed free upgrade — {upgrade['room_type'].title()} category "
+            f"'{upgrade['category']}' at ${upgrade['price']:.2f} vs current "
+            f"${old_total:.2f} — review with client before switching"
+        ),
+        booking_id=booking_id, price_category=price_category,
+        new_price_category=upgrade["category"],
+        old_total=round2(old_total), new_total=upgrade["price"],
+        price_drop=round2(old_total - upgrade["price"]),
+        net_saving=round2(old_total - upgrade["price"]),
+    )
+
+
+# ── ESPRESSO Paid-in-Full Detection ─────────────────────────────
+#
+# A handful of dollars (or an outright credit balance, i.e. a negative
+# amount due) still counts as paid in full — rounding, taxes, small
+# adjustments. $25 flat floor, or a percentage of total price for larger
+# bookings, whichever is more generous. Confirmed against real data:
+# booking 3000040's $23 due (due the same day the scan ran) is exactly the
+# case this exists for — it had been slipping through as a false "$77
+# OPTIMIZATION" because the reprice API call returned a normal-length
+# response, so the old, purely-reactive paid-status check never even ran
+# for it.
+#
+# WIDENED 2026-08-04 from 1.5% to 5%: booking 1000003 ($370.84 due on
+# $8,892.68, 4.17%) was reported by Neon as one that should have been
+# caught and wasn't — the 1.5% rule was working exactly as designed
+# ($370.84 is real money still owed, final payment isn't even due for
+# another 9 months), but was stricter than what "paid in full" means in
+# practice for this project. Checked the real percent-still-due
+# distribution across 468 captured bookings before picking a number: it's
+# a smooth continuum with no natural gap near 4.17%, so there's no
+# "objectively correct" cutoff to discover here the way there was for the
+# free-upgrade fix — this is a business-risk-tolerance choice, not a fact.
+# 5% was chosen as the smallest round number that clears 1000003 with a
+# little headroom; it also newly classifies ~37 additional bookings out of
+# 468 (~8%) as paid-in-full compared to the old 1.5% rule, i.e. that many
+# fewer bookings get scored for repricing at all. If that's too aggressive
+# or not aggressive enough, adjust this one constant — nothing else
+# depends on the specific number.
+PAID_IN_FULL_TOLERANCE_FLAT = 25.0
+PAID_IN_FULL_TOLERANCE_PCT = 0.05
+
+
+def is_paid_in_full(final_payment_due: float | None, total_price: float) -> bool:
+    """final_payment_due should come from the portal's own "Final Payment
+    Due (USD)" figure (already reconciled for taxes/credits/adjustments —
+    confirmed present on 590/590 real bookings whenever Total Price is),
+    not re-derived from total_price minus payments_received."""
+    if final_payment_due is None:
+        return False  # couldn't read the field — don't guess, fall through
+    tolerance = max(PAID_IN_FULL_TOLERANCE_FLAT, total_price * PAID_IN_FULL_TOLERANCE_PCT)
+    return final_payment_due <= tolerance

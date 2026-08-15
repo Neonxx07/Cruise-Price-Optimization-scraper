@@ -9,11 +9,11 @@ from pathlib import Path
 from PySide6.QtCore import Qt, Slot
 from PySide6.QtGui import QFont
 from PySide6.QtWidgets import (
+    QAbstractItemView,
     QApplication,
     QCheckBox,
     QComboBox,
     QGridLayout,
-    QGroupBox,
     QHBoxLayout,
     QHeaderView,
     QLabel,
@@ -23,7 +23,6 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QMessageBox,
     QPushButton,
-    QSplitter,
     QTableWidget,
     QTableWidgetItem,
     QTextEdit,
@@ -32,9 +31,13 @@ from PySide6.QtWidgets import (
 )
 from qasync import asyncSlot
 
+from core.calculator import total_optimization_savings
 from core.models import BookingResult, CruiseLine
 from gui.queue_manager import BookingQueueManager, QueueStatus
 from gui.scan_adapter import GuiScanAdapter
+from utils.logging import get_logger
+
+logger = get_logger(__name__)
 
 
 class MainWindow(QMainWindow):
@@ -60,11 +63,38 @@ class MainWindow(QMainWindow):
             return
         event.ignore()
         self._shutting_down = True
-        self.status_label.setText("Closing browser session...")
+        self.status_label.setText("Stopping scan and closing browser session...")
         asyncio.ensure_future(self._shutdown_and_close())
 
     async def _shutdown_and_close(self) -> None:
+        """CONFIRMED REAL BUG, fixed 2026-08-13: this used to close the
+        browser immediately, even with a scan still running. That made
+        _run_batch's in-flight `scraper.check_booking(...)` call fail
+        with "Target page, context or browser has been closed" —
+        booking_service.py's OWN dead-browser recovery then interpreted
+        that as a crash and started a SECOND, brand-new browser to keep
+        working through the remaining queue, racing against this
+        function which had already asked to quit the application.
+
+        Correct sequence: stop the scan first, wait (bounded — never
+        freeze the GUI indefinitely) for it to actually finish the
+        booking it's mid-flight on, THEN close the browser, THEN quit."""
         try:
+            if self.queue_manager.is_running:
+                self.status_label.setText("Stopping scan (finishing current booking)...")
+                self.queue_manager.stop_processing()
+                # Bounded wait, not indefinite — 30s is generously more
+                # than one booking's real worst-case (network timeout +
+                # retry), matching this project's own scraper timeout
+                # settings, without risking a permanent freeze if
+                # something is truly stuck.
+                for _ in range(150):
+                    if not self.queue_manager.is_running:
+                        break
+                    await asyncio.sleep(0.2)
+                else:
+                    logger.warning("gui.shutdown_scan_stop_timeout")
+            self.status_label.setText("Closing browser session...")
             await self.queue_manager.close_live_session()
         except Exception:
             traceback.print_exc()
@@ -80,121 +110,74 @@ class MainWindow(QMainWindow):
         self.login_status_label.setStyleSheet("color: #444444; font-weight: bold;")
         layout.addWidget(self.login_status_label)
 
-        # Two-pane layout: left = booking entry / queue / scraping log,
-        # right = controls / results — matches the intended screen split
-        # rather than one long stacked column.
-        splitter = QSplitter(Qt.Horizontal)
-        splitter.addWidget(self._build_left_pane())
-        splitter.addWidget(self._build_right_pane())
-        splitter.setStretchFactor(0, 2)
-        splitter.setStretchFactor(1, 3)
-        layout.addWidget(splitter, 1)
+        top_layout = QGridLayout()
+        top_layout.setHorizontalSpacing(12)
+        top_layout.setVerticalSpacing(10)
 
-        bottom_layout = QHBoxLayout()
-        self.export_button = QPushButton("Export report")
-        self.export_button.clicked.connect(self._on_export)
-        bottom_layout.addWidget(self.export_button)
-
-        self.status_label = QLabel("Ready")
-        self.status_label.setStyleSheet("color: #666666;")
-        bottom_layout.addWidget(self.status_label, 1)
-
-        layout.addLayout(bottom_layout)
-
-        self.setCentralWidget(container)
-
-    def _build_left_pane(self) -> QWidget:
-        """Booking entry, the queued booking list, and the scraping activity log."""
-        pane = QWidget()
-        layout = QVBoxLayout(pane)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(12)
-
-        booking_group = QGroupBox("Booking")
-        booking_layout = QGridLayout(booking_group)
-        booking_layout.setHorizontalSpacing(8)
-        booking_layout.setVerticalSpacing(8)
-
-        booking_layout.addWidget(QLabel("Booking ID:"), 0, 0)
+        top_layout.addWidget(QLabel("Booking ID:"), 0, 0)
         self.booking_input = QLineEdit()
         self.booking_input.returnPressed.connect(self._add_booking)
-        booking_layout.addWidget(self.booking_input, 0, 1)
+        top_layout.addWidget(self.booking_input, 0, 1)
+
         self.add_booking_button = QPushButton("Add to queue")
         self.add_booking_button.clicked.connect(self._add_booking)
-        booking_layout.addWidget(self.add_booking_button, 0, 2)
+        top_layout.addWidget(self.add_booking_button, 0, 2)
 
-        booking_layout.addWidget(QLabel("Bulk (comma or newline separated):"), 1, 0, 1, 3)
-        self.bulk_input = QTextEdit()
-        self.bulk_input.setFixedHeight(80)
-        booking_layout.addWidget(self.bulk_input, 2, 0, 1, 3)
-        self.add_bulk_button = QPushButton("Add list")
-        self.add_bulk_button.clicked.connect(self._add_bulk)
-        booking_layout.addWidget(self.add_bulk_button, 3, 2)
-
-        layout.addWidget(booking_group)
-
-        list_group = QGroupBox("Booking list")
-        list_layout = QVBoxLayout(list_group)
-        self.queue_status_label = QLabel("0 pending, 0 running")
-        self.queue_status_label.setStyleSheet("font-weight: bold;")
-        list_layout.addWidget(self.queue_status_label)
-        self.queue_list = QListWidget()
-        list_layout.addWidget(self.queue_list, 1)
-        self.clear_queue_button = QPushButton("Clear queue")
-        self.clear_queue_button.clicked.connect(self._on_clear_queue)
-        list_layout.addWidget(self.clear_queue_button)
-
-        layout.addWidget(list_group, 1)
-
-        process_group = QGroupBox("The scraping process")
-        process_layout = QVBoxLayout(process_group)
-        self.activity_log = QTextEdit()
-        self.activity_log.setReadOnly(True)
-        self.activity_log.setStyleSheet("font-family: Consolas, monospace; font-size: 11px;")
-        process_layout.addWidget(self.activity_log)
-
-        layout.addWidget(process_group, 1)
-
-        return pane
-
-    def _build_right_pane(self) -> QWidget:
-        """Start/stop/login controls and the check results."""
-        pane = QWidget()
-        layout = QVBoxLayout(pane)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(12)
-
-        controls_group = QGroupBox("Start / Stop / Check login")
-        controls_layout = QGridLayout(controls_group)
-        controls_layout.setHorizontalSpacing(8)
-        controls_layout.setVerticalSpacing(8)
-
-        controls_layout.addWidget(QLabel("Cruise Line:"), 0, 0)
+        top_layout.addWidget(QLabel("Cruise Line:"), 1, 0)
         self.cruise_line_selector = QComboBox()
-        self.cruise_line_selector.addItems([c.value for c in CruiseLine])
-        controls_layout.addWidget(self.cruise_line_selector, 0, 1)
-        self.login_button = QPushButton("Check login")
-        self.login_button.clicked.connect(self._on_login_check)
-        controls_layout.addWidget(self.login_button, 0, 2)
+        # CONFIRMED REAL BUG 2026-08-12: this used to list EVERY CruiseLine
+        # enum member, including MSC — but MSC has no scraper in this
+        # pipeline at all (it's driven by the separate msc_commands.py/
+        # msc_session_controller.py subsystem) and BookingService._get_scraper
+        # used to silently fall through to EspressoScraper for it. Excluding
+        # it here means the dropdown only ever offers cruise lines this
+        # pipeline can actually drive.
+        self.cruise_line_selector.addItems([c.value for c in CruiseLine if c != CruiseLine.MSC])
+        top_layout.addWidget(self.cruise_line_selector, 1, 1)
 
         self.start_button = QPushButton("Start")
         self.start_button.clicked.connect(self._on_start)
-        controls_layout.addWidget(self.start_button, 1, 0)
+        top_layout.addWidget(self.start_button, 1, 2)
+
         self.stop_button = QPushButton("Stop")
         self.stop_button.clicked.connect(self._on_stop)
         self.stop_button.setEnabled(False)
-        controls_layout.addWidget(self.stop_button, 1, 1)
+        top_layout.addWidget(self.stop_button, 0, 3)
+
+        self.login_button = QPushButton("Check login")
+        self.login_button.clicked.connect(self._on_login_check)
+        top_layout.addWidget(self.login_button, 1, 3)
+
+        layout.addLayout(top_layout)
+
+        self.summary_label = QLabel()
+        self.summary_label.setWordWrap(True)
+        self.summary_label.setFont(QFont("Arial", 10, QFont.Bold))
+        layout.addWidget(self.summary_label)
+
+        queue_layout = QGridLayout()
+        queue_layout.setHorizontalSpacing(12)
+        queue_layout.setVerticalSpacing(10)
+
+        queue_layout.addWidget(QLabel("Bulk booking IDs (comma or newline separated):"), 0, 0, 1, 2)
+        self.bulk_input = QTextEdit()
+        self.bulk_input.setFixedHeight(100)
+        queue_layout.addWidget(self.bulk_input, 1, 0, 1, 2)
+
+        self.add_bulk_button = QPushButton("Add list")
+        self.add_bulk_button.clicked.connect(self._add_bulk)
+        queue_layout.addWidget(self.add_bulk_button, 1, 2)
 
         self.force_recheck_checkbox = QCheckBox("Force live recheck")
-        controls_layout.addWidget(self.force_recheck_checkbox, 2, 0, 1, 3)
+        queue_layout.addWidget(self.force_recheck_checkbox, 2, 0, 1, 2)
 
-        self.capture_market_data_checkbox = QCheckBox("Collect market data (category/offer-code snapshot)")
+        self.capture_market_data_checkbox = QCheckBox("Collect market data (category/offer snapshot)")
         self.capture_market_data_checkbox.setChecked(True)
         self.capture_market_data_checkbox.setToolTip(
-            "Store the category/offer-code table snapshot (ESPRESSO category table, "
-            "NCL category grid, or GoCCL offer-code comparison) in the database for later analysis."
+            "Store a snapshot in the database for later analysis: the category table for "
+            "ESPRESSO/NCL, or the offer-code comparison for GoCCL."
         )
-        controls_layout.addWidget(self.capture_market_data_checkbox, 3, 0, 1, 3)
+        queue_layout.addWidget(self.capture_market_data_checkbox, 3, 0, 1, 2)
 
         self.capture_everything_checkbox = QCheckBox("Capture everything (full page HTML + network traffic)")
         self.capture_everything_checkbox.setToolTip(
@@ -202,16 +185,32 @@ class MainWindow(QMainWindow):
             "(tables + label/value pairs), and every network request/response — all read-only, "
             "written under data/pages/ and data/network_traffic.jsonl. Increases scan time and disk use."
         )
-        controls_layout.addWidget(self.capture_everything_checkbox, 4, 0, 1, 3)
+        queue_layout.addWidget(self.capture_everything_checkbox, 4, 0, 1, 2)
 
-        layout.addWidget(controls_group)
+        self.remove_selected_button = QPushButton("Remove selected")
+        self.remove_selected_button.clicked.connect(self._on_remove_selected)
+        queue_layout.addWidget(self.remove_selected_button, 2, 2)
 
-        results_group = QGroupBox("Booking after check — status, no saving / price difference")
-        results_layout = QVBoxLayout(results_group)
-        self.summary_label = QLabel()
-        self.summary_label.setWordWrap(True)
-        self.summary_label.setFont(QFont("Arial", 10, QFont.Bold))
-        results_layout.addWidget(self.summary_label)
+        self.clear_queue_button = QPushButton("Clear queue")
+        self.clear_queue_button.clicked.connect(self._on_clear_queue)
+        queue_layout.addWidget(self.clear_queue_button, 3, 2)
+
+        layout.addLayout(queue_layout)
+
+        layout.addWidget(QLabel("Activity log (every automated browser action):"))
+        self.activity_log = QTextEdit()
+        self.activity_log.setReadOnly(True)
+        self.activity_log.setFixedHeight(120)
+        self.activity_log.setStyleSheet("font-family: Consolas, monospace; font-size: 11px;")
+        layout.addWidget(self.activity_log)
+
+        self.queue_status_label = QLabel("0 pending, 0 running")
+        self.queue_status_label.setStyleSheet("font-weight: bold;")
+        layout.addWidget(self.queue_status_label)
+
+        self.queue_list = QListWidget()
+        self.queue_list.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        layout.addWidget(self.queue_list)
 
         self.results_table = QTableWidget(0, 4)
         self.results_table.setHorizontalHeaderLabels([
@@ -220,25 +219,40 @@ class MainWindow(QMainWindow):
         header = self.results_table.horizontalHeader()
         header.setSectionResizeMode(QHeaderView.Stretch)
         self.results_table.setAlternatingRowColors(True)
-        results_layout.addWidget(self.results_table, 1)
+        self.results_table.setSortingEnabled(True)
+        layout.addWidget(self.results_table)
 
-        layout.addWidget(results_group, 1)
+        bottom_layout = QGridLayout()
+        bottom_layout.setHorizontalSpacing(12)
+        bottom_layout.setVerticalSpacing(10)
 
-        return pane
+        self.export_button = QPushButton("Export report")
+        self.export_button.clicked.connect(self._on_export)
+        bottom_layout.addWidget(self.export_button, 0, 0)
+
+        self.status_label = QLabel("Ready")
+        self.status_label.setStyleSheet("color: #666666;")
+        bottom_layout.addWidget(self.status_label, 0, 1)
+
+        layout.addLayout(bottom_layout)
+
+        self.setCentralWidget(container)
 
     def _refresh_summary(self) -> None:
         total = len(self.results)
         optimizations = sum(1 for r in self.results if r.status.value == "OPTIMIZATION")
+        upgrades = sum(1 for r in self.results if r.status.value == "UPGRADE_AVAILABLE")
         traps = sum(1 for r in self.results if r.status.value == "TRAP")
         # Only OPTIMIZATION rows represent savings actually recommended.
         # NO_SAVING rows carry a negative net_saving to mean "repricing
         # would cost more, so we didn't recommend it" — summing those in
         # would make "Total savings" go deeply negative even when real
         # optimizations were found. Matches the CLI's own summary (main.py).
-        savings = sum(r.net_saving for r in self.results if r.status.value == "OPTIMIZATION")
+        savings = total_optimization_savings(self.results)
         summary_text = (
             f"Bookings watched: {total}   "
             f"Optimizations: {optimizations}   "
+            f"Upgrades available: {upgrades}   "
             f"Traps: {traps}   "
             f"Total savings: ${savings:.2f}"
         )
@@ -259,16 +273,17 @@ class MainWindow(QMainWindow):
     @asyncSlot()
     async def _on_login_check(self) -> None:
         print("GUI: _on_login_check entered")
+        # CONFIRMED REAL RISK, fixed 2026-08-13 (Phase 0 correctness audit):
+        # QApplication.processEvents() synchronously dispatches any already-
+        # queued Qt events — including a queued second click on this same
+        # button, or on Start — before the buttons below were disabled.
+        # Disabling FIRST closes that window: a re-entrant click processed
+        # during processEvents() now sees both buttons already disabled.
+        self.login_button.setEnabled(False)
+        self.start_button.setEnabled(False)
         self.status_label.setText("Opening browser for login check...")
         self.login_status_label.setText("Login status: checking...")
         QApplication.processEvents()
-
-        # Login and scanning now share one live browser page — running
-        # both at once would mean two coroutines driving the same
-        # Playwright Page concurrently, so Start is blocked until this
-        # finishes (mirrors the existing login_button lock during scans).
-        self.login_button.setEnabled(False)
-        self.start_button.setEnabled(False)
 
         cruise_line = CruiseLine(self.cruise_line_selector.currentText())
         try:
@@ -314,6 +329,20 @@ class MainWindow(QMainWindow):
     def _remove_queue_item(self, booking_id: str) -> None:
         if self.queue_manager.remove_booking(booking_id):
             self._update_queue_view(self.queue_manager.get_snapshot())
+
+    @Slot()
+    def _on_remove_selected(self) -> None:
+        booking_ids = [
+            item.data(Qt.UserRole)
+            for item in self.queue_list.selectedItems()
+            if item.data(Qt.UserRole)
+        ]
+        if not booking_ids:
+            QMessageBox.information(self, "Nothing selected", "Select one or more queued bookings to remove first.")
+            return
+        removed = sum(1 for bid in booking_ids if self.queue_manager.remove_booking(bid))
+        self._update_queue_view(self.queue_manager.get_snapshot())
+        self.status_label.setText(f"Removed {removed} booking(s) from queue.")
 
     @Slot()
     def _on_clear_queue(self) -> None:
@@ -394,14 +423,25 @@ class MainWindow(QMainWindow):
             self.status_label.setText("Queue processing failed")
             QMessageBox.critical(self, "Processing failed", str(exc))
         finally:
-            self.start_button.setEnabled(True)
-            self.stop_button.setEnabled(False)
-            self.clear_queue_button.setEnabled(True)
-            self.add_booking_button.setEnabled(True)
-            self.add_bulk_button.setEnabled(True)
-            self.booking_input.setEnabled(True)
-            self.bulk_input.setEnabled(True)
-            self.login_button.setEnabled(True)
+            # CONFIRMED REAL BUG, fixed 2026-08-13 (Phase 0 correctness
+            # audit): this used to unconditionally re-enable every control
+            # here, including the case where start_processing() raised
+            # simply because a real scan was ALREADY running (queue_manager
+            # correctly refused to start a second one) — re-enabling Start/
+            # Login/Add/Clear while that other, still-running scan owns the
+            # live browser page reopened the exact re-entrancy window the
+            # login-check fix above closes for that path. Only restore the
+            # idle-state controls when the queue is genuinely not running
+            # any more.
+            if not self.queue_manager.is_running:
+                self.start_button.setEnabled(True)
+                self.stop_button.setEnabled(False)
+                self.clear_queue_button.setEnabled(True)
+                self.add_booking_button.setEnabled(True)
+                self.add_bulk_button.setEnabled(True)
+                self.booking_input.setEnabled(True)
+                self.bulk_input.setEnabled(True)
+                self.login_button.setEnabled(True)
             self._update_queue_view(self.queue_manager.get_snapshot())
 
     @Slot()
@@ -420,28 +460,50 @@ class MainWindow(QMainWindow):
         self.activity_log.append(f"[{ts}] {action}  {detail_str}")
 
     @staticmethod
-    def _format_net_saving(net_saving: float) -> str:
+    def _format_net_saving(net_saving: float, status: str = "") -> str:
         """Spell out cost increases instead of a bare negative dollar
         figure ("$-459.00") that reads as ambiguous — a negative
-        net_saving means repricing would cost more, not save less."""
+        net_saving means repricing would cost more, not save less.
+
+        Sign follows the price DELTA, not the savings polarity: a price
+        going UP ("more expensive") reads "+" since the number the client
+        owes got bigger, and a price going DOWN ("saved") reads "-" since
+        it got smaller — matches how a plain price-change figure reads,
+        rather than a positive-means-good/negative-means-bad framing.
+
+        CONFIRMED REAL BUG 2026-08-12: calculator.py's TRAP/NO_SAVING
+        branches (the package-trap and OBC-loss-ratio checks) can compute
+        a positive net_saving on paper — that's the whole point of those
+        checks, catching a "win" that's smaller than what's being given up
+        — but this method used to say "-$50.00 saved" for those rows
+        regardless of status, directly contradicting the TRAP/NO_SAVING
+        label sitting right next to it in the previous column. Now never
+        uses "saved" language for a row that isn't actually recommended."""
+        if status in ("TRAP", "NO_SAVING") and net_saving > 0:
+            return f"${net_saving:.2f} (not recommended — see status)"
         if net_saving > 0:
-            return f"+${net_saving:.2f} saved"
+            return f"-${net_saving:.2f} saved"
         if net_saving < 0:
-            return f"-${abs(net_saving):.2f} more expensive"
+            return f"+${abs(net_saving):.2f} more expensive"
         return "$0.00"
 
     def _append_result_row(self, result: BookingResult) -> None:
+        # Sorting must be off while inserting: with it enabled, each
+        # setItem() call can trigger an immediate re-sort mid-insert and
+        # scatter this row's cells across different rows.
+        self.results_table.setSortingEnabled(False)
         row = self.results_table.rowCount()
         self.results_table.insertRow(row)
         self.results_table.setItem(row, 0, QTableWidgetItem(result.booking_id))
         self.results_table.setItem(row, 1, QTableWidgetItem(result.status.value))
-        self.results_table.setItem(row, 2, QTableWidgetItem(self._format_net_saving(result.net_saving)))
+        self.results_table.setItem(row, 2, QTableWidgetItem(self._format_net_saving(result.net_saving, result.status.value)))
         self.results_table.setItem(row, 3, QTableWidgetItem(str(result.confidence)))
         color = self._color_for_status(result.status.value)
         for col in range(4):
             item = self.results_table.item(row, col)
             if item is not None:
                 item.setBackground(color)
+        self.results_table.setSortingEnabled(True)
 
     def _update_queue_view(self, snapshot) -> None:
         self.queue_status_label.setText(f"{snapshot.queued} pending, {snapshot.running} running")
@@ -459,6 +521,7 @@ class MainWindow(QMainWindow):
                 remove_button.clicked.connect(lambda _, bid=item.booking_id: self._remove_queue_item(bid))
                 widget_layout.addWidget(remove_button)
             list_item = QListWidgetItem(self.queue_list)
+            list_item.setData(Qt.UserRole, item.booking_id)
             list_item.setSizeHint(widget.sizeHint())
             self.queue_list.addItem(list_item)
             self.queue_list.setItemWidget(list_item, widget)
@@ -470,7 +533,7 @@ class MainWindow(QMainWindow):
             self.results_table.insertRow(row)
             self.results_table.setItem(row, 0, QTableWidgetItem(result.booking_id))
             self.results_table.setItem(row, 1, QTableWidgetItem(result.status.value))
-            self.results_table.setItem(row, 2, QTableWidgetItem(self._format_net_saving(result.net_saving)))
+            self.results_table.setItem(row, 2, QTableWidgetItem(self._format_net_saving(result.net_saving, result.status.value)))
             self.results_table.setItem(row, 3, QTableWidgetItem(str(result.confidence)))
             color = self._color_for_status(result.status.value)
             for col in range(4):
@@ -481,6 +544,12 @@ class MainWindow(QMainWindow):
     def _color_for_status(self, status: str) -> Qt.GlobalColor:
         if status == "OPTIMIZATION":
             return Qt.green
+        # Deliberately distinct from OPTIMIZATION: a category upgrade is a
+        # different physical room/deck, always needs human review before
+        # switching — never the same one-click confidence as a confirmed
+        # same-category win.
+        if status == "UPGRADE_AVAILABLE":
+            return Qt.cyan
         if status == "TRAP":
             return Qt.red
         if status == "NO_SAVING":

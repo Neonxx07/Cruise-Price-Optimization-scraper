@@ -8,6 +8,25 @@ fare changes, package losses, and OBC shifts.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from decimal import Decimal, ROUND_HALF_UP
+
+
+def _round2(value: float) -> float:
+    """Same rounding convention as core.calculator.round2 (ROUND_HALF_UP
+    via a Decimal(str(...)) string round-trip, not Python's banker's-
+    rounding builtin `round()`) — duplicated here rather than imported to
+    avoid a circular import (calculator.py imports calc_confidence from
+    this module already, at module load time). ADDED 2026-08-13 (Phase 0
+    correctness audit): fare_change_pct below used to be computed with
+    plain `round(x, 2)`, the exact float-representation/banker's-rounding
+    defect calculator.round2 was already rewritten to fix elsewhere in
+    this codebase — just missed here because this field is a percentage
+    display value, not a dollar amount, and was out of that earlier fix's
+    scope. This is a display-only field (never summed, never fed back
+    into a financial decision), so this only changes what a human sees
+    for the rare exact-half-cent-equivalent tie case — never a dollar
+    figure."""
+    return float(Decimal(str(value)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
 
 
 @dataclass
@@ -83,7 +102,7 @@ def calc_confidence(
 
         return ConfidenceResult(
             score=score,
-            fare_change_pct=round(fare_change_pct * 100, 2),
+            fare_change_pct=_round2(fare_change_pct * 100),
             old_cruise_fare=old_cruise_fare,
             new_cruise_fare=new_cruise_fare,
         )

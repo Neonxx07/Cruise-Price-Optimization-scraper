@@ -49,6 +49,14 @@ def menu_login():
     _pause()
 
 
+def _ask_headless_mode() -> bool | None:
+    choice = input(
+        "Show the browser window so you can watch it work? "
+        "(y/N — just press Enter to run invisibly in the background): "
+    ).strip().lower()
+    return False if choice in ("y", "yes") else True
+
+
 def menu_scan():
     _banner()
     n = _count_bookings()
@@ -56,7 +64,10 @@ def menu_scan():
         print(f"You don't have any booking IDs yet. Add some first (option 4).")
         _pause()
         return
-    print(f"Checking {n} booking(s) from {WATCHLIST}...\n")
+    headless_mode = _ask_headless_mode()
+    print(f"\nChecking {n} booking(s) from {WATCHLIST}...\n")
+    if headless_mode is False:
+        print("Opening a visible browser window — leave it alone, don't close it.\n")
     REPORTS_DIR.mkdir(exist_ok=True)
     DATA_DIR.mkdir(exist_ok=True)
     stamp = datetime.now().strftime("%Y-%m-%d_%H%M")
@@ -65,6 +76,8 @@ def menu_scan():
         output=str(REPORTS_DIR / f"report_{stamp}.csv"),
         excel=str(REPORTS_DIR / f"report_{stamp}.xlsx"),
         capture_raw=str(DATA_DIR),
+        capture_market_data=False, capture_everything=False,
+        headless_mode=headless_mode,
     )
     asyncio.run(_run_scan(args))
     print(f"\nDone! Open reports\\report_{stamp}.xlsx to see the results.")
@@ -83,13 +96,19 @@ def menu_watch():
     minutes_in = input("Minutes between each check? (just press Enter for 60): ").strip()
     hours = float(hours_in) if hours_in else 8.0
     minutes = int(minutes_in) if minutes_in else 60
+    headless_mode = _ask_headless_mode()
     REPORTS_DIR.mkdir(exist_ok=True)
     DATA_DIR.mkdir(exist_ok=True)
-    print(f"\nRunning every {minutes} min for {hours}h. Press Ctrl+C to stop early.\n")
+    print(f"\nRunning every {minutes} min for {hours}h. Press Ctrl+C to stop early.")
+    if headless_mode is False:
+        print("Each pass opens a visible browser window — leave it alone, don't close it.")
+    print()
     args = SimpleNamespace(
         bookings_file=WATCHLIST, bookings=None, cruise_line="ESPRESSO",
         interval_minutes=minutes, duration_hours=hours, max_passes=None,
         output_dir=str(REPORTS_DIR / "watch"), capture_raw=str(DATA_DIR),
+        capture_market_data=False, capture_everything=False,
+        headless_mode=headless_mode,
     )
     asyncio.run(_run_watch(args))
     _pause()

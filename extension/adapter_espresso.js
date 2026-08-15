@@ -46,6 +46,68 @@ function fn_espresso_checkPaidStatus() {
   } catch (e) { return { isPaid: false, error: e.message }; }
 }
 
+// Reads the "Final Payment Due (USD)" field on the Reservation Summary
+// page — the portal's own already-reconciled remaining balance. Mirrors
+// core/calculator.py's is_paid_in_full()/espresso.py's _read_payment_status():
+// confirmed against 590 real bookings as more reliable than the old
+// text/DOM scraping in fn_espresso_checkPaidStatus (0/590 real matches),
+// which remains below purely as a defense-in-depth fallback.
+function fn_espresso_readPaymentStatus() {
+  const bodyText = document.body?.innerText || '';
+  const patterns = {
+    totalPrice: /Total Price \(USD\):\s*(-?[\d,]+\.?\d*)/i,
+    deposit: /Deposit \(USD\):\s*(-?[\d,]+\.?\d*)/i,
+    paymentsReceived: /Payments Received \(USD\):\s*(-?[\d,]+\.?\d*)/i,
+    finalPaymentDue: /Final Payment Due \(USD\):\s*(-?[\d,]+\.?\d*)/i,
+  };
+  const values = {};
+  for (const [key, re] of Object.entries(patterns)) {
+    const m = bodyText.match(re);
+    values[key] = m ? parseFloat(m[1].replace(/,/g, '')) : null;
+  }
+  return values;
+}
+
+// Captures the loaded category table without mutating the page — used to
+// find a strictly-higher-tier "free upgrade" (see findFreeUpgrade in
+// calculator.js). Mirrors platform/scraper/espresso.py's
+// _capture_category_table().
+//
+// Some bookings render TWO side-by-side rate-program columns per row via
+// a `columnSelection` radio pair (e.g. "Group Allocation - Best Rate" vs
+// "Group Prevailing - Best Rate", or "Individual - Best Rate" vs
+// "Individual - Best Value") — only the left (c2, always pre-checked)
+// column has ever been read here. Both columns' cells already exist in
+// the same page load, so both are now captured purely as additional
+// data — this does NOT feed the right-hand (c3) column into any pricing
+// decision yet, deliberately, pending a real evidence base of when the
+// two columns actually diverge (see the matching comment in
+// _capture_category_table() in espresso.py for the full rationale).
+function fn_espresso_captureCategoryTable(currentCategory) {
+  const tbody = document.querySelector('#catAvailCategoryList tbody') || document.querySelector('[id*="catAvail"] tbody');
+  const rows = [];
+  if (tbody) {
+    for (const row of tbody.querySelectorAll('tr')) {
+      const category = row.querySelector('td.c1 div.categoryIcon span, .categoryIcon span')?.textContent?.trim() || null;
+      const status = row.querySelector('td.c2.rooms .svCabin .status, .svCabin .status')?.textContent?.trim() || '';
+      const c2Cells = Array.from(row.querySelectorAll('td.c2:not(.clearCell)')).map(td => (td.textContent || '').trim());
+      const c3Cells = Array.from(row.querySelectorAll('td.c3:not(.clearCell)')).map(td => (td.textContent || '').trim());
+      rows.push({ category, status, rowText: (row.innerText || '').trim(), c2Cells, c3Cells });
+    }
+  }
+  const c2Header = document.querySelector('th.columnSelection.c2 label');
+  const c3Header = document.querySelector('th.columnSelection.c3 label');
+  const c2Radio = document.querySelector('input[name="columnSelection"].c2');
+  return {
+    currentCategory: currentCategory || null,
+    rows,
+    dualRateColumns: Boolean(c2Header || c3Header),
+    c2Label: c2Header ? c2Header.textContent.trim() : null,
+    c3Label: c3Header ? c3Header.textContent.trim() : null,
+    activeColumn: c2Radio ? (c2Radio.checked ? 'c2' : 'c3') : null,
+  };
+}
+
 function fn_espresso_search(bookingId) {
   const input = document.getElementById('reservationid');
   if (!input) return { ok: false, error: 'reservationid not found' };

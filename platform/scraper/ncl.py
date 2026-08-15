@@ -21,7 +21,7 @@ from core.calculator import (
 from core.models import BookingResult, CruiseLine
 from utils.logging import get_logger
 
-from .base import BaseScraper
+from .base import BaseScraper, is_dead_browser_error
 
 logger = get_logger(__name__)
 
@@ -53,7 +53,16 @@ class NclScraper(BaseScraper):
                         isPaid: d.bi?.IsPaid || false,
                         isLocked: d.bi?.IsLocked || false,
                         category: d.bi?.Category || d.category || null,
-                        invoiceTotal: d.bi?.InvoiceTotal || d.baseInvoice?.INVOICE_TOTAL || 0,
+                        // CONFIRMED REAL RISK, fixed 2026-08-13: `||` treats a
+                        // genuine $0 InvoiceTotal the same as missing/undefined,
+                        // silently falling through to a fallback field or a
+                        // hardcoded 0 either way — indistinguishable from a real
+                        // parse failure. `??` (nullish coalescing) only falls
+                        // through on null/undefined, so a real zero survives,
+                        // while a genuinely absent value now becomes `null`
+                        // (read on the Python side, below) instead of a fake 0
+                        // that would silently corrupt price_drop/net_saving.
+                        invoiceTotal: (d.bi?.InvoiceTotal ?? d.baseInvoice?.INVOICE_TOTAL) ?? null,
                         promos: d.bi?.guests
                             ? Object.values(d.bi.guests || {}).map(g => g.Promos || '').join(',')
                             : '',
@@ -102,11 +111,25 @@ class NclScraper(BaseScraper):
         return result or []
 
     async def _switch_to_edit_mode(self) -> bool:
-        """Click Switch to Edit Mode. Returns True if edit mode activated."""
+        """Click Switch to Edit Mode. Returns True if edit mode activated.
+
+        The click itself acquires NCL's server-side 30-minute edit lock —
+        confirmed real bug 2026-08-12: if the confirmation wait below timed
+        out on a slow render, the original code let that exception
+        propagate BEFORE this function ever returned, so the caller's
+        `in_edit_mode` flag never got set and the `finally: _cancel_edit()`
+        release never fired — leaving a real booking locked for 30 minutes
+        with the code believing it had never entered edit mode. The lock is
+        already acquired the moment the click succeeds; the wait below only
+        confirms the UI caught up, so a slow render must never cost us the
+        "we're locked, remember to release it" signal."""
         has_btn = await self.page.query_selector("#res-switch-edit")
         if has_btn:
             await self.page.click("#res-switch-edit")
-            await self.wait_for("#res-edit-save, a[href*='storeBooking']", timeout=12000)
+            try:
+                await self.wait_for("#res-edit-save, a[href*='storeBooking']", timeout=12000)
+            except Exception as e:
+                logger.warning("ncl.edit_mode_confirm_timeout", error=str(e))
             return True
         return False
 
@@ -273,13 +296,22 @@ class NclScraper(BaseScraper):
             if not preload.get("ok"):
                 raise RuntimeError(f"Cannot read __preloaded_data: {preload.get('error')}")
 
+            # CONFIRMED REAL RISK, fixed 2026-08-13: invoiceTotal is now `null`
+            # (not a silent 0) when __preloaded_data genuinely had no readable
+            # total (see _read_preloaded_data's `??` fix above) — refuse to
+            # proceed with a fabricated $0 booking value, which would have
+            # silently corrupted price_drop for a real repricing decision.
+            invoice_total = preload.get("invoiceTotal")
+            if invoice_total is None:
+                raise RuntimeError("NCL booking has no readable InvoiceTotal — refusing to guess $0")
+
             if preload.get("isPaid"):
                 return make_paid_in_full_result(
-                    booking_id, preload.get("category"), CruiseLine.NCL, preload.get("invoiceTotal", 0),
+                    booking_id, preload.get("category"), CruiseLine.NCL, invoice_total,
                 )
 
             current_category = preload.get("category")
-            old_total = preload.get("invoiceTotal", 0)
+            old_total = invoice_total
             current_promos = preload.get("currentPromos", "")
             logger.info("ncl.booking_info", booking_id=booking_id, category=current_category, total=old_total)
             self.log_action(
@@ -357,6 +389,23 @@ class NclScraper(BaseScraper):
         except Exception as e:
             logger.error("ncl.error", booking_id=booking_id, error=str(e))
             self.log_action("error", booking_id=booking_id, error=str(e))
+            # CONFIRMED REAL RISK, fixed 2026-08-13: this used to catch and
+            # convert EVERY exception into an ordinary ERROR BookingResult,
+            # including a genuinely dead browser/page ("has been closed",
+            # "target closed", a renderer crash). BookingService's restart
+            # path (_is_dead_browser_error) can only ever trigger on an
+            # exception that actually propagates out of check_booking() —
+            # swallowing it here made a dead browser permanently
+            # unrecoverable for NCL: every remaining booking in the batch
+            # would fail identically, one after another, forever, with no
+            # self-healing. Re-raise dead-browser-shaped exceptions (the
+            # `finally` below still runs first, releasing the edit lock if
+            # one was held) so the caller can actually recover; every other
+            # exception still becomes a normal ERROR result exactly as
+            # before — this does not change behavior for any real portal-
+            # level failure this project has ever seen.
+            if is_dead_browser_error(e):
+                raise
             return make_error_result(booking_id, current_category, CruiseLine.NCL, str(e))
 
         finally:

@@ -12,7 +12,7 @@ import argparse
 import asyncio
 import sys
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 import uvicorn
@@ -101,17 +101,30 @@ async def _run_login_check(args):
         print("   Please log in there now (username/password/MFA as usual).")
         print(f"   Waiting up to {args.timeout_minutes} minute(s) for login to complete...\n")
 
+        # Require the same non-login URL on two consecutive polls (10s
+        # apart) before declaring success. A single check is too eager: an
+        # SSO/MFA redirect chain can land on an intermediate cruisingpower.com
+        # URL that momentarily satisfies "doesn't contain login/signin"
+        # before the user has actually finished authenticating — a single
+        # snapshot mistakes that transient hop for real success and closes
+        # the browser out from under the user mid-login (confirmed live
+        # 2026-08-04: browser closed right after Neon started logging in,
+        # and the saved session turned out invalid — every subsequent page
+        # 404'd, including the plain homepage).
         deadline = time.monotonic() + args.timeout_minutes * 60
         poll_s = 5
+        stable_url: str | None = None
         while time.monotonic() < deadline:
             await asyncio.sleep(poll_s)
             if cruise_line in (CruiseLine.NCL, CruiseLine.GOCCL):
                 logged_in = "login" not in scraper.page.url.lower() and "signin" not in scraper.page.url.lower()
             else:
                 logged_in = await scraper._check_login()
-            if logged_in:
+            current_url = scraper.page.url
+            if logged_in and current_url == stable_url:
                 print("✅ Logged in — session saved. You can run scan/watch normally now.")
                 return
+            stable_url = current_url if logged_in else None
             print("   ...still waiting for login")
 
         print("⏰ Timed out waiting for login. Run 'python main.py login' again when ready.")
@@ -146,6 +159,7 @@ def _load_watchlist(path: str) -> list[str]:
 
 async def _run_scan(args):
     from config.settings import settings
+    from core.calculator import total_optimization_savings
     from core.models import CruiseLine
     from models.database import init_db
     from services.booking_service import BookingService
@@ -183,6 +197,9 @@ async def _run_scan(args):
         detail_str = " ".join(f"{k}={v}" for k, v in detail.items())
         print(f"   · {entry['action']}  {detail_str}")
 
+    if args.headless_mode is False:
+        print("   Opening a visible browser window — leave it alone, don't close it.")
+
     job = await service.start_scan(
         booking_ids,
         cruise_line,
@@ -191,6 +208,7 @@ async def _run_scan(args):
         capture_market_data=args.capture_market_data,
         capture_everything=args.capture_everything,
         on_action=on_action if args.capture_everything else None,
+        headless=args.headless_mode,
     )
 
     # Wait for completion
@@ -202,9 +220,12 @@ async def _run_scan(args):
     print(f"\n{'='*50}")
     print(f"📊 Results: {len(job.results)} bookings checked\n")
 
-    icons = {"OPTIMIZATION": "✅", "TRAP": "⚠️", "NO_SAVING": "⏭", "ERROR": "❌",
+    icons = {"OPTIMIZATION": "✅", "UPGRADE_AVAILABLE": "🆙", "TRAP": "⚠️", "NO_SAVING": "⏭", "ERROR": "❌",
              "PAID_IN_FULL": "💳", "WLT": "⏭", "SKIPPED_TODAY": "⏩"}
-    status_order = ["OPTIMIZATION", "TRAP", "WLT", "PAID_IN_FULL", "NO_SAVING", "SKIPPED_TODAY", "ERROR"]
+    status_order = [
+        "OPTIMIZATION", "UPGRADE_AVAILABLE", "TRAP", "WLT", "PAID_IN_FULL",
+        "NO_SAVING", "SKIPPED_TODAY", "ERROR",
+    ]
     by_status: dict[str, list] = {}
     for r in job.results:
         by_status.setdefault(r.status.value, []).append(r)
@@ -216,7 +237,13 @@ async def _run_scan(args):
         icon = icons.get(status, "❓")
         print(f"{icon} {status} ({len(rows)})")
         for r in rows:
-            saving = f" — ${r.net_saving:.2f}" if r.net_saving > 0 else ""
+            # See run_persistent_watchlist_scan.py's matching fix
+            # (2026-08-12): TRAP/NO_SAVING can carry a positive net_saving
+            # on paper (that's the point of those checks — catching a
+            # "win" smaller than what's being given up), so only show the
+            # dollar figure for statuses where it reflects a real,
+            # recommended saving.
+            saving = f" — ${r.net_saving:.2f}" if r.net_saving > 0 and status not in ("TRAP", "NO_SAVING") else ""
             print(f"   {r.booking_id}{saving}")
             if r.note:
                 print(f"     {r.note}")
@@ -225,7 +252,7 @@ async def _run_scan(args):
     # CSV export
     if args.output:
         csv_content = export_results_csv(job.results)
-        with open(args.output, "w") as f:
+        with open(args.output, "w", encoding="utf-8") as f:
             f.write(csv_content)
         print(f"\n📁 CSV saved to: {args.output}")
 
@@ -236,7 +263,7 @@ async def _run_scan(args):
 
     # Summary
     opts = [r for r in job.results if r.status.value == "OPTIMIZATION"]
-    total_saving = sum(r.net_saving for r in opts)
+    total_saving = total_optimization_savings(job.results)
     print(f"\n💰 Total savings found: ${total_saving:.2f} across {len(opts)} booking(s)")
 
 
@@ -281,6 +308,8 @@ async def _run_watch(args):
     if args.max_passes:
         cadence += f", max {args.max_passes} pass(es)"
     print(f"   {cadence}")
+    if args.headless_mode is False:
+        print("   Each pass opens a visible browser window — leave it alone, don't close it.")
     print(f"   Output: {output_dir}/  (read-only checks — no rate is ever confirmed automatically)\n")
 
     service = BookingService()
@@ -289,8 +318,8 @@ async def _run_watch(args):
     try:
         while True:
             pass_num += 1
-            started = datetime.utcnow()
-            print(f"{'='*50}\n🔄 Pass {pass_num} — {started.isoformat()}Z")
+            started = datetime.now(timezone.utc)
+            print(f"{'='*50}\n🔄 Pass {pass_num} — {started.isoformat()}")
 
             def on_progress(job):
                 print(f"   [{job.progress_done}/{job.progress_total}] {job.current_booking_id or 'done'}")
@@ -303,6 +332,7 @@ async def _run_watch(args):
                 raw_dump_dir=args.capture_raw,
                 capture_market_data=args.capture_market_data,
                 capture_everything=args.capture_everything,
+                headless=args.headless_mode,
             )
 
             while job.status.value in ("PENDING", "RUNNING"):
@@ -311,7 +341,7 @@ async def _run_watch(args):
 
             csv_content = export_results_csv(job.results)
             csv_path = output_dir / f"pass{pass_num:03d}_{started.strftime('%Y-%m-%d_%H%M')}.csv"
-            with open(csv_path, "w") as f:
+            with open(csv_path, "w", encoding="utf-8") as f:
                 f.write(csv_content)
 
             excel_path = output_dir / f"pass{pass_num:03d}_{started.strftime('%Y-%m-%d_%H%M')}.xlsx"
@@ -399,6 +429,17 @@ def main():
              "step-by-step action log for every booking. Requires --capture-raw (defaults to "
              "'data' if not set). Increases scan time and disk use.",
     )
+    scan_visibility = scan_parser.add_mutually_exclusive_group()
+    scan_visibility.add_argument(
+        "--headless", action="store_true",
+        help="Run with no visible browser window (default — see config/settings.py "
+             "browser_headless).",
+    )
+    scan_visibility.add_argument(
+        "--visible", action="store_true",
+        help="Pop a real, visible browser window for this scan so you can watch it work. "
+             "Don't close the window yourself — closing it kills the scan.",
+    )
 
     # Watch command — recurring overnight scans
     watch_parser = subparsers.add_parser(
@@ -442,8 +483,31 @@ def main():
              "step-by-step action log for every booking, every pass. Requires --capture-raw "
              "(defaults to 'data' if not set). Increases scan time and disk use.",
     )
+    watch_visibility = watch_parser.add_mutually_exclusive_group()
+    watch_visibility.add_argument(
+        "--headless", action="store_true",
+        help="Run with no visible browser window (default — see config/settings.py "
+             "browser_headless).",
+    )
+    watch_visibility.add_argument(
+        "--visible", action="store_true",
+        help="Pop a real, visible browser window for every pass so you can watch it work. "
+             "Don't close the window yourself — closing it kills the current pass.",
+    )
 
     args = parser.parse_args()
+
+    # Resolve the --headless/--visible pair into one tri-state value:
+    # True = force headless, False = force a visible window, None = defer
+    # to settings.browser_headless. argparse's mutually_exclusive_group
+    # already rejects passing both, so at most one of the two is True here.
+    if args.command in ("scan", "watch"):
+        if getattr(args, "visible", False):
+            args.headless_mode = False
+        elif getattr(args, "headless", False):
+            args.headless_mode = True
+        else:
+            args.headless_mode = None
 
     if args.command in ("scan", "watch") and getattr(args, "capture_everything", False) and not args.capture_raw:
         args.capture_raw = "data"

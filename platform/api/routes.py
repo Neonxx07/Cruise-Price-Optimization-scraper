@@ -86,11 +86,10 @@ async def list_bookings(cruise_line: str | None = None, limit: int = 100):
 @router.get("/bookings/{booking_id}", response_model=list[BookingResponse])
 async def get_booking(booking_id: str):
     """Get all check results for a specific booking ID."""
-    records = await _booking_service.get_all_bookings()
-    filtered = [r for r in records if r["booking_id"] == booking_id]
-    if not filtered:
+    records = await _booking_service.get_bookings_by_id(booking_id)
+    if not records:
         raise HTTPException(status_code=404, detail="Booking not found")
-    return filtered
+    return records
 
 
 @router.get("/bookings/{booking_id}/history", response_model=list[PriceHistoryEntry])

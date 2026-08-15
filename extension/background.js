@@ -175,6 +175,7 @@ async function autoSaveCSV() {
 async function handleESPRESSOBooking(bookingId) {
   const tabId = await getDedicatedTab();
   let priceCategory = null;
+  let lastCategoryTable = null;
 
   const apiResult = await retry(async (attemptNum) => {
     if (attemptNum > 0) {
@@ -201,6 +202,15 @@ async function handleESPRESSOBooking(bookingId) {
     if (catInfo?.priceCategory) priceCategory = catInfo.priceCategory;
     if (attemptNum === 0) _bgLog(bookingId, 'PRICE_CATEGORY', catInfo?.found ? 'OK' : 'WARN', `code="${priceCategory}"`);
 
+    // Paid-in-Full early gate — reads the portal's own reconciled
+    // "Final Payment Due" balance before spending time on the categories
+    // table or any API calls. Confirmed against 590 real bookings.
+    const paymentStatus = await runInPage(tabId, fn_espresso_readPaymentStatus);
+    if (attemptNum === 0) _bgLog(bookingId, 'PAYMENT_STATUS', 'INFO', JSON.stringify(paymentStatus));
+    if (isPaidInFull(paymentStatus?.finalPaymentDue, paymentStatus?.totalPrice || 0)) {
+      return { _paidInFull: true, oldTotal: paymentStatus?.totalPrice || 0 };
+    }
+
     const cr = await runInPage(tabId, fn_espresso_clickCategories);
     if (!cr?.ok) throw new Error('Categories link not found');
     await waitForEl(tabId, '#catAvailCategoryList, [id*="catAvail"]', 12000);
@@ -211,6 +221,10 @@ async function handleESPRESSOBooking(bookingId) {
       const wlt = await runInPage(tabId, fn_espresso_checkWLT, priceCategory);
       if (wlt?.isWLT) return { _wlt: true };
     }
+
+    // Capture the category table now, while it's loaded, for free-upgrade
+    // detection below — cheap since the table is already on the page.
+    lastCategoryTable = await runInPage(tabId, fn_espresso_captureCategoryTable, priceCategory);
 
     // Read page data — polls until selectionJSON changes (max 2000ms)
     const pageData = await runInPage(tabId, fn_espresso_readPageData, priceCategory);
@@ -262,7 +276,40 @@ async function handleESPRESSOBooking(bookingId) {
     return makeNoPriceChangeResult(bookingId, priceCategory, 'ESPRESSO', apiResult.price);
   }
 
-  const result = calculateESPRESSO(apiResult.data, bookingId, priceCategory);
+  let result = calculateESPRESSO(apiResult.data, bookingId, priceCategory);
+
+  // RE-ENABLED 2026-08-01 with a real fix — see core/calculator.py's
+  // "ESPRESSO Free-Upgrade Detection" module docstring for the full
+  // incident history (the previous version compared a per-person table
+  // price directly to a whole-booking total and produced 6 false
+  // positives). findUpgradeCandidates() is a free, unit-safe pre-filter
+  // only — it decides nothing. Every candidate it returns still gets a
+  // REAL allocate()+repriceModalCheck() round trip below, and only a
+  // confirmed total that's actually <= oldTotal is ever surfaced.
+  // Verified live against all 6 original false positives: every one now
+  // correctly comes back as costing more, not less.
+  if (result.status === 'NO_SAVING' && lastCategoryTable?.rows?.length) {
+    const candidates = findUpgradeCandidates(priceCategory, lastCategoryTable.rows);
+    let best = null;
+    for (const candidate of candidates) {
+      const candData = await runInPage(tabId, fn_espresso_readPageData, candidate.category);
+      if (!candData?.executionToken) continue;
+      await runInPage(tabId, fn_espresso_executeAPICalls,
+        candData.executionToken, candData.selectionJSON, candData.radioValue);
+      await new Promise(res => setTimeout(res, 1000)); // let Angular render the new allocation price
+      const candTop = await runInPage(tabId, fn_espresso_readTopPrices);
+      const confirmedTotal = candTop?.allocationPrice;
+      _bgLog(bookingId, 'UPGRADE_CANDIDATE', 'INFO', `${candidate.category}: confirmed=$${confirmedTotal}`);
+      if (confirmedTotal == null || confirmedTotal > result.oldTotal) continue;
+      if (!best || confirmedTotal < best.price) {
+        best = { category: candidate.category, roomType: candidate.roomType, price: confirmedTotal };
+      }
+    }
+    if (best) {
+      result = makeUpgradeAvailableResult(bookingId, priceCategory, 'ESPRESSO', result.oldTotal, best);
+    }
+  }
+
   _bgLog(bookingId, 'RESULT', result.status, `net=$${result.netSaving} | ${result.note}`);
   if (result.status === 'NO_SAVING') await cacheNoSaving('ESPRESSO', bookingId);
   return result;

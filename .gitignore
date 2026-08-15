@@ -15,17 +15,31 @@ env/
 .env
 .env.local
 
-# Database
+# Database -- generated/runtime state (rebuilt by running scans), not source
+# data. This is a blanket rule: it also covers SQLite's -shm/-wal sidecar
+# files, which mirror live database content just as much as the .db file
+# itself.
 *.db
+*.db-shm
+*.db-wal
+*.db-journal
 *.sqlite3
+
+# Scan output / captured data -- all of this is real, live scrape output
+# (real booking IDs, real prices, real portal page captures), regenerated
+# by running a scan. Never commit any of it, including subfolders that look
+# like "work product" -- if a specific capture is ever needed as a fixture,
+# copy just that file into tests/fixtures/ deliberately, with any real
+# booking IDs/names replaced by fake ones first.
 *.jsonl
 /platform/data/
+/platform/watch_runs/
+/platform/watchlist.txt
 
-# Scan output / reports
+# Generated reports (CSV/XLSX exports) -- regenerate via a scan, not source data
 *.csv
 *.xlsx
 /platform/reports/
-/platform/watchlist.txt
 
 # Logs
 logs/
@@ -44,10 +58,10 @@ Thumbs.db
 *.swp
 *.swo
 
-# Playwright
+# Playwright traces
 playwright-data/
 
-# Browser profile data
+# Browser profile data -- real session cookies, never commit
 platform/browser-profile/
 
 # Coverage

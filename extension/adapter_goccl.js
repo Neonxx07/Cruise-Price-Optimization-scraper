@@ -12,6 +12,13 @@
 
 const GOCCL_SEARCH_URL = 'https://www.goccl.com/BookingEngine/BookingSearch/SearchForReservations.aspx';
 
+// Mirrors config/settings.py's settings.goccl_default_guests_count. Neither
+// side reads the booking's actual guest count from the page — both use
+// this fixed default to convert offer-code comparison's "Average Per
+// Person" price into a gross total comparable with currentPriceGross. Keep
+// this in sync with the Python default if that ever changes.
+const GOCCL_DEFAULT_GUESTS_COUNT = 2;
+
 // ── Search for a booking ───────────────────────────────────────
 function fn_goccl_search(bookingId) {
   const input = document.getElementById('ctl00_DefaultContent_txtBookingNumber');
@@ -30,27 +37,30 @@ function fn_goccl_search(bookingId) {
 }
 
 // ── Read the current booking's price, offer code, category, stateroom ──
+// Reads window.initialData — a JSON blob the booking page embeds on load
+// with the full invoice/rate/category detail (same pattern as NCL's
+// window.__preloaded_data). The CSS selectors this replaced (recorded via
+// DevTools) didn't match anything on a real live booking: confirmed against
+// booking DEMO02 that "[data-component='category-rate-header-rate-name']"
+// and "booking-details-bar__category*" don't exist anywhere on the page —
+// the rate/offer code in particular is never rendered as visible text at
+// all, only present in this JSON (initialData.rate.code).
 function fn_goccl_readCurrentPriceAndSelection() {
   try {
-    const parsePrice = (t) => { const c = (t || '').replace(/[^\d.]/g, ''); return c ? parseFloat(c) : 0; };
+    const data = window.initialData;
+    if (!data) return { ok: false, error: 'window.initialData not found on page' };
 
-    const priceEl = document.querySelector('span.price__number');
-    const offerEl = document.querySelector("[data-component='category-rate-header-rate-name']");
-    const categoryEl = document.querySelector(
-      'article.booking-details-bar__category--category span.booking-details-bar__category-value'
-    );
-    const stateroomEl = document.querySelector('span.booking-details-bar__category-metaname');
-
-    if (!priceEl || !offerEl || !categoryEl || !stateroomEl) {
-      return { ok: false, error: 'Booking summary bar elements not found' };
-    }
+    const gross = (data.invoiceSummary && data.invoiceSummary.grossAmount && data.invoiceSummary.grossAmount.amount);
+    const rate = data.rate || {};
+    const category = data.category || {};
+    const stateroomType = category.stateroomType || {};
 
     return {
       ok: true,
-      currentPriceGross: parsePrice(priceEl.textContent),
-      currentOfferCode: (offerEl.textContent || '').trim(),
-      currentCategory: (categoryEl.textContent || '').trim(),
-      currentStateroomType: (stateroomEl.textContent || '').trim(),
+      currentPriceGross: gross != null ? Number(gross) : 0,
+      currentOfferCode: rate.code || '',
+      currentCategory: category.code || '',
+      currentStateroomType: stateroomType.name || '',
     };
   } catch (e) {
     return { ok: false, error: e.message };
@@ -76,34 +86,42 @@ function fn_goccl_openChangeOfferRate() {
 }
 
 // ── Read the offer-code comparison screen ───────────────────────
-// Confirmed container: section.rate__container, with stateroom-type prices
-// as numbered buttons (1=Upper/Lower, 2=Interior, 3=Ocean View, 4=Balcony,
-// 5=Suite — order confirmed from a recorded click on button index 4
-// landing on Balcony).
+// Confirmed against a real booking (DEMO02): each offer is a
+// div.rate-code-tile carrying data-rate-code/data-rate-name directly as
+// attributes, and each stateroom-type price is a
+// button.rate-code-tile__price-button carrying data-rate-meta-name/
+// data-rate-meta-price/data-rate-meta-soldout. Reading these attributes
+// directly is exact and order-independent.
+//
+// This replaced an earlier button-index-position guess (a fixed
+// UPPER_LOWER/INTERIOR/OCEAN_VIEW/BALCONY/SUITE list assumed to line up
+// with button order) that silently misaligned columns whenever a cell
+// was sold out/N-A and shifted the index — confirmed against real data:
+// it reported a "BALCONY" candidate that was actually an OCEAN VIEW
+// price, a stateroom downgrade masquerading as a same-category fare-code
+// swap.
 function fn_goccl_readOfferCodeComparison() {
   try {
-    const stateroomOrder = ['UPPER_LOWER', 'INTERIOR', 'OCEAN_VIEW', 'BALCONY', 'SUITE'];
     const parsePrice = (t) => { const c = (t || '').replace(/[^\d.]/g, ''); return c ? parseFloat(c) : 0; };
 
-    const rows = Array.from(document.querySelectorAll('section.rate__container > div > div'));
+    const tiles = Array.from(document.querySelectorAll('div.rate-code-tile'));
     const results = [];
-    for (const row of rows) {
-      const nameEl = row.querySelector('h6, .offer-name');
-      const offerName = nameEl ? nameEl.textContent.trim() : '';
-      const codeEl = row.querySelector(".offer-code, [data-component='offer-code']");
-      const offerCode = codeEl ? codeEl.textContent.trim() : '';
+    for (const tile of tiles) {
+      const offerCode = tile.getAttribute('data-rate-code') || '';
+      const offerName = tile.getAttribute('data-rate-name') || '';
 
-      const buttons = Array.from(row.querySelectorAll('button'));
-      buttons.forEach((button, idx) => {
-        if (idx >= stateroomOrder.length) return;
-        const priceEl = button.querySelector('span.price__number');
-        if (!priceEl) return;
+      const priceButtons = Array.from(tile.querySelectorAll('button.rate-code-tile__price-button'));
+      for (const button of priceButtons) {
+        if (button.getAttribute('data-rate-meta-soldout') === 'true') continue;
+        const stateroomName = button.getAttribute('data-rate-meta-name') || '';
+        const priceAttr = button.getAttribute('data-rate-meta-price');
+        if (!priceAttr) continue;
         results.push({
           offerName, offerCode,
-          stateroomType: stateroomOrder[idx],
-          pricePerPerson: parsePrice(priceEl.textContent),
+          stateroomType: stateroomName,
+          pricePerPerson: parsePrice(priceAttr),
         });
-      });
+      }
     }
     return { ok: true, offerCodes: results };
   } catch (e) {
@@ -181,7 +199,7 @@ async function handleGOCCLBooking(bookingId, tabId) {
 
     const result = calculateGOCCL(
       bookingId, priceCategory, current.currentStateroomType, current.currentOfferCode,
-      current.currentPriceGross, comparison.offerCodes, 2,
+      current.currentPriceGross, comparison.offerCodes, GOCCL_DEFAULT_GUESTS_COUNT,
     );
     log('RESULT', result.status, `net=$${result.netSaving} | ${result.note}`);
     if (result.status === 'NO_SAVING') await cacheNoSaving('GOCCL', bookingId);

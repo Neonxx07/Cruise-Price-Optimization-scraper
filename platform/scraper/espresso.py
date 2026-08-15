@@ -28,9 +28,12 @@ import time
 from config.settings import settings
 from core.calculator import (
     calculate_espresso,
+    find_upgrade_candidates,
+    is_paid_in_full,
     make_no_price_change_result,
     make_paid_in_full_result,
     make_skip_reprice_result,
+    make_upgrade_available_result,
     make_wlt_result,
 )
 from core.models import BookingResult, BookingStatus, CruiseLine
@@ -49,6 +52,24 @@ _TEMPLATE_PLACEHOLDER_RE = re.compile(r"^\{\{.*\}\}$")
 
 def _is_template_placeholder(value: str) -> bool:
     return bool(_TEMPLATE_PLACEHOLDER_RE.match(value.strip()))
+
+
+_DUAL_RATE_COLUMN_NOTE = (
+    " [NOTE: this booking has a second rate-program column (c3) on the "
+    "categories table that was captured but NOT evaluated — verify by hand "
+    "whether it shows a lower price than the one used here]"
+)
+
+
+def _append_dual_rate_note(note: str, market_data: dict | None) -> str:
+    """Extracted as a pure function (2026-08-13, Phase 0 correctness audit)
+    so the dual-rate-column visibility fix is directly unit-testable.
+    See check_booking's own comment for why this only appends a note
+    rather than comparing c2/c3 prices — no live evidence exists for what
+    c3 actually means, so guessing at it is deliberately avoided."""
+    if market_data and market_data.get("dualRateColumns"):
+        return note + _DUAL_RATE_COLUMN_NOTE
+    return note
 
 
 class EspressoScraper(BaseScraper):
@@ -145,7 +166,12 @@ class EspressoScraper(BaseScraper):
         return bool(result)
 
     async def _check_paid_status(self) -> dict | None:
-        """Check if booking is fully paid."""
+        """Fallback paid-status check, kept for defense in depth inside the
+        short-response branch. Its own selectors were guessed and never
+        verified — checked against 590 real captured bookings, the "paid in
+        full" text fallback below matched zero of them. _read_payment_status
+        (below), run as an early gate right after search, is the reliable
+        path now; this only matters if that early gate is ever skipped."""
         result = await self.page.evaluate("""
             (() => {
                 const totalEl = document.querySelector('[class*="totalPrice"] .amount, .total-price .amount, #totalPrice');
@@ -162,6 +188,49 @@ class EspressoScraper(BaseScraper):
         """)
         return result
 
+    _PAYMENT_FIELD_PATTERNS = {
+        "total_price": re.compile(r"Total Price \(USD\):\s*(-?[\d,]+\.?\d*)", re.IGNORECASE),
+        "deposit": re.compile(r"Deposit \(USD\):\s*(-?[\d,]+\.?\d*)", re.IGNORECASE),
+        "payments_received": re.compile(r"Payments Received \(USD\):\s*(-?[\d,]+\.?\d*)", re.IGNORECASE),
+        "final_payment_due": re.compile(r"Final Payment Due \(USD\):\s*(-?[\d,]+\.?\d*)", re.IGNORECASE),
+    }
+
+    # ADDED 2026-08-13 (Phase 0 correctness audit): the amount patterns
+    # above are deliberately UNCHANGED (still require the literal "(USD)"
+    # label) — this only adds detection of whatever currency code the page
+    # actually shows, without touching how any amount is parsed. Confirmed
+    # real risk this closes: if ESPRESSO/Celebrity ever renders "(CAD)" (or
+    # any non-USD code) instead, the amount patterns above already
+    # correctly fail to match (returning None, not a wrong USD-shaped
+    # number) — but nothing previously recorded WHY, or distinguished that
+    # from "this field just wasn't on the page." This makes that distinction
+    # visible via the `currency` key below, generalized to any 3-letter
+    # code rather than assuming USD.
+    _CURRENCY_LABEL_RE = re.compile(
+        r"(?:Total Price|Deposit|Payments Received|Final Payment Due)\s*\(([A-Z]{3})\)",
+        re.IGNORECASE,
+    )
+
+    async def _read_payment_status(self) -> dict:
+        """Reads Total Price / Deposit / Payments Received / Final Payment
+        Due directly from the Reservation Summary page's plain body text.
+        Confirmed against 590 real bookings: whenever Total Price is
+        present, Final Payment Due is too — and it's already reconciled
+        for taxes/credits/adjustments, so it's used directly by
+        is_paid_in_full() rather than re-derived from Total minus Received.
+
+        Also returns "currency": the 3-letter code actually shown next to
+        these labels (e.g. "USD"), or None if no such label was found at
+        all. Never assume "USD" when this is None — see BookingResult.currency."""
+        body_text = await self.page.inner_text("body")
+        values: dict[str, float | None] = {}
+        for key, pattern in self._PAYMENT_FIELD_PATTERNS.items():
+            m = pattern.search(body_text)
+            values[key] = float(m.group(1).replace(",", "")) if m else None
+        currency_match = self._CURRENCY_LABEL_RE.search(body_text)
+        values["currency"] = currency_match.group(1).upper() if currency_match else None
+        return values
+
     async def _click_categories(self) -> None:
         """Click the Categories link to load the category table."""
         await self.page.evaluate("""
@@ -176,7 +245,25 @@ class EspressoScraper(BaseScraper):
         await self.wait_for("#catAvailCategoryList, [id*='catAvail']", timeout=12000)
 
     async def _capture_category_table(self, current_category: str | None = None) -> dict:
-        """Capture the loaded ESPRESSO category table state without mutating the page."""
+        """Capture the loaded ESPRESSO category table state without mutating the page.
+
+        Some bookings (confirmed both on group bookings and at least one
+        individual booking, 2026-08-09) render TWO side-by-side rate-program
+        columns per row via a `columnSelection` radio pair — e.g. "Group
+        Allocation - Best Rate" vs "Group Prevailing - Best Rate", or
+        "Individual - Best Rate" vs "Individual - Best Value". Only the
+        left (`c2`, always pre-checked) column has ever been read by this
+        scraper or fed into any decision logic — the right (`c3`) column's
+        price has never been captured at all. Neon's observation, from
+        working the real portal: the right-hand column sometimes shows a
+        genuinely lower price than the left. Both columns' cells already
+        exist in the same page load (no extra click/request needed), so
+        this now records both, purely as additional captured data — it
+        does NOT feed either column into any pricing decision yet. That is
+        deliberately deferred until there's a real evidence base of when/how
+        often the two columns actually diverge (same lesson as the
+        free-upgrade-detection incident: verify before deciding, never
+        guess which column is "right")."""
         result = await self.page.evaluate(f"""
             (() => {{
                 const tbody = document.querySelector('#catAvailCategoryList tbody')
@@ -188,6 +275,8 @@ class EspressoScraper(BaseScraper):
                         const status = row.querySelector('td.c2.rooms .svCabin .status, .svCabin .status')?.textContent?.trim() || '';
                         const radio = row.querySelector('input[name="rbCategorySelection"][data-columnindex="0"]')
                                    || row.querySelector('input[type="radio"]');
+                        const c2Cells = Array.from(row.querySelectorAll('td.c2:not(.clearCell)')).map(td => td.textContent.trim());
+                        const c3Cells = Array.from(row.querySelectorAll('td.c3:not(.clearCell)')).map(td => td.textContent.trim());
                         rows.push({{
                             category,
                             status,
@@ -195,17 +284,26 @@ class EspressoScraper(BaseScraper):
                             radioChecked: Boolean(radio?.checked),
                             promo: row.querySelector('.promo, .currentPromo')?.textContent?.trim() || '',
                             rowText: row.innerText.trim(),
+                            c2Cells,
+                            c3Cells,
                         }});
                     }}
                 }}
                 const token = location.href.match(/execution=(e\\d+s\\d+)/)?.[1] || null;
                 const selectionJSON = document.querySelector('input.selectionJSON, input[name*="selectionJSON"]')?.value || '';
+                const c2Header = document.querySelector('th.columnSelection.c2 label');
+                const c3Header = document.querySelector('th.columnSelection.c3 label');
+                const c2Radio = document.querySelector('input[name="columnSelection"].c2');
                 return {{
                     ok: true,
                     currentCategory: {json.dumps(current_category)},
                     executionToken: token,
                     selectionJSON,
                     rows,
+                    dualRateColumns: Boolean(c2Header || c3Header),
+                    c2Label: c2Header?.textContent?.trim() || null,
+                    c3Label: c3Header?.textContent?.trim() || null,
+                    activeColumn: (c2Radio ? (c2Radio.checked ? 'c2' : 'c3') : null),
                 }};
             }})()
         """)
@@ -279,6 +377,40 @@ class EspressoScraper(BaseScraper):
         """)
         return result
 
+    async def _confirm_candidate_total(self, category: str) -> float | None:
+        """Get ESPRESSO's own REAL confirmed total for `category` — never
+        an estimate. Runs the exact same allocate()+repriceModalCheck()
+        sequence already trusted for OPTIMIZATION/TRAP (same safety
+        boundary: never touches the actual "Continue with New Rate" commit
+        button), then reads the confirmed total back via _read_top_prices()
+        rather than parsing repriceModalCheck's JSON body.
+
+        Confirmed live 2026-08-01 (booking 1000004, candidate J3):
+        repriceModalCheck can return {"key": "skipRepriceModal"} — meaning
+        this booking can't COMMIT a reprice into this category — while
+        sb.summary.price.allocationPrice still updates to the real
+        confirmed total regardless. Those are different questions ("can I
+        confirm this" vs "what would it cost"), and only the second one is
+        needed to know whether a category is a genuine upgrade. Verified
+        against all 6 bookings from the original false-positive incident:
+        every one now correctly shows a real cost INCREASE ($401-$5,459),
+        matching manual verification that none of them were real upgrades.
+
+        Returns None if no price was ever rendered (never treat missing
+        data as a signal of savings).
+        """
+        page_data = await self._read_page_data(category)
+        if not page_data.get("executionToken"):
+            return None
+        await self._execute_api_calls(
+            page_data["executionToken"], page_data["selectionJSON"], page_data["radioValue"],
+        )
+        # Let Angular finish recomputing/rendering the allocation price
+        # after the real allocate() response comes back.
+        await asyncio.sleep(1.0)
+        top_prices = await self._read_top_prices()
+        return top_prices.get("allocationPrice")
+
     async def _execute_api_calls(self, token: str, selection_json: str, radio: str) -> dict:
         """Execute the allocate + reprice API calls inside the page context."""
         result = await self.page.evaluate(f"""
@@ -317,10 +449,17 @@ class EspressoScraper(BaseScraper):
         load categories → WLT check → execute API → calculate result.
         """
         price_category: str | None = None
+        # ADDED 2026-08-13 (Phase 0 correctness audit): the real currency
+        # code detected from the Reservation Summary page text (see
+        # _read_payment_status/_CURRENCY_LABEL_RE), or None if no
+        # recognizable label was found. Applied to whatever BookingResult
+        # is ultimately returned, further down, regardless of which branch
+        # produced it — never assumed "USD" when this stays None.
+        detected_currency: str | None = None
         self.last_market_data = None
 
         async def _attempt():
-            nonlocal price_category
+            nonlocal price_category, detected_currency
 
             # Go through the portal home page first, the same path a human
             # takes right after login — deep-linking straight to
@@ -352,13 +491,34 @@ class EspressoScraper(BaseScraper):
             logger.info("espresso.category", booking_id=booking_id, category=price_category)
             self.log_action("read_category", booking_id=booking_id, category=price_category)
 
+            # Paid-in-full early gate — runs before Categories is even
+            # clicked, using the Reservation Summary page's own "Final
+            # Payment Due (USD)" figure (see is_paid_in_full/
+            # _read_payment_status). Catches this regardless of what the
+            # reprice-modal API would have returned — a real booking
+            # (3000040) was previously slipping through as a false
+            # "$77 OPTIMIZATION" because its API response was a normal
+            # length, so the old reactive-only paid-status check never ran.
+            payment_status = await self._read_payment_status()
+            detected_currency = payment_status.get("currency")
+            self.log_action("payment_status", booking_id=booking_id, **payment_status)
+            if is_paid_in_full(
+                payment_status.get("final_payment_due"),
+                payment_status.get("total_price") or 0.0,
+            ):
+                return {"_paidInFull": True, "oldTotal": payment_status.get("total_price") or 0.0}
+
             # Click categories and load the table
             self.log_action("click_categories", booking_id=booking_id)
             await self._click_categories()
             await self.dump_page_snapshot(booking_id, "categories_table")
 
+            # Always captured now (not just when capture_market_data is on)
+            # — find_free_upgrade() needs these rows for every booking, not
+            # just ones being logged for analysis. capture_market_data still
+            # controls whether this gets persisted to the market_data table.
+            self.last_market_data = await self._capture_category_table(price_category)
             if capture_market_data:
-                self.last_market_data = await self._capture_category_table(price_category)
                 logger.info(
                     "espresso.market_data_captured",
                     booking_id=booking_id,
@@ -461,6 +621,56 @@ class EspressoScraper(BaseScraper):
             )
 
         result = calculate_espresso(api_result["data"], booking_id, price_category)
+
+        # RE-ENABLED 2026-08-01 with a real fix — see core/calculator.py's
+        # "ESPRESSO Free-Upgrade Detection" module docstring for the full
+        # incident history (design #3 was confirmed wrong against real
+        # data: 6 false positives from comparing a per-person table price
+        # to a whole-booking total). find_upgrade_candidates() is a free,
+        # unit-safe pre-filter only — it decides nothing. Every candidate
+        # it returns still gets a real allocate()+repriceModalCheck() round
+        # trip via _confirm_candidate_total(), and only a REAL confirmed
+        # total that's actually <= old_total is ever surfaced. Verified
+        # live against all 6 original false positives: every one now
+        # correctly comes back as costing more, not less.
+        if result.status == BookingStatus.NO_SAVING and self.last_market_data:
+            candidates = find_upgrade_candidates(price_category, self.last_market_data.get("rows", []))
+            best: dict | None = None
+            for candidate in candidates:
+                confirmed_total = await self._confirm_candidate_total(candidate["category"])
+                logger.info(
+                    "espresso.upgrade_candidate_confirmed",
+                    booking_id=booking_id, category=candidate["category"], confirmed_total=confirmed_total,
+                )
+                if confirmed_total is None or confirmed_total > result.old_total:
+                    continue
+                if best is None or confirmed_total < best["price"]:
+                    best = {"category": candidate["category"], "room_type": candidate["room_type"], "price": confirmed_total}
+            if best is not None:
+                result = make_upgrade_available_result(
+                    booking_id, price_category, CruiseLine.ESPRESSO, result.old_total, best,
+                )
+
+        # Applied uniformly to every branch above (sentinel WLT/paid-in-full/
+        # skip-reprice/no-price-change results, the main calculated result,
+        # and the upgrade-available override) — "UNKNOWN" unless the page
+        # text actually showed a recognizable currency label this run.
+        result.currency = detected_currency or "UNKNOWN"
+
+        # ADDED 2026-08-13 (Phase 0 correctness audit): _capture_category_table
+        # already captures the c3 (alternate rate-program) column's raw cell
+        # text for bookings that render one, but — per that function's own
+        # docstring — never feeds it into any pricing decision, since no live
+        # capture exists confirming what c3's cell format actually means or
+        # how it compares to c2's. Deliberately NOT adding speculative price
+        # comparison/selection logic here — there's no evidence to build it
+        # on, and guessing wrong here is exactly the failure class the
+        # free-upgrade-detection incident history in core/calculator.py
+        # warns against. Instead: make the KNOWN ambiguity visible rather
+        # than silently absent — a human reviewing this result now knows a
+        # second, unevaluated rate-program column exists on this booking.
+        result.note = _append_dual_rate_note(result.note, self.last_market_data)
+
         logger.info("espresso.result", booking_id=booking_id, status=result.status.value, net=result.net_saving)
         self.log_action("result", booking_id=booking_id, status=result.status.value, net_saving=result.net_saving)
         return result

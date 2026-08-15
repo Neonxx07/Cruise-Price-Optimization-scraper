@@ -1,0 +1,6 @@
+# Development/test-only dependencies -- not needed to RUN the app, only
+# to run the test suite (tests/). Kept separate from requirements.txt so
+# a production install stays minimal.
+-r requirements.txt
+pytest>=8.0.0
+pytest-asyncio>=0.23.0
