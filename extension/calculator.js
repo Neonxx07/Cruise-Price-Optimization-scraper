@@ -293,7 +293,7 @@ function calculateGOCCL(bookingId, priceCategory, currentStateroomType, currentO
 // remaining amount.
 // WIDENED 2026-08-04 from 1.5% to 5% — see the long comment above
 // PAID_IN_FULL_TOLERANCE_PCT in core/calculator.py for the full
-// rationale (booking 1000003, no natural cutoff in the real data,
+// rationale (booking 3000001, no natural cutoff in the real data,
 // this is a tunable business-risk choice, not a discovered fact).
 const PAID_IN_FULL_TOLERANCE_FLAT = 25.0;
 const PAID_IN_FULL_TOLERANCE_PCT = 0.05;

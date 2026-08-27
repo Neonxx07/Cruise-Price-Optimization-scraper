@@ -6,7 +6,7 @@ critical point Neon corrected early on — price and discount are
 INDEPENDENT levers, not one "is the total lower" comparison. A real
 opportunity can exist purely in the discount dimension even when the price
 dimension is a dead end (see the confirmed real example on booking
-2000001 in msc_project_knowledge.md: today's plain price was actually
+3000005 in msc_project_knowledge.md: today's plain price was actually
 HIGHER, but a better discount tier — 15% replacing an existing 10%, with
 the 5% Voyagers stacking on top of either — was a genuine, separate win).
 
@@ -38,7 +38,7 @@ This module never guesses past what the data actually supports — each
 check independently reports INSUFFICIENT_DATA rather than a false
 NO_OPPORTUNITY when a required input wasn't captured.
 
-CONFIRMED LIVE 2026-08-11, booking 2000015: Voyagers Exclusive belongs
+CONFIRMED LIVE 2026-08-11, booking 3000024: Voyagers Exclusive belongs
 on the same "never discloses itself" list as senior discount (below) —
 a Voyagers Club membership was added to this real booking (visible via
 its Passenger Details gaining an "MSC Voyagers Club: ... - Gold" line
@@ -51,19 +51,33 @@ Exclusive is silent the same way senior discount is; detect it the same
 way — SRN math against the standard-NCF-by-length table — never by
 searching for disclosure text.
 
-KNOWN OPEN LIMITATION, found testing against booking 2000012: senior
-discount never gets an explicit "Discount Description"/"MSC Club
-Discount" disclosure line the way named promos and the flat Voyagers 5%
-do (confirmed in msc_commands.py's _extract_discounts docstring). That
-means `current_discounts` can come back empty on a booking that actually
-HAS senior discount applied, which would make DISCOUNT_ADD wrongly
-report "add senior discount" as an opportunity when it's already there.
-Until this is fixed (likely by deriving senior discount from itemized
-SRN math against the known standard-NCF-by-length table, then folding it
-into current_discounts before calling this function), a caller passing
-data for an all_seniors=True booking should treat a DISCOUNT_ADD
-OPPORTUNITY result skeptically and verify the SRN line by hand before
-recommending it.
+CLOSED 2026-08-24 (was "KNOWN OPEN LIMITATION" — found testing against
+booking 3000021, then confirmed live on bookings 3000031/3000018/
+3000017): senior discount never gets an explicit "Discount Description"/
+"MSC Club Discount" disclosure line the way named promos and the flat
+Voyagers 5% do (confirmed in msc_commands.py's _extract_discounts
+docstring). That means `current_discounts` can come back empty on a
+booking that actually HAS senior discount applied. The SRN-implied-
+discount math (_extract_discounts_with_implied) is the mitigation for
+this, but it only has reference values for 3/4/7-night cruises
+(STANDARD_NCF_BY_NIGHTS) — outside those lengths, `_check_discount_add`
+now downgrades a SENIOR DISCOUNT recommendation to INSUFFICIENT_DATA
+instead of a confident OPPORTUNITY (see senior_discount_verifiable /
+msc_commands.py's _srn_reference_available), rather than relying on every
+caller to remember to "treat it skeptically."
+
+CONFIRMED HARD RULE, added 2026-08-18 after a real false positive
+(booking 3000030 — a single 83-year-old traveling alone was recommended
+for SENIOR DISCOUNT): senior discount requires AT LEAST TWO senior (65+)
+passengers in the cabin, not just one. MSC's own discount dropdown lists
+SENIOR DISCOUNT based on ANY passenger being 65+, regardless of party
+composition — this is now corrected via senior_count/
+_filter_out_ineligible_senior_discount below, replacing the old
+all_seniors ("every passenger is 65+") flag, which was never the real
+eligibility test in either direction (it wrongly required 100% of
+passengers to be seniors, excluding a valid 2-seniors-plus-grandchildren
+cabin, AND wrongly let a single senior pass since "all 1 passengers are
+seniors" is trivially true).
 """
 
 from __future__ import annotations
@@ -94,6 +108,27 @@ def _filter_out_disallowed_discounts(options: list[str] | None) -> list[str] | N
     if options is None:
         return None
     return [o for o in options if "MIL-CIV" not in o.upper() and "MILITARY" not in o.upper()]
+
+
+def _filter_out_ineligible_senior_discount(options: list[str] | None, senior_count: int) -> list[str] | None:
+    """CONFIRMED HARD RULE, stated directly by Neon 2026-08-18 after a
+    real false positive (booking 3000030 — a single 83-year-old traveling
+    alone got recommended for SENIOR DISCOUNT): senior discount requires
+    AT LEAST TWO passengers 65+ in the cabin. A lone senior does not
+    qualify, even though "every passenger on this booking is 65+" is
+    trivially true for them — that "all passengers seniors" framing
+    (msc_commands.py's old all_seniors flag) was never the real
+    eligibility test. Non-senior passengers alongside 2+ seniors (e.g.
+    grandchildren) do NOT disqualify it — only the raw senior COUNT
+    matters. MSC's own discount dropdown lists SENIOR DISCOUNT regardless
+    of party composition, so this can't be read off the dropdown alone.
+    Same pattern as _filter_out_disallowed_discounts: preserves the None
+    (not captured) vs [] (captured, filtered to empty) distinction."""
+    if options is None:
+        return None
+    if senior_count >= 2:
+        return options
+    return [o for o in options if "SENIOR" not in o.upper()]
 
 
 def _parse_rate_pct(label: str) -> float | None:
@@ -152,6 +187,7 @@ def _check_price_match(
     today_price_tab_confirmed: bool = False,
     is_group_rate: bool = False,
     is_paid_in_full: bool = False,
+    final_payment_date_passed: bool = False,
 ) -> MscCheck:
     # HARD RULE, confirmed directly by Neon 2026-08-12: a paid-in-full
     # booking can still have a discount ADDED (see DISCOUNT_ADD/
@@ -169,6 +205,20 @@ def _check_price_match(
             type=MscOpportunityType.PRICE_MATCH,
             status=MscCheckStatus.NO_OPPORTUNITY,
             note="this booking is paid in full — MSC does not allow price-matching a fully-paid booking (discounts can still be added/upgraded, see the other checks)",
+        )
+    # HARD RULE, confirmed directly by Neon 2026-08-24 (bookings
+    # 3000031/3000018/3000017), matching widely-reported MSC/general
+    # cruise-industry practice: a fare drop only gets informally honored
+    # before final payment is due — once that date passes the fare is
+    # locked in. Distinct from is_paid_in_full above (a booking can be
+    # past its final payment date without having actually paid yet) but
+    # the same shape of hard gate, checked before any price math, discount
+    # checks unaffected.
+    if final_payment_date_passed:
+        return MscCheck(
+            type=MscOpportunityType.PRICE_MATCH,
+            status=MscCheckStatus.NO_OPPORTUNITY,
+            note="this booking's final payment date has already passed — MSC only price-matches/reprices before final payment is due, the fare is locked in after that (discounts can still be added/upgraded, see the other checks)",
         )
     if today_base_price is None:
         return MscCheck(
@@ -222,6 +272,7 @@ def _check_price_match(
                     f"{_due_amount_context_note(diff, due_amount)}"
                 ),
                 estimated_value=diff,
+                value_unit="USD",
             )
         return MscCheck(
             type=MscOpportunityType.PRICE_MATCH,
@@ -254,6 +305,7 @@ def _check_price_match(
                     f"{_due_amount_context_note(diff, due_amount)}"
                 ),
                 estimated_value=diff,
+                value_unit="USD",
             )
         # today_base_price is approximately equal to or above current_total.
         # The equal case is a genuine boundary, not a confirmed $0 "win":
@@ -281,11 +333,42 @@ def _check_price_match(
     )
 
 
+def _voyagers_club_addable_label(has_voyagers: bool) -> str:
+    """CONFIRMED REAL GAP, closed 2026-08-24 (booking 3000019): recommending
+    "Voyagers Club 5%, call MSC to add" reads as a clean, ready-to-call
+    opportunity, but the flat Club discount requires the customer to
+    actually HAVE an MSC Voyagers Club membership — MSC won't apply it to
+    someone who doesn't. When they don't, this is not a false positive
+    (Neon's own framing: "not 100% false positive... positive in a way I
+    cannot describe") — it's a REAL opportunity that requires one extra
+    step first. Researched 2026-08-24: joining MSC Voyagers Club directly
+    is free and immediate (just needs the booking reference, open to
+    anyone with a confirmed booking) — the Welcome tier alone may already
+    be enough for the flat 5% (requires_club, no tier minimum seen in the
+    discount catalog), so this is usually a much smaller ask than a formal
+    Status Match (matching an elite tier from ~55+ other eligible loyalty
+    programs, free but takes up to 72 hours) — worth confirming which path
+    actually unlocks MSCCLUB5 against a real booking before assuming
+    either one is required. Surfaced as an explicit caveat so whoever
+    reads this can judge whether the extra step is worth it themselves,
+    rather than a bare "call MSC" that leads to a confusing dead end."""
+    if has_voyagers:
+        return "Voyagers Club 5%"
+    return (
+        "Voyagers Club 5% (customer isn't currently an MSC Voyagers Club member — "
+        "joining is free and just needs the booking reference, or a Status Match from "
+        "an eligible loyalty program for a higher starting tier; confirm which path "
+        "actually unlocks this discount before deciding it's worth the extra step)"
+    )
+
+
 def _check_discount_add(
     current_discounts: list[dict] | None,
     today_discount_options: list[str] | None,
     is_group_rate: bool = False,
     club_discount_offered: bool | None = None,
+    has_voyagers: bool = False,
+    senior_discount_verifiable: bool = False,
 ) -> MscCheck:
     if current_discounts is None:
         return MscCheck(
@@ -315,14 +398,18 @@ def _check_discount_add(
         return MscCheck(
             type=MscOpportunityType.DISCOUNT_ADD,
             status=MscCheckStatus.OPPORTUNITY,
-            note="no Voyagers Club discount applied yet — Group Rate bookings are only eligible for the flat 5% Voyagers Club discount (not military/senior/promo tiers, not Voyagers Selection), call MSC to check eligibility and add",
+            note=(
+                "no Voyagers Club discount applied yet — Group Rate bookings are only eligible for the flat "
+                f"{_voyagers_club_addable_label(has_voyagers)} discount (not military/senior/promo tiers, not "
+                "Voyagers Selection), call MSC to check eligibility and add"
+            ),
         )
 
     # "implied" (SRN-math-detected, see _extract_discounts_with_implied)
     # counts the same as an explicitly disclosed "club"/"named" discount
     # here — a discount already reducing the price, regardless of
     # whether it prints a disclosure line, means don't recommend adding
-    # ANOTHER one on top (confirmed real bug 2026-08-11: booking 2000015
+    # ANOTHER one on top (confirmed real bug 2026-08-11: booking 3000024
     # got recommended "add a discount" minutes after a real 9.75% was
     # already applied, purely because it never discloses itself in text).
     already_has_any_discount = any(d.get("kind") in ("club", "named", "implied") for d in current_discounts)
@@ -362,17 +449,49 @@ def _check_discount_add(
 
     addable = []
     if club_discount_offered:
-        addable.append("Voyagers Club 5%")
-    if today_discount_options:
-        addable.extend(today_discount_options)
+        addable.append(_voyagers_club_addable_label(has_voyagers))
+
+    # CONFIRMED REAL FALSE POSITIVES, 2026-08-24 (bookings 3000031,
+    # 3000018, 3000017): senior discount never discloses itself (see
+    # this module's own KNOWN OPEN LIMITATION docstring), so an empty
+    # current_discounts list here only proves "no discount applied" when
+    # senior_discount_verifiable is True (the SRN-vs-standard-NCF math
+    # actually ran for this cruise length — see
+    # msc_commands.py's _srn_reference_available). All three of these real
+    # bookings had senior_count >= 2 (genuinely eligible for the option)
+    # and a cruise length outside STANDARD_NCF_BY_NIGHTS, so the SRN check
+    # never ran — and DISCOUNT_ADD confidently recommended adding it
+    # anyway, purely because current_discounts happened to be empty.
+    # Split SENIOR options into their own uncertain bucket in that case
+    # instead of trusting them as confirmed-addable.
+    uncertain = []
+    for opt in (today_discount_options or []):
+        if "SENIOR" in opt.upper() and not senior_discount_verifiable:
+            uncertain.append(opt)
+        else:
+            addable.append(opt)
 
     if addable:
+        note = (
+            "no discount currently applied — "
+            f"{', '.join(addable)} available today, call MSC to check eligibility and add"
+        )
+        if uncertain:
+            note += (
+                f" (also shows {', '.join(uncertain)} as available, but this cruise length isn't covered by "
+                "the standard-fare reference table used to rule out senior discount already being silently "
+                "applied — can't confirm it isn't already on top of the rest; verify the SRN line by hand)"
+            )
+        return MscCheck(type=MscOpportunityType.DISCOUNT_ADD, status=MscCheckStatus.OPPORTUNITY, note=note)
+    if uncertain:
         return MscCheck(
             type=MscOpportunityType.DISCOUNT_ADD,
-            status=MscCheckStatus.OPPORTUNITY,
+            status=MscCheckStatus.INSUFFICIENT_DATA,
             note=(
-                "no discount currently applied — "
-                f"{', '.join(addable)} available today, call MSC to check eligibility and add"
+                f"{', '.join(uncertain)} shows as available today, but senior discount never discloses itself "
+                "on MSC's Price Breakdown and this cruise length isn't covered by the standard-fare reference "
+                "table used to rule it out via SRN math — can't confirm it isn't already silently applied; "
+                "verify the SRN line by hand before recommending it"
             ),
         )
     return MscCheck(
@@ -451,6 +570,7 @@ def _check_discount_tier_upgrade(
                 f"call MSC to swap just this component, keep the base rate and any other stacked discount unchanged"
             ),
             estimated_value=round2(best_rate - current_best),
+            value_unit="PERCENTAGE_POINTS",
         )
     if unparseable:
         return MscCheck(
@@ -472,7 +592,7 @@ def _check_voyagers_selection(
     current_discounts: list[dict] | None,
     today_discount_catalog: list[dict] | None,
     has_voyagers: bool,
-    all_seniors: bool,
+    senior_count: int,
     is_group_rate: bool = False,
 ) -> MscCheck:
     # Same Group Rate rule, stated directly by Neon 2026-08-11: ONLY
@@ -532,8 +652,30 @@ def _check_voyagers_selection(
     # this is a heuristic, not a verified fact: a disclosed named
     # discount whose label also reads "SPECIAL OFFER" is treated as
     # likely already this same promo.
+    # CONFIRMED REAL GAP, fixed 2026-08-26: this used to test ONLY for
+    # "SPECIAL OFFER". But MSC also discloses this same family of program
+    # under the literal label "VOYAGERS EXCLUSIVES" (real captured format,
+    # quoted in msc_commands.py's own discount-parsing docstring:
+    # `Discount Description: VOYAGERS EXCLUSIVES - ... - Discount Rate: 9.75%`).
+    # Such a line parses as kind="named", does NOT contain "SPECIAL OFFER",
+    # and is not kind="implied" — so it cleared every guard here and this
+    # check returned a confident OPPORTUNITY recommending a Voyagers
+    # Selection discount on a booking that ALREADY carries the Exclusives
+    # program. That's a real cross-program false positive.
+    #
+    # Matched on the "EXCLUSIV" stem so both the singular and plural real
+    # spellings are caught. NOTE: msc_commands.py's docstring (a disclosed
+    # Exclusives line WITH a printed rate) and this module's own header
+    # comment (Exclusive is silent and must never be detected by
+    # disclosure text) genuinely contradict each other on this program —
+    # flagged for reconciliation against a real capture. Guarding on BOTH
+    # labels is the safe direction either way: the cost of a false
+    # "already applied" is a missed opportunity a human can still find,
+    # while the cost of the old behavior was recommending a discount that
+    # can't be stacked.
+    _ALREADY_APPLIED_LABELS = ("SPECIAL OFFER", "VOYAGERS EXCLUSIV")
     already_applied = any(
-        "SPECIAL OFFER" in (d.get("label") or "").upper()
+        any(marker in (d.get("label") or "").upper() for marker in _ALREADY_APPLIED_LABELS)
         for d in current_discounts
         if d.get("kind") == "named"
     )
@@ -544,7 +686,7 @@ def _check_voyagers_selection(
             note="a 'SPECIAL OFFER' discount is already disclosed on this booking — likely Voyagers Selection already applied (not yet confirmed against a real applied example, verify by hand if in doubt)",
         )
 
-    # ADDED 2026-08-11, booking 2000015: an "implied" (SRN-math) entry
+    # ADDED 2026-08-11, booking 3000024: an "implied" (SRN-math) entry
     # proves SOME undisclosed discount is already on this booking, but
     # NOT confidently which one — could be senior, Exclusive, Selection
     # itself, or some combination. Confidently recommending "add
@@ -564,10 +706,17 @@ def _check_voyagers_selection(
         )
 
     best = max(selection_entries, key=lambda d: safe_float(d.get("rate_pct")))
+    # Corrected 2026-08-18 (booking 3000030): this note used to fire on
+    # the old "all passengers 65+" rule, which wrongly flagged a LONE
+    # senior as Senior-Discount-eligible. The real eligibility rule is at
+    # least 2 senior (65+) passengers — see
+    # _filter_out_ineligible_senior_discount's docstring — so the
+    # exclusivity warning below only makes sense under that same rule.
     exclusivity_note = (
-        " — this booking's passengers are all 65+: confirmed UI-enforced rule is Voyagers Selection "
-        "is NOT combinable with Senior Discount, so this would mean giving up Senior in exchange, not stacking both"
-        if all_seniors else ""
+        " — this booking has 2+ senior (65+) passengers, making it Senior-Discount-eligible: confirmed "
+        "UI-enforced rule is Voyagers Selection is NOT combinable with Senior Discount, so this would mean "
+        "giving up Senior in exchange, not stacking both"
+        if senior_count >= 2 else ""
     )
     return MscCheck(
         type=MscOpportunityType.VOYAGERS_SELECTION,
@@ -592,11 +741,13 @@ def evaluate_msc_booking(
     today_discount_options: list[str] | None = None,
     today_discount_catalog: list[dict] | None = None,
     has_voyagers: bool = False,
-    all_seniors: bool = False,
+    senior_count: int = 0,
+    senior_discount_verifiable: bool = False,
     due_amount: float | None = None,
     today_price_tab_confirmed: bool = False,
     is_group_rate: bool = False,
     club_discount_offered: bool | None = None,
+    final_payment_date_passed: bool = False,
 ) -> MscBookingResult:
     """Run all three opportunity checks for one booking.
 
@@ -653,10 +804,30 @@ def evaluate_msc_booking(
         has_voyagers: Whether any passenger on this booking has an MSC
             Voyagers Club membership (from _extract_passengers()) —
             Voyagers Selection requires this.
-        all_seniors: Whether every passenger on this booking is 65+ (from
-            _extract_passengers()) — used only to attach the confirmed
-            not-combinable-with-Senior caveat to a VOYAGERS_SELECTION
-            opportunity note, not to suppress it.
+        senior_count: How many passengers on this booking are 65+ (from
+            _extract_passengers()). CONFIRMED HARD RULE, Neon 2026-08-18:
+            senior discount requires AT LEAST TWO senior passengers in the
+            cabin — a lone senior is not eligible even though MSC's own
+            dropdown lists SENIOR DISCOUNT regardless of party
+            composition. Used here to strip SENIOR DISCOUNT out of
+            today_discount_options before DISCOUNT_ADD/DISCOUNT_TIER_UPGRADE
+            ever see it when this booking doesn't meet that bar (see
+            _filter_out_ineligible_senior_discount), and to attach the
+            confirmed not-combinable-with-Senior caveat to a
+            VOYAGERS_SELECTION opportunity note when it does.
+        senior_discount_verifiable: Whether msc_commands.py's
+            _srn_reference_available found this booking's cruise length in
+            STANDARD_NCF_BY_NIGHTS, i.e. whether the SRN-vs-standard-fare
+            math could actually run to rule out a silent senior discount.
+            CONFIRMED REAL FALSE POSITIVES, 2026-08-24 (bookings 3000031/
+            3000018/3000017 — 9/19/10 nights, none in the reference
+            table): senior discount never discloses itself, so an empty
+            current_discounts only proves "no discount applied" when this
+            is True. When False, DISCOUNT_ADD downgrades a SENIOR DISCOUNT
+            recommendation to INSUFFICIENT_DATA instead of a confident
+            OPPORTUNITY — defaults to False (conservative, matching every
+            other unverified signal in this function) so a caller that
+            forgets to pass this gets the cautious behavior, not a guess.
         due_amount: The booking's remaining Due Amount (from
             msc_commands.py's _extract_booking_essentials()), used only
             to attach factual context to a PRICE_MATCH opportunity note
@@ -689,6 +860,15 @@ def evaluate_msc_booking(
             captured and genuinely absent (a real negative signal — this
             specific rate doesn't offer the club pathway at all), True
             when present.
+        final_payment_date_passed: Whether msc_commands.py's
+            _final_payment_date_passed found this booking's own Final
+            Payment Date already behind us. CONFIRMED HARD RULE, Neon
+            2026-08-24, matching widely-reported MSC/cruise-industry
+            practice: a fare drop only gets honored before final payment
+            is due — _check_price_match short-circuits to NO_OPPORTUNITY
+            when this is True, the same shape of gate as is_paid_in_full
+            (the two are related but distinct: a booking can be past its
+            final payment date without having actually paid yet).
     """
     if cancelled_or_postponed:
         return MscBookingResult(
@@ -709,7 +889,7 @@ def evaluate_msc_booking(
     # doesn't succeed), while [] means "captured, and genuinely no
     # discount was disclosed." Confirmed real bug, first live batch run
     # 2026-08-11: collapsing None into [] here made a booking that
-    # genuinely already had a real discount applied (2000010, SPECIAL
+    # genuinely already had a real discount applied (3000016, SPECIAL
     # OFFER 15% + MSCCLUB5) get reported as a false DISCOUNT_ADD/
     # VOYAGERS_SELECTION "opportunity" on 3 of 5 identical repeated
     # checks, purely because the Price Breakdown modal hadn't finished
@@ -723,15 +903,22 @@ def evaluate_msc_booking(
     # than in each check, so it can never leak through DISCOUNT_ADD or
     # DISCOUNT_TIER_UPGRADE regardless of what MSC's dropdown lists.
     allowed_discount_options = _filter_out_disallowed_discounts(today_discount_options)
+    # Senior discount requires 2+ senior passengers (see senior_count's
+    # docstring above) — same one-time filtering pattern, added 2026-08-18
+    # after booking 3000030's false positive (a lone 83-year-old).
+    allowed_discount_options = _filter_out_ineligible_senior_discount(allowed_discount_options, senior_count)
 
     checks = [
         _check_price_match(
             current_base_price, today_base_price, current_total_price, due_amount,
-            today_price_tab_confirmed, is_group_rate, is_paid_in_full,
+            today_price_tab_confirmed, is_group_rate, is_paid_in_full, final_payment_date_passed,
         ),
-        _check_discount_add(current_discounts, allowed_discount_options, is_group_rate, club_discount_offered),
+        _check_discount_add(
+            current_discounts, allowed_discount_options, is_group_rate, club_discount_offered,
+            has_voyagers, senior_discount_verifiable,
+        ),
         _check_discount_tier_upgrade(current_discounts, allowed_discount_options, is_group_rate),
-        _check_voyagers_selection(current_discounts, today_discount_catalog, has_voyagers, all_seniors, is_group_rate),
+        _check_voyagers_selection(current_discounts, today_discount_catalog, has_voyagers, senior_count, is_group_rate),
     ]
     has_any_opportunity = any(c.status == MscCheckStatus.OPPORTUNITY for c in checks)
 

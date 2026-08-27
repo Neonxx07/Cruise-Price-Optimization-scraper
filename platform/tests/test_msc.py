@@ -13,7 +13,7 @@ from core.models import MSC_PAID_IN_FULL_DUE_THRESHOLD, MscCheckStatus
 
 
 def test_explicitly_cancelled_detects_status_word():
-    text = "Booking\n-\n2000006\nCANCELED\nBooking Value\n$0.00\n"
+    text = "Booking\n-\n3000012\nCANCELED\nBooking Value\n$0.00\n"
     assert m._is_explicitly_cancelled(text) is True
 
 
@@ -23,7 +23,7 @@ def test_explicitly_cancelled_detects_reinstate_button():
 
 
 def test_explicitly_cancelled_false_on_normal_confirmed_booking():
-    text = "Booking\n-\n2000008\nCONFIRMED\nBooking Value\n$966.89\n"
+    text = "Booking\n-\n3000014\nCONFIRMED\nBooking Value\n$966.89\n"
     assert m._is_explicitly_cancelled(text) is False
 
 
@@ -31,7 +31,7 @@ def test_regression_explicitly_cancelled_does_not_false_positive_on_random_text(
     """Must not fire on ordinary page text that merely contains the word
     'cancel' in an unrelated context (e.g. a 'CANCEL BOOKING' button that
     exists on every live booking, cancelled or not)."""
-    text = "Booking\n-\n2000015\nCONFIRMED\nBooking Value\n$6,174.81\nCANCEL BOOKING\n"
+    text = "Booking\n-\n3000024\nCONFIRMED\nBooking Value\n$6,174.81\nCANCEL BOOKING\n"
     assert m._is_explicitly_cancelled(text) is False
 
 
@@ -51,14 +51,14 @@ def test_is_paid_in_full(due_amount, is_overpayment, expected):
 
 
 def test_regression_overpayment_real_example():
-    """Real captured example, booking 2000012: 'Overpayment\\n$0.02'."""
+    """Real captured example, booking 3000021: 'Overpayment\\n$0.02'."""
     text = "Booking Value\n$2,190.54\n(Price includes all tax and fees)\nOverpayment\n$0.02\nPrice Breakdown >"
     ess = m._extract_booking_essentials(text)
     assert ess["is_overpayment"] is True
     assert ess["overpayment_amount"] == "0.02"
 
 
-# ── Tab matching (5-tier cascade) ─────────────────────────────────
+# ── Tab matching (6-tier cascade) ─────────────────────────────────
 
 
 def test_tab_match_exact():
@@ -67,7 +67,7 @@ def test_tab_match_exact():
 
 
 def test_regression_amenity_signature_match_neons_real_example():
-    """Real ground truth from Neon, booking 2000009: 'BALCONY UPGRADE
+    """Real ground truth from Neon, booking 3000015: 'BALCONY UPGRADE
     DRINKS WIFI' is the same product as 'FLASH SALE DRINKS AND WIFI'."""
     target, reason = m._select_matching_tab(
         "BALCONY UPGRADE DRINKS WIFI",
@@ -109,6 +109,46 @@ def test_cruise_only_tier_fallback_does_not_guess_when_ambiguous():
     target, reason = m._select_matching_tab(
         "SOME NEW CAMPAIGN",
         ["ESCAPE TO SEA CRUISE ONLY", "FLASH SALE CRUISE ONLY", "BROCHURE RATES"],
+    )
+    assert target is None
+
+
+def test_tab_match_tier6_fuzzy_catches_typo_none_of_tiers_1_to_5_cover():
+    """ADDED 2026-08-25: a singular/plural typo ('DRINK' vs 'DRINKS')
+    breaks tier 3 (exact-word keyword-subset) AND tier 4 (amenity-
+    signature is a literal string set) -- confirmed this fell through to
+    'no match' before tier 6 existed. RapidFuzz scores this pair 84 with
+    a 48-point gap to the only other candidate, comfortably clearing the
+    validated 80/20 threshold."""
+    target, reason = m._select_matching_tab(
+        "SALE DRINK AND WIFI",
+        ["FLASH SALE DRINKS AND WIFI", "ESCAPE TO SEA CRUISE ONLY"],
+    )
+    assert target == "FLASH SALE DRINKS AND WIFI"
+
+
+def test_tab_match_tier6_does_not_override_a_tier5_ambiguous_refusal():
+    """Tier 6 must never re-litigate a refusal an earlier tier already
+    made -- this is the exact case tier 5 already correctly refuses
+    (test_cruise_only_tier_fallback_does_not_guess_when_ambiguous above);
+    confirms tier 6's `if target is None and not ambiguous_note` guard
+    actually holds, not just that the final answer happens to match."""
+    target, reason = m._select_matching_tab(
+        "SOME NEW CAMPAIGN",
+        ["ESCAPE TO SEA CRUISE ONLY", "FLASH SALE CRUISE ONLY", "BROCHURE RATES"],
+    )
+    assert target is None
+    assert "tier 5" in reason.lower()
+
+
+def test_tab_match_tier6_stays_out_of_the_confirmed_obc_incident():
+    """Regression guard for the exact real incident this tier's threshold
+    was validated against: an OBC-included rate must still never match a
+    plain drinks+wifi tab, even though they share real words (both fuzzy
+    scores land well under the 80 floor for this specific pair)."""
+    target, reason = m._select_matching_tab(
+        "CRUISE WITH DRINKS WIFI OBC",
+        ["FLASH SALE CRUISE ONLY", "ESCAPE TO SEA CRUISE ONLY", "BROCHURE RATES", "FLASH SALE DRINKS AND WIFI"],
     )
     assert target is None
 
@@ -160,6 +200,38 @@ def test_regression_paid_in_full_blocks_price_match_only():
         is_paid_in_full=False,
     )
     assert check_not_paid.status == MscCheckStatus.OPPORTUNITY
+
+
+def test_price_match_estimated_value_tagged_usd():
+    """ADDED 2026-08-25, closing the estimated_value unit-mixing landmine
+    flagged in core/models.py's MscCheck docstring: PRICE_MATCH's dollar
+    figure must be tagged "USD" so a future aggregator can group by unit
+    before summing rather than blindly mixing dollars and percentage
+    points across check types."""
+    check = _check_price_match(
+        current_base_price=1000.0, today_base_price=500.0,
+        today_price_tab_confirmed=True,
+    )
+    assert check.status == MscCheckStatus.OPPORTUNITY
+    assert check.estimated_value == 500.0
+    assert check.value_unit == "USD"
+
+
+def test_discount_tier_upgrade_estimated_value_tagged_percentage_points():
+    """Same landmine fix as above, but for DISCOUNT_TIER_UPGRADE's
+    estimated_value, which is a percentage-POINT difference
+    (best_rate - current_best), never a dollar figure — must be tagged
+    distinctly from PRICE_MATCH's "USD" so the two are never summed
+    together blindly."""
+    from core.calculator_msc import _check_discount_tier_upgrade
+
+    check = _check_discount_tier_upgrade(
+        current_discounts=[{"kind": "named", "label": "MIL-CIV-IL-DSCNT-10%", "rate_pct": 10.0}],
+        today_discount_options=["SPECIAL OFFER 15%"],
+    )
+    assert check.status == MscCheckStatus.OPPORTUNITY
+    assert check.estimated_value == 5.0
+    assert check.value_unit == "PERCENTAGE_POINTS"
 
 
 def test_evaluate_msc_booking_paid_in_full_still_allows_discount_add():

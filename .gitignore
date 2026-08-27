@@ -35,11 +35,15 @@ env/
 /platform/data/
 /platform/watch_runs/
 /platform/watchlist.txt
+/platform/watchlist.txt.bak*
 
 # Generated reports (CSV/XLSX exports) -- regenerate via a scan, not source data
 *.csv
 *.xlsx
 /platform/reports/
+
+# Local dependency-upgrade backups (pip freeze snapshots) -- not source
+.dep_backups/
 
 # Logs
 logs/

@@ -489,10 +489,18 @@ def test_dedupe_does_not_affect_discount_catalog_contract():
     """Sanity check on the None-vs-[] contract this fix protects,
     consumed by evaluate_msc_booking's DISCOUNT_ADD/DISCOUNT_TIER_UPGRADE
     checks (see core/calculator_msc.py) -- None must produce
-    INSUFFICIENT_DATA, [] must not."""
+    INSUFFICIENT_DATA, [] must not. senior_discount_verifiable=True is
+    passed explicitly (added 2026-08-24) so this test keeps exercising the
+    None-vs-[] contract specifically -- the separate SRN-blind-spot gate
+    (see test_msc.py) would otherwise mask a confirmed-empty [] as
+    INSUFFICIENT_DATA too, for an unrelated reason."""
     from core.calculator_msc import _check_discount_add
-    insufficient = _check_discount_add(current_discounts=None, today_discount_options=["SENIOR DISCOUNT"])
-    confirmed_empty = _check_discount_add(current_discounts=[], today_discount_options=["SENIOR DISCOUNT"])
+    insufficient = _check_discount_add(
+        current_discounts=None, today_discount_options=["SENIOR DISCOUNT"], senior_discount_verifiable=True,
+    )
+    confirmed_empty = _check_discount_add(
+        current_discounts=[], today_discount_options=["SENIOR DISCOUNT"], senior_discount_verifiable=True,
+    )
     assert insufficient.status.value == "INSUFFICIENT_DATA"
     assert confirmed_empty.status.value == "OPPORTUNITY"
 

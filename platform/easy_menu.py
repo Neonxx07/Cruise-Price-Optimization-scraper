@@ -50,11 +50,15 @@ def menu_login():
 
 
 def _ask_headless_mode() -> bool | None:
-    choice = input(
-        "Show the browser window so you can watch it work? "
-        "(y/N — just press Enter to run invisibly in the background): "
-    ).strip().lower()
-    return False if choice in ("y", "yes") else True
+    # ESPRESSO (cruisingpower.com) never works headless — its bot detection
+    # blocks/breaks headless sessions — and easy_menu.py only ever drives
+    # ESPRESSO (see WATCHLIST/cruise_line="ESPRESSO" below). Asking "run
+    # invisibly?" used to be a real trap: pressing Enter silently launched a
+    # headless session that scraper/base.py now force-overrides to visible
+    # anyway, so the question's "invisible" answer was never actually
+    # honored. Always visible, no prompt — callers below print the
+    # visible-window notice.
+    return False
 
 
 def menu_scan():

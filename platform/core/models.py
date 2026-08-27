@@ -102,6 +102,31 @@ class BookingResult(BaseModel):
     lost_fares: list[str] = Field(default_factory=list)
     re_addable_fares: list[str] = Field(default_factory=list)
     gained_fares: list[str] = Field(default_factory=list)
+    # ADDED 2026-08-25, backed by real data: mining raw_responses.jsonl's 532
+    # real captured ESPRESSO invoices found "GRP TVL PRTC" (Group Travel
+    # Protection) appearing 64 times as an ordinary invoice line item —
+    # previously indistinguishable from a lost drink package/Wi-Fi perk in
+    # lost_pkg_names, even though losing trip-insurance coverage is a
+    # materially different kind of loss (it can affect cancellation/refund
+    # eligibility, not just a perk). Its dollar value still contributes to
+    # lost_pkg_value/net_saving unchanged — this field only makes the loss
+    # visible as a DISTINCT category so a human reviewing the result sees
+    # it called out, not blended into "Lost Packages." See
+    # core.calculator._is_travel_protection.
+    lost_travel_protection: list[str] = Field(default_factory=list)
+    # NCL promo strings, before and after the reprice — ADDED 2026-08-26.
+    # These are the exact inputs the protected-promo hard gate decides on
+    # (see core.calculator.ncl_lost_protected_promos / LATRIPLE), so
+    # without them a TRAP verdict was unauditable: the operator could see
+    # "would LOSE LATRIPLE" in the note but had no way to check the actual
+    # before/after promo sets the decision came from. Also directly match
+    # the two distinct promo columns in the project owner's own reference
+    # report ("Curr. Promos (Header)" = the booking's own header promos;
+    # "Promos (Category Row)" = the category grid row's promos), which are
+    # deliberately kept SEPARATE there rather than collapsed into one.
+    # Empty string for every non-NCL cruise line.
+    old_promos: str = ""
+    new_promos: str = ""
 
     confidence: int = 0
     old_cruise_fare: float = 0.0
@@ -167,21 +192,28 @@ class MscCheck(BaseModel):
     type: MscOpportunityType
     status: MscCheckStatus
     note: str = ""
-    # CONFIRMED REAL INCONSISTENCY, flagged 2026-08-13 audit, not yet
-    # fixed (would need a judgment call on how to split/rename, not a
-    # pure bug fix): units are NOT the same across check types. For
-    # PRICE_MATCH this is a DOLLAR amount (see calculator_msc.py's
-    # _check_price_match, `estimated_value=diff`). For
-    # DISCOUNT_TIER_UPGRADE this is a PERCENTAGE-POINT difference
+    # CONFIRMED REAL INCONSISTENCY, flagged 2026-08-13 audit. Units are NOT
+    # the same across check types. For PRICE_MATCH this is a DOLLAR amount
+    # (see calculator_msc.py's _check_price_match, `estimated_value=diff`).
+    # For DISCOUNT_TIER_UPGRADE this is a PERCENTAGE-POINT difference
     # (`best_rate - current_best`, e.g. 5.0 meaning "5 points better"),
-    # never a dollar figure. Nothing in this codebase currently
+    # never a dollar figure. DISCOUNT_ADD/VOYAGERS_SELECTION never set this
+    # field at all today (verified — grep for `estimated_value=` in
+    # calculator_msc.py). Nothing in this codebase currently
     # aggregates/displays this field directly (verified — only `.note`,
-    # a human-readable string, is ever surfaced), so this is dormant
-    # today, not an active bug. But it IS a landmine for any future
-    # "total estimated opportunity value" feature — such a feature must
-    # NOT sum this field across check types without first checking
-    # `type`.
+    # a human-readable string, is ever surfaced), so mixing units here was
+    # dormant, not an active bug — but WAS a landmine for any future
+    # "total estimated opportunity value" feature.
     estimated_value: Optional[float] = None
+    # ADDED 2026-08-25 to close the landmine above at the source rather
+    # than leave it for a future aggregator to rediscover the hard way:
+    # every call site that sets estimated_value now also tags its real
+    # unit ("USD" for PRICE_MATCH's dollar figures, "PERCENTAGE_POINTS"
+    # for DISCOUNT_TIER_UPGRADE's best_rate - current_best; None wherever
+    # estimated_value itself is also None). A future aggregator must
+    # group by value_unit before summing, never sum raw estimated_value
+    # across mixed check types.
+    value_unit: Optional[str] = None
 
 
 class MscBookingResult(BaseModel):
@@ -203,7 +235,7 @@ class MscBookingResult(BaseModel):
 
 # ── MSC Discount Price-Test ─────────────────────────────────────
 #
-# ADDED 2026-08-13, forensic investigation of bookings 2000017/2000020:
+# ADDED 2026-08-13, forensic investigation of bookings 3000026/3000029:
 # confirmed that evaluate_msc_booking()'s DISCOUNT_ADD/DISCOUNT_TIER_UPGRADE
 # checks can detect a discount is ELIGIBLE (Senior, Voyagers Club, a named
 # promo) but never determine what it's actually WORTH in dollars — MSC's
@@ -246,7 +278,7 @@ class MscDiscountCandidate(BaseModel):
 
 
 class MscDiscountTestStatus(str, Enum):
-    """EXPANDED 2026-08-13 after the first live test on 2000017 exposed
+    """EXPANDED 2026-08-13 after the first live test on 3000026 exposed
     two real bugs: (1) a hard requirement on rate-tab DOM presence that
     doesn't hold once a discount changes what MSC renders after Confirm,
     and (2) every early-return path collapsing to one generic
@@ -321,7 +353,7 @@ class MscDiscountTestResult(BaseModel):
     actual_savings: Optional[float] = None
     currency: str = "UNKNOWN"
 
-    # CONFIRMED REAL GAP, added 2026-08-13 after a live retest of 2000017
+    # CONFIRMED REAL GAP, added 2026-08-13 after a live retest of 3000026
     # produced a DIFFERENT price ($2,559.00) than a human had separately
     # observed live ($2,565.26) for the same discount on the same booking
     # — and this model had no way to tell which of

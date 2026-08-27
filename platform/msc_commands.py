@@ -123,7 +123,7 @@ Commands (one per line in data/msc_control/command.txt):
 
   --- Live discount price-testing (added 2026-08-13) ---
   CONFIRMED REAL GAP this closes, from a forensic investigation of
-  bookings 2000017/2000020: evaluate_msc_booking() can detect a
+  bookings 3000026/3000029: evaluate_msc_booking() can detect a
   discount is ELIGIBLE but never determines what it's actually worth —
   MSC represents at least one real discount (Senior) as a non-literal,
   dynamically-computed rate with no percentage anywhere to parse, and the
@@ -161,56 +161,25 @@ Commands (one per line in data/msc_control/command.txt):
                                 INSUFFICIENT_DATA if no passenger on this
                                 booking has a Voyagers membership.
 
-  --- Recommended flow: single-tab, sequential (fixed 2026-08-10) ---
-  Confirmed by real, repeated incidents: opening MORE THAN ONE tab against
-  this WCS backend — even just two — can trigger a genuine server-side
-  session/cookie conflict (_ERR_INVALID_COOKIE) that silently corrupts
-  results (one tab showed a completely unrelated sailing with a different
-  passenger's data, no visible error). The single-tab flow below never
-  opens a second tab at all, which avoids this failure mode entirely. Use
-  this instead of the multi-tab commands further below for any new work.
+  REMOVED 2026-08-14: the manual single-tab (stage_booking/
+  harvest_staged_booking) and legacy multi-tab (open_batch_tabs/
+  harvest_batch_tabs) flows are gone. Both required Neon to manually click
+  "CONFIRM AND PROCEED" between staging and harvesting each booking — a
+  human-in-the-loop "watch, then review" step that check_booking/
+  check_booking_batch below (the fully automated lookup -> stage -> confirm
+  -> harvest -> evaluate flow, zero clicks needed) has fully superseded
+  since 2026-08-11. Confirmed by real, repeated incidents: opening MORE
+  THAN ONE tab against this WCS backend — even just two — can trigger a
+  genuine server-side session/cookie conflict (_ERR_INVALID_COOKIE) that
+  silently corrupts results (one tab showed a completely unrelated sailing
+  with a different passenger's data, no visible error) — check_booking_batch2
+  is the only supported way to run 2 tabs now, with the sailing-identity
+  fingerprint check described there as its mitigation.
 
-  stage_booking:<id>          - on the CURRENT tab (no new tab opened),
-                                looks up the booking, clicks "Book Same
-                                Departure", and stops on the resulting
-                                occupancy screen — same read-only guarantee
-                                as before, never clicks Confirm. Stores the
-                                result in-memory (not per-tab) for
-                                harvest_staged_booking to use next. Returns
-                                the booking's category/current value/rate
-                                name so Neon knows what he's about to
-                                confirm.
-  harvest_staged_booking       - call ONCE, after Neon clicks "CONFIRM AND
-                                PROCEED" on the current tab. Automatically
-                                finds and clicks the rate/promo tab that
-                                matches the booking's OWN rate name (see
-                                the rate-tab-matching note below — this is
-                                now automated, not a manual spot-check),
-                                then reads the resulting price for the
-                                booking's own category and appends the
-                                comparison to
-                                data/msc_control/rate_check_data.jsonl.
-
-  --- Legacy multi-tab flow (kept for reference, prefer single-tab above) ---
-  open_batch_tabs:<id1,id2,...> - opens ONE NEW TAB per booking id (max 1
-                                recommended given the cookie-conflict risk
-                                above), navigates each to its own dummy
-                                occupancy screen, and stops there. Attaches
-                                a network response listener per tab so
-                                whatever request the manual Confirm click
-                                sends gets logged to
-                                data/msc_control/network_capture.jsonl.
-  harvest_batch_tabs          - call ONCE, after Neon has manually
-                                clicked "CONFIRM AND PROCEED" in every tab
-                                opened by open_batch_tabs. Reads each
-                                staged tab's resulting listing and appends
-                                a comparison to
-                                data/msc_control/rate_check_data.jsonl.
-  close_tabs:<idx1,idx2,...>  - closes the given tab indices, resyncing
-                                state["page"] to a remaining tab if the
-                                active one was among them, and purging any
-                                stale open_batch_tabs bookkeeping for those
-                                same indices.
+  close_tabs:<idx1,idx2,...>  - closes the given tab indices (opened via
+                                new_tab), resyncing state["page"] to a
+                                remaining tab if the active one was among
+                                them.
 """
 
 import asyncio
@@ -220,7 +189,10 @@ import os
 import re
 from datetime import datetime
 
+import dateparser
 import keyring
+from price_parser import Price
+from rapidfuzz import fuzz
 
 from config.settings import settings
 from utils.logging import get_logger, track_background_task
@@ -340,7 +312,7 @@ async def _lookup_one_booking(page, booking_id: str) -> dict:
     _wait_for_content's poll just timed out and returned the error page
     text as if it were a normal capture. That got written straight into
     booking_data.jsonl as this booking's "latest" record — corrupting a
-    real booking's data with garbage (confirmed on 2000007, whose
+    real booking's data with garbage (confirmed on 3000013, whose
     correct $3,790.51/$0.00-due data got overwritten this way) and
     silently regressing every later calculator run for it until noticed.
     Returns {"session_expired": True, ...} instead of a normal-looking
@@ -359,7 +331,7 @@ async def _lookup_one_booking(page, booking_id: str) -> dict:
         # was NOT sufficient — the Ship/Area/Itinerary/Departure-Arrival/
         # Duration block renders on its own separate timing and can still
         # be missing even once "Booking Value" is already present
-        # (confirmed real capture, booking 2000015: jumped straight from
+        # (confirmed real capture, booking 3000024: jumped straight from
         # "Add Cruise" to "Cabin 1" details, skipping the whole itinerary
         # section entirely). This silently broke duration-dependent logic
         # (_extract_duration_nights, needed for the implied-discount SRN
@@ -413,7 +385,7 @@ async def _lookup_one_booking(page, booking_id: str) -> dict:
             # fixed 1500ms wait was fine for years of manual, human-paced
             # driving but was NOT always enough once check_booking_batch
             # started firing these back-to-back with no natural pauses —
-            # one real capture (booking 2000010) grabbed the PLAIN
+            # one real capture (booking 3000016) grabbed the PLAIN
             # booking detail page instead of the modal, which
             # _extract_discounts then silently read as "zero discounts",
             # producing a dangerous false positive (recommending a
@@ -439,7 +411,7 @@ async def _lookup_one_booking(page, booking_id: str) -> dict:
                 # Discount:" lines _extract_discounts() actually needs.
                 # A single fixed settle delay after the header (tried:
                 # 1000ms) was STILL flaky — 1 of 3 repeated checks on the
-                # same real booking (2000010, confirmed to genuinely
+                # same real booking (3000016, confirmed to genuinely
                 # have SPECIAL OFFER 15% + MSCCLUB5 both applied) still
                 # came back with zero discounts parsed, because render
                 # time for the rest of the modal isn't constant. Poll
@@ -468,7 +440,7 @@ async def _lookup_one_booking(page, booking_id: str) -> dict:
         # regex-scanned, match nothing, and be silently treated as
         # "confirmed empty" — exactly the false "no discount, add one"
         # bug class this project already had one real incident from
-        # (booking 2000010). Must stay None on any failure here.
+        # (booking 3000016). Must stay None on any failure here.
         logger.warning("msc.breakdown_read_failed", error=str(e))
         breakdown_text = None
 
@@ -492,7 +464,7 @@ async def _lookup_one_booking(page, booking_id: str) -> dict:
         # of what the booking status field says — confirmed 2026-08-10.
         "cancelled_or_postponed_placeholder": _is_placeholder_departure(summary_text),
         # A DIFFERENT real cancellation shape, confirmed 2026-08-12
-        # (booking 2000006): a plain outright cancellation with a
+        # (booking 3000012): a plain outright cancellation with a
         # perfectly normal departure date, marked by the literal
         # "CANCELED" status word and a "REINSTATE BOOKING" button
         # instead of the far-future placeholder trick above. Checks BOTH
@@ -500,10 +472,13 @@ async def _lookup_one_booking(page, booking_id: str) -> dict:
         # — either one alone catching it is enough.
         "explicitly_cancelled": _is_explicitly_cancelled(summary_text) or bool(status_badge and "CANCEL" in status_badge),
         # Auto-detected from Passenger Details instead of relying on Neon
-        # stating ages in chat every time — senior discount requires ALL
-        # passengers 65+ (confirmed rule).
+        # stating ages in chat every time — senior discount requires AT
+        # LEAST TWO passengers 65+ in the cabin (see senior_count; corrected
+        # 2026-08-18, all_seniors alone is not the real eligibility rule —
+        # see _extract_passengers's docstring).
         "passengers": passenger_info["passengers"],
         "all_seniors": passenger_info["all_seniors"],
+        "senior_count": passenger_info["senior_count"],
         "has_voyagers": passenger_info["has_voyagers"],
         # Structured discount(s) already applied to this booking — both
         # explicitly disclosed (Price Breakdown text) AND inferred via
@@ -627,11 +602,11 @@ def _extract_booking_essentials(text: str) -> dict:
 
     "Guaranteed Cabin" bookings use a completely different line format —
     no cabin number, no parenthetical code, e.g. 'Cabin  1 - Guaranteed
-    Cabin INT' — confirmed on bookings 2000011/2000019, where the first
+    Cabin INT' — confirmed on bookings 3000020/3000028, where the first
     regex returned None for both. Falls back to a second pattern for
     that format.
 
-    ADDED 2026-08-11, real gap found reviewing booking 2000007: this
+    ADDED 2026-08-11, real gap found reviewing booking 3000013: this
     function never extracted "Due Amount" at all, so the automated
     pipeline's is_paid_in_full was always hardcoded False even on a
     booking confirmed genuinely paid in full ($0.00 due) — which meant a
@@ -639,29 +614,54 @@ def _extract_booking_essentials(text: str) -> dict:
     never got flagged as "this booking is already paid in full, so
     price-matching this would very likely be a real refund, not just a
     future-payment reduction" (the exact refund-framing rule already
-    established for DISCOUNT_ADD, which applies equally here)."""
-    m_val = re.search(r"Booking Value\n\$([\d,]+\.\d{2})", text or "")
-    # Deliberately still matches a leading '-' if present (e.g. "-$50.00")
-    # WITHOUT capturing the sign into group 1 — due_amount's magnitude is
-    # all that's needed once is_negative_due below has already flagged it
-    # as an overpayment; _is_paid_in_full short-circuits on is_overpayment
-    # before ever looking at the due_amount value in that case.
-    m_due = re.search(r"Due Amount\n-?\$?([\d,]+\.\d{2})", text or "")
-    m_due_prefix = re.search(r"Due Amount\n(.{0,3})", text or "")
-    is_negative_due = bool(m_due_prefix and "-" in m_due_prefix.group(1))
+    established for DISCOUNT_ADD, which applies equally here).
+
+    UPGRADED 2026-08-24: the dollar amounts below used to require an
+    EXACT "\\d+\\.\\d{2}" shape and silently returned no match at all on
+    any other real, valid format — the same bug CLASS already confirmed
+    once on GoCCL (a whole-dollar "$1,418" with no cents broke a regex
+    demanding exactly 2 decimal digits). Verified against this project's
+    own real captured strings before adopting: price-parser's
+    Price.fromstring() correctly handles whole-dollar amounts, a stray
+    space after "$", and a "USD $X" prefix, none of which the old regex
+    would have matched. It does NOT preserve a negative/parenthetical
+    sign on its own (Price(amount=Decimal('50.00')) for both "-$50.00"
+    and "($50.00)") — that detection stays a separate check on the raw
+    captured line, same as before, now also recognizing a parenthetical
+    negative (a common real-world credit convention) alongside the
+    existing leading-minus check."""
+    m_val_line = re.search(r"Booking Value\n(.+)", text or "")
+    value_price = Price.fromstring(m_val_line.group(1)) if m_val_line else None
+    value_str = f"{value_price.amount:.2f}" if value_price and value_price.amount is not None else None
+
+    m_due_line = re.search(r"Due Amount\n(.+)", text or "")
+    due_raw = m_due_line.group(1) if m_due_line else None
+    due_price = Price.fromstring(due_raw) if due_raw else None
+    due_str = f"{due_price.amount:.2f}" if due_price and due_price.amount is not None else None
+    # Sign detection has to happen on the RAW captured text — price-parser
+    # gives magnitude only, by design (confirmed via direct test: both
+    # "-$50.00" and "($50.00)" parse to amount=Decimal('50.00')).
+    is_negative_due = bool(due_raw and ("-" in due_raw or "(" in due_raw))
     # ADDED 2026-08-12, direct instruction from Neon: MSC can show
     # "Overpayment" instead of "Due Amount" when a client has paid more
     # than the booking's current total (e.g. after a price drop already
     # applied) — that's paid-in-full and then some, not just "due amount
     # not found." Also treats a negative "Due Amount" figure (e.g.
-    # "-$50.00", either sign/dollar order) as the same signal, in case
-    # MSC ever renders it that way instead of swapping the label. Neither
-    # of these has been seen live yet — built defensively per Neon's
-    # instruction, to be confirmed against a real example the next time
-    # one turns up.
+    # "-$50.00" or "($50.00)", either sign/dollar order) as the same
+    # signal, in case MSC ever renders it that way instead of swapping
+    # the label. Neither of these has been seen live yet — built
+    # defensively per Neon's instruction, to be confirmed against a real
+    # example the next time one turns up.
     is_overpayment = bool(re.search(r"\bOverpayment\b", text or "", re.IGNORECASE)) or is_negative_due
-    m_overpay_amt = re.search(r"Overpayment[^\d\-]{0,20}\$?([\d,]+\.\d{2})", text or "", re.IGNORECASE)
-    overpayment_amount = m_overpay_amt.group(1) if m_overpay_amt else None
+    # Real captured shape (booking 3000021) has a newline between the
+    # label and the amount, same as "Due Amount"/"Booking Value" — [^\d\-]
+    # (not [^\n]) is deliberate so the skip crosses that newline instead
+    # of stopping at it. Capture widened to accept a whole-dollar amount
+    # too (was "\.\d{2}" exactly), same fragility class fixed everywhere
+    # else in this function.
+    m_overpay = re.search(r"Overpayment[^\d\-]{0,20}(-?\$?[\d,]+(?:\.\d+)?)", text or "", re.IGNORECASE)
+    overpay_price = Price.fromstring(m_overpay.group(1)) if m_overpay else None
+    overpayment_amount = f"{overpay_price.amount:.2f}" if overpay_price and overpay_price.amount is not None else None
     # The booking's own rate/promo program, e.g. "Price :\nFLASH SALE
     # DRINKS AND WIFI" — needed to click the MATCHING tab on a fresh
     # listing (see _match_rate_tab). Confirmed real gap 2026-08-10: the
@@ -671,16 +671,18 @@ def _extract_booking_essentials(text: str) -> dict:
     # $26 once matched to the right tab).
     m_rate = re.search(r"Price\s*:\n(.+)", text or "")
     rate_name = m_rate.group(1).strip() if m_rate else None
+    final_payment_date_passed = _final_payment_date_passed(text)
     m_cat = re.search(r"Cabin\s+\d+\s*-\s*N.\d+[^\n(]+\(([A-Z0-9]+)\)", text or "")
     if m_cat:
         return {
-            "value": m_val.group(1) if m_val else None,
-            "due_amount": m_due.group(1) if m_due else None,
+            "value": value_str,
+            "due_amount": due_str,
             "is_overpayment": is_overpayment,
             "overpayment_amount": overpayment_amount,
             "category": m_cat.group(1),
             "is_guaranteed": False,
             "rate_name": rate_name,
+            "final_payment_date_passed": final_payment_date_passed,
         }
     # "Guaranteed Cabin" bookings have no cabin number or parenthetical
     # code at all — e.g. 'Cabin  1 - Guaranteed Cabin INTERIOR' — so this
@@ -690,14 +692,56 @@ def _extract_booking_essentials(text: str) -> dict:
     # matching needs a different strategy — see is_guaranteed flag.
     m_cat = re.search(r"Cabin\s+\d+\s*-\s*Guaranteed Cabin\s+([A-Z]+)", text or "")
     return {
-        "value": m_val.group(1) if m_val else None,
-        "due_amount": m_due.group(1) if m_due else None,
+        "value": value_str,
+        "due_amount": due_str,
         "is_overpayment": is_overpayment,
         "overpayment_amount": overpayment_amount,
         "category": m_cat.group(1) if m_cat else None,
         "is_guaranteed": bool(m_cat),
         "rate_name": rate_name,
+        "final_payment_date_passed": final_payment_date_passed,
     }
+
+
+_FINAL_PAYMENT_DATE_LINE_RE = re.compile(r"Final Payment Date\n(.+)")
+
+
+def _final_payment_date_passed(text: str) -> bool | None:
+    """Whether this booking's own Final Payment Date has already passed,
+    parsed directly from its Reservation Summary text. Returns None (not
+    False) when the field isn't present/parseable — e.g. a booking with no
+    "Final Payment Date" line at all — never assume "not passed" from
+    missing data; callers should only apply this as a gate when it comes
+    back True, same discipline as every other MSC signal in this file.
+
+    CONFIRMED REAL RULE, Neon 2026-08-24 (bookings 3000031/3000018/
+    3000017, all with a final payment date days-to-months in the past):
+    MSC — like most cruise lines — will informally price-match/reprice a
+    fare drop before final payment is due, but once that date passes the
+    fare is locked in. A booking's PRICE_MATCH check must never report an
+    opportunity once this date is behind us, the same way it already never
+    does for a paid-in-full booking (is_paid_in_full and a passed final
+    payment date are related but distinct signals — a booking can be past
+    its final payment date without being fully paid off yet).
+
+    UPGRADED 2026-08-24, same day this was written: the original regex
+    required an exact "\\d{2}/\\d{2}/\\d{4}" shape and would have silently
+    returned None (not even a wrong date — no match at all) on a real,
+    valid single-digit month/day like "8/9/2026" — the exact fragility
+    class already confirmed once on GoCCL's price regex. dateparser
+    handles that plus month-name formats without needing to keep
+    expanding a hand-rolled pattern by hand every time a new variant
+    turns up. DATE_ORDER is pinned to MDY explicitly (never left to
+    system-locale defaults) since MSC's own format is confirmed US-style
+    month/day/year — verified this resolves a genuinely ambiguous date
+    like "03/04/2026" to March 4th, not April 3rd."""
+    m = _FINAL_PAYMENT_DATE_LINE_RE.search(text or "")
+    if not m:
+        return None
+    final_payment_date = dateparser.parse(m.group(1).strip(), settings={"DATE_ORDER": "MDY"})
+    if final_payment_date is None:
+        return None
+    return datetime.now() >= final_payment_date
 
 
 # Confirmed 2026-08-10, directly stated by Neon: MSC rebooks cancelled/
@@ -721,7 +765,7 @@ def _is_placeholder_departure(text: str) -> bool:
     return bool(year) and year >= PLACEHOLDER_YEAR_THRESHOLD
 
 
-# ADDED 2026-08-12, real miss caught by Neon: booking 2000006 has a
+# ADDED 2026-08-12, real miss caught by Neon: booking 3000012 has a
 # perfectly normal departure date (09/21/2026 — nowhere near the far-
 # future placeholder threshold above), so _is_placeholder_departure
 # never flags it, but the booking IS genuinely cancelled — MSC just
@@ -760,7 +804,7 @@ def _extract_passengers(text: str) -> dict:
     appears for passengers who have a membership."""
     section_match = re.search(r"Passenger Details\n(.*?)(?:\nAdditional Items|$)", text or "", re.DOTALL)
     if not section_match:
-        return {"passengers": [], "all_seniors": False, "has_voyagers": False}
+        return {"passengers": [], "all_seniors": False, "senior_count": 0, "has_voyagers": False}
 
     lines = [l.strip() for l in section_match.group(1).split("\n") if l.strip()]
     passengers = []
@@ -791,7 +835,21 @@ def _extract_passengers(text: str) -> dict:
 
     return {
         "passengers": passengers,
+        # CONFIRMED WRONG RULE, corrected 2026-08-18 by Neon (booking
+        # 3000030 false positive): "all_seniors" (every passenger 65+)
+        # was never the real senior-discount eligibility test and is kept
+        # only as a raw descriptive fact now — do not use it to decide
+        # senior-discount eligibility. The real rule, stated directly:
+        # senior discount requires AT LEAST TWO passengers 65+ in the
+        # cabin. A single senior traveling alone does NOT qualify, even
+        # though "all passengers are seniors" is trivially true for them.
+        # Non-senior passengers alongside 2+ seniors (e.g. grandchildren)
+        # do NOT disqualify it — only the senior COUNT matters. See
+        # senior_count below and core/calculator_msc.py's
+        # _filter_out_ineligible_senior_discount, the actual eligibility
+        # gate.
         "all_seniors": bool(passengers) and all(p["age"] >= 65 for p in passengers),
+        "senior_count": sum(1 for p in passengers if p["age"] >= 65),
         "has_voyagers": any(p["voyagers_number"] for p in passengers),
     }
 
@@ -800,7 +858,7 @@ def _compute_required_occupancy(passengers: list) -> dict:
     """MSC's occupancy screen prices four independent age tiers (Adult
     18+, Child 12-17, Kids 2-11, Infant 0-1). 'Book Same Departure'
     auto-fills only the ADULT count from the real booking — confirmed
-    real bug 2026-08-12, booking 2000015 (2 adults + 3 kids ages
+    real bug 2026-08-12, booking 3000024 (2 adults + 3 kids ages
     6/8/10): the dummy landed on Adult=2/Child=0/Kids=0/Infant=0,
     silently dropping all 3 kids, so the resulting today-price was a
     2-guest quote compared against the real booking's 5-guest total —
@@ -813,7 +871,7 @@ def _compute_required_occupancy(passengers: list) -> dict:
     Kids(2-11)/Infant(0-1) slot's exact age to be selected individually
     (a second requirement discovered right after fixing the count
     alone; a correct COUNT still isn't enough to get a real price).
-    CONFIRMED REAL BUG 2026-08-12, booking 2000005: the infant tier
+    CONFIRMED REAL BUG 2026-08-12, booking 3000011: the infant tier
     needs this too (its own `#age-{cabin}-infant-{index}` select,
     options '0'/'1') — initially only child/jrchild were wired up,
     which silently left an infant-carrying booking stuck on the
@@ -844,7 +902,7 @@ def _compute_required_occupancy(passengers: list) -> dict:
 
 async def _read_occupancy(page) -> dict:
     """Read the occupancy screen's current per-tier guest counts
-    (selectors confirmed live 2026-08-12 against booking 2000015's
+    (selectors confirmed live 2026-08-12 against booking 3000024's
     staged occupancy screen: `.occupancy-control-wrap[data-target=...]
     [data-cabin="1"] .occupancy-data`)."""
     return await page.evaluate(
@@ -869,7 +927,7 @@ async def _click_occupancy(page, tier: str, action: str) -> bool:
 
 async def _select_age(page, tier: str, cabin: int, index: int, age: int) -> bool:
     """Fill one Child(12-17)/Kids(2-11) slot's age dropdown — confirmed
-    live 2026-08-12, booking 2000015: adding 3 Kids via the +/- counter
+    live 2026-08-12, booking 3000024: adding 3 Kids via the +/- counter
     alone (_click_occupancy) isn't enough, MSC also requires each slot's
     exact age selected via a `#age-{cabin}-{tier}-{index}` <select>
     (hidden behind custom styling, same 'needs force=True' pattern as
@@ -896,7 +954,7 @@ async def _fix_occupancy(page, passengers: list) -> dict:
     only actually touches anything when a real mismatch is found.
 
     SAFETY GUARD, added 2026-08-12 after a real near-miss (booking
-    2000003): an empty `passengers` list means passenger extraction
+    3000009): an empty `passengers` list means passenger extraction
     FAILED (a timing race, now separately fixed at the source in
     _stage_booking_for_confirm's wait condition) — it does NOT mean the
     booking genuinely has zero guests. Trusting it anyway computed 0
@@ -953,8 +1011,20 @@ async def _fix_occupancy(page, passengers: list) -> dict:
     }
 
 
+# CONFIRMED REAL BUG, fixed 2026-08-26: the label and type groups used to be
+# `[^\n\-]+?` — a character class that EXCLUDES the hyphen — so no amount of
+# backtracking could ever match a hyphenated discount name. This file's own
+# dropdown-detection regex treats `MIL-CIV` as a real live label (see
+# _find_discount_dropdown's /DISCOUNT|TODAY|MIL-CIV/ test), and
+# calculator_msc's _parse_rate_pct uses 'MIL-CIV-IL-DSCNT-10%' as its
+# documented example — so a real, disclosed, hyphenated discount was silently
+# absent from current_discounts, which made `already_has_any_discount` False
+# and produced a FALSE "no discount applied, add one" DISCOUNT_ADD
+# opportunity. Exactly the false-positive class this file is built to prevent.
+# `[^\n]+?` is safe here because the following `\s*-\s*Discount Type:` /
+# `\s*-\s*Discount Rate:` literals anchor where each group must stop.
 _DISCOUNT_RE = re.compile(
-    r"(MSC Club Discount|Discount Description):\s*([^\n\-]+?)\s*-\s*Discount Type:\s*([^\n\-]+?)\s*-\s*Discount Rate:\s*([\d.]+)%"
+    r"(MSC Club Discount|Discount Description):\s*([^\n]+?)\s*-\s*Discount Type:\s*([^\n]+?)\s*-\s*Discount Rate:\s*([\d.]+)%"
 )
 
 
@@ -963,7 +1033,7 @@ def _extract_discounts(breakdown_text: str) -> list:
     the Price Breakdown text into structured data, instead of only
     catching a discount when it happens to get mentioned in chat.
     Confirmed two real label formats, and a booking can have BOTH at
-    once (stacked) — e.g. booking 2000002 has 'Discount Description:
+    once (stacked) — e.g. booking 3000008 has 'Discount Description:
     SPECIAL OFFER 15% ... 15.0%' AND 'MSC Club Discount: MSCCLUB5 ...
     5.0%' as two separate lines:
       - 'MSC Club Discount: MSCCLUB5 - Discount Type: Percentage -
@@ -975,7 +1045,7 @@ def _extract_discounts(breakdown_text: str) -> list:
     elsewhere in this project) — this only extracts the individual
     components, it does not attempt to combine them.
 
-    IMPORTANT LIMITATION, confirmed against booking 2000012: this can
+    IMPORTANT LIMITATION, confirmed against booking 3000021: this can
     return [] despite a booking having a real, verified 5% senior + 5%
     Voyagers discount applied — MSC does NOT always print an explicit
     disclosure line (senior discount in particular never seems to get
@@ -1031,6 +1101,29 @@ def _extract_duration_nights(text: str):
     return int(m.group(1)) if m else None
 
 
+def _srn_reference_available(summary_text: str) -> bool:
+    """Whether STANDARD_NCF_BY_NIGHTS covers this booking's cruise
+    duration — i.e. whether _extract_discounts_with_implied could actually
+    attempt its SRN-vs-standard math for this booking, not just whether it
+    happened to find anything. Senior discount (and Voyagers Exclusive)
+    never disclose themselves explicitly, so an empty current_discounts
+    list only PROVES "no discount applied" when this comes back True; when
+    False, empty means "couldn't check," not "confirmed clean."
+
+    CONFIRMED REAL FALSE POSITIVES, 2026-08-24: bookings 3000031 (9
+    nights), 3000018 (19 nights), and 3000017 (10 nights) — none covered
+    by STANDARD_NCF_BY_NIGHTS ({3, 4, 7}) — all had senior_count >= 2
+    (genuinely eligible) and empty current_discounts, and DISCOUNT_ADD
+    confidently recommended adding SENIOR DISCOUNT on all three. Since the
+    SRN math never even ran for these lengths, that empty list never
+    proved anything — the discount could already be silently applied.
+    _check_discount_add now downgrades to INSUFFICIENT_DATA for SENIOR
+    DISCOUNT specifically when this comes back False, instead of trusting
+    an unverifiable empty list as confirmed-clean."""
+    nights = _extract_duration_nights(summary_text)
+    return nights is not None and nights in STANDARD_NCF_BY_NIGHTS
+
+
 def _extract_srn_value(breakdown_text: str):
     """Pull the first per-passenger SRN (non-commissionable fares) dollar
     amount from a Price Breakdown capture, e.g. 'SRN	Non commissionable
@@ -1056,9 +1149,9 @@ def _extract_discounts_with_implied(summary_text: str, breakdown_text: str):
     """CONFIRMED REAL GAP, closed 2026-08-11: senior discount and
     Voyagers Exclusive both NEVER print an explicit "Discount
     Description"/"MSC Club Discount" disclosure line (confirmed live on
-    booking 2000012 for senior, and booking 2000015 for Exclusive — a
+    booking 3000021 for senior, and booking 3000024 for Exclusive — a
     full-page text search for "Discount"/"Exclusiv" found nothing on
-    2000015 despite a real, confirmed 9.75% (5%+5%) discount being
+    3000024 despite a real, confirmed 9.75% (5%+5%) discount being
     genuinely applied). Relying on _extract_discounts() alone therefore
     produces false "no discount, add one" recommendations on any booking
     carrying one of these silent discounts.
@@ -1225,7 +1318,7 @@ def _extract_discount_catalog(response_body: str) -> list:
 def _is_group_rate(rate_name: str) -> bool:
     """'Group Rates' bookings use a separate block-allocation inventory
     that isn't offered at all in the individual dummy-booking search —
-    confirmed real 2026-08-10 on bookings 2000013/2000011, whose rate
+    confirmed real 2026-08-10 on bookings 3000022/3000020, whose rate
     tabs (Escape to Sea, Flash Sale, Brochure Rates, etc.) never included
     anything resembling their own "Group Rates" program. Comparing a
     Group Rates booking against ANY of those tabs is not apples-to-apples
@@ -1296,13 +1389,13 @@ def _select_matching_tab(rate_name: str, tabs: list) -> tuple:
        truncated/reworded slightly between the booking's own detail page
        and the dummy-listing tab labels.
     3. Keyword-subset match (confirmed real gap 2026-08-10, booking
-       2000014): "DRINKS AND WIFI INCLUDED" doesn't substring-match
+       3000023): "DRINKS AND WIFI INCLUDED" doesn't substring-match
        "FLASH SALE DRINKS AND WIFI", even though they're clearly the
        same product — ignore generic promotional filler words, and
        match only if EVERY one of the rate name's distinctive words
        appears in the tab's label.
     4. Amenity-signature EXACT match (confirmed real ground truth from
-       Neon 2026-08-12, booking 2000009): "BALCONY UPGRADE DRINKS
+       Neon 2026-08-12, booking 3000015): "BALCONY UPGRADE DRINKS
        WIFI" describes a category-upgrade PROMO ("balcony"/"upgrade"),
        not today's tab vocabulary at all — tier 3 fails since those
        words never appear in any tab. But the real comparable PRODUCT is
@@ -1312,7 +1405,7 @@ def _select_matching_tab(rate_name: str, tabs: list) -> tuple:
        entirely — requires an EXACT set match (not subset either
        direction), since a drinks+wifi tab is a genuinely different,
        cheaper product than a drinks+wifi+obc one (confirmed distinct
-       earlier: booking 2000004's "CRUISE WITH DRINKS WIFI OBC"
+       earlier: booking 3000010's "CRUISE WITH DRINKS WIFI OBC"
        correctly does NOT match a plain drinks+wifi tab — a partial
        overlap must never count as a match).
     5. Cruise-only-tier fallback (direct instruction from Neon
@@ -1327,7 +1420,24 @@ def _select_matching_tab(rate_name: str, tabs: list) -> tuple:
        category-upsell name, not a campaign name, but still carries no
        amenity info) matching "ESCAPE TO SEA CRUISE ONLY". More than one
        such tab is genuinely ambiguous (which specific cruise-only
-       campaign is live can vary) — don't guess which one."""
+       campaign is live can vary) — don't guess which one.
+    6. Fuzzy-similarity fallback (RapidFuzz), added 2026-08-25 — only
+       ever runs after all five tiers above found nothing AND none of
+       them already flagged an ambiguous refusal (never overrides a
+       tier's own "refusing to guess"). Catches a real, plausible gap
+       none of tiers 1-5 cover: a minor wording/typo variant (confirmed
+       real example: "SALE DRINK AND WIFI" — singular "DRINK" — against
+       tab "FLASH SALE DRINKS AND WIFI") breaks tier 3's exact-word
+       keyword-subset check AND tier 4's amenity-signature check (its
+       token set is a literal string set, "drink" != "drinks"), so it
+       fell through to "no match" before this tier existed. Only commits
+       when the best candidate's token_set_ratio is >=80 AND at least 20
+       points clear of the second-best candidate — validated by running
+       every existing test case above (including the historical "$654 vs
+       $26" and OBC-vs-non-OBC incidents) through this exact threshold
+       before adopting it: zero change to any of their outcomes, this
+       tier never even fires for them (their fuzzy scores are either
+       too low or too close together to clear the bar)."""
     if not tabs:
         return None, "no rate tabs found on this listing"
 
@@ -1393,6 +1503,29 @@ def _select_matching_tab(rate_name: str, tabs: list) -> tuple:
                 ambiguous_note = (
                     f"tier 5 (cruise-only fallback) found {len(cruise_only_candidates)} "
                     f"ambiguous candidates: {cruise_only_candidates}"
+                )
+    # Tier 6: fuzzy-similarity fallback — see this function's docstring
+    # for the validated 80%-similarity / 20-point-gap thresholds and why
+    # they were chosen. Never runs if a prior tier already found a match
+    # OR already flagged its own ambiguous refusal (ambiguous_note is
+    # only ever set when ">1" candidates tied, never when a tier simply
+    # found zero — see tiers 3/4 above).
+    if target is None and not ambiguous_note:
+        _FUZZY_SCORE_FLOOR = 80
+        _FUZZY_GAP_FLOOR = 20
+        scored = sorted(
+            ((t, fuzz.token_set_ratio(rate_name, t)) for t in candidate_tabs),
+            key=lambda pair: -pair[1],
+        )
+        if scored:
+            best_tab, best_score = scored[0]
+            second_score = scored[1][1] if len(scored) > 1 else 0
+            if best_score >= _FUZZY_SCORE_FLOOR and (best_score - second_score) >= _FUZZY_GAP_FLOOR:
+                target = best_tab
+            elif best_score >= _FUZZY_SCORE_FLOOR:
+                ambiguous_note = (
+                    f"tier 6 (fuzzy) found candidates too close to call: "
+                    f"{[(t, round(s, 1)) for t, s in scored[:3]]}"
                 )
     if target is None:
         if ambiguous_note:
@@ -1572,7 +1705,7 @@ async def _capture_msc_response(response, booking_id: str, out_path: str, state:
                     entry["response_body_truncated"] = True
             except Exception as e:
                 # Silently swallowing this before hid why response_body
-                # never showed up on a real capture (booking 2000016,
+                # never showed up on a real capture (booking 3000025,
                 # 2026-08-10) despite resource_type correctly being 'xhr' —
                 # recording the real reason instead of guessing.
                 entry["response_body_error"] = str(e)
@@ -1610,7 +1743,7 @@ async def _stage_booking_for_confirm(page, booking_id: str) -> dict:
             await page.wait_for_timeout(500)
         return await page.inner_text("body")
 
-    # CONFIRMED REAL BUG, 2026-08-12, booking 2000003: waiting for just
+    # CONFIRMED REAL BUG, 2026-08-12, booking 3000009: waiting for just
     # "Booking Value" let this proceed on an incomplete capture where the
     # Passenger Details section hadn't rendered yet — the SAME class of
     # timing bug already fixed once in _lookup_one_booking's
@@ -1689,7 +1822,7 @@ async def _stage_booking_for_confirm(page, booking_id: str) -> dict:
             "current_value": essentials["value"],
         }
 
-    # ADDED 2026-08-12, real miss caught by Neon (booking 2000006): a
+    # ADDED 2026-08-12, real miss caught by Neon (booking 3000012): a
     # plain outright cancellation, not the far-future-placeholder kind
     # above. Checked BEFORE ever clicking "Book Same Departure" — a
     # cancelled booking's $0.00 data was previously fed straight through
@@ -1726,7 +1859,7 @@ async def _stage_booking_for_confirm(page, booking_id: str) -> dict:
         after_click = await _wait_for(
             "Select Special Discounts", "Additional Discounts", "CONFIRM AND PROCEED"
         )
-        # Confirmed real false positive 2026-08-10 on booking 2000018: a
+        # Confirmed real false positive 2026-08-10 on booking 3000027: a
         # slow page load (not a genuine dead end — Neon manually clicked
         # through to a real category listing seconds later) left the poll
         # still on the original booking page, which happened to ALSO
@@ -1774,7 +1907,7 @@ async def _stage_booking_for_confirm(page, booking_id: str) -> dict:
 
         # Fix occupancy to match the real booking's passengers BEFORE
         # capturing anything price-related — see _fix_occupancy's
-        # docstring for the real bug this closes (booking 2000015,
+        # docstring for the real bug this closes (booking 3000024,
         # 2026-08-12: 3 kids silently dropped, dummy quote for 2 guests
         # got compared against the real 5-guest total).
         occupancy_fix = await _fix_occupancy(page, passenger_info["passengers"])
@@ -1838,6 +1971,7 @@ async def _stage_booking_for_confirm(page, booking_id: str) -> dict:
         "rate_name": essentials.get("rate_name"),
         "is_group_rate": _is_group_rate(essentials.get("rate_name")),
         "all_seniors": passenger_info["all_seniors"],
+        "senior_count": passenger_info["senior_count"],
         "has_voyagers": passenger_info["has_voyagers"],
         "discount_options": discount_options,
         "club_discount_offered": club_discount_offered,
@@ -1878,7 +2012,7 @@ async def _confirm_and_proceed_click(page) -> bool:
 
 def generate_discount_candidates(staged: dict) -> list:
     """From evidence ALREADY captured during staging (discount_options,
-    club_discount_offered, all_seniors, is_group_rate — see
+    club_discount_offered, senior_count, is_group_rate — see
     _stage_booking_for_confirm), produce the list of individual discount
     candidates actually worth live-testing.
 
@@ -1886,7 +2020,7 @@ def generate_discount_candidates(staged: dict) -> list:
     Voyagers together, etc.) — per the explicit instruction not to assume
     two visible discounts can be stacked, and because this project has no
     live-proven evidence yet that even a SINGLE candidate's test pipeline
-    is reliable end-to-end (the first live attempt, on 2000017, needed a
+    is reliable end-to-end (the first live attempt, on 3000026, needed a
     real bug fix before it could read a price at all). Combination
     testing is real future work (see the roadmap), not something to
     guess at today. Every candidate returned here is a single, real,
@@ -1895,7 +2029,13 @@ def generate_discount_candidates(staged: dict) -> list:
     Military discounts are never generated, matching the same hard
     policy _filter_out_disallowed_discounts already enforces in
     core/calculator_msc.py (CruiseIntel does not apply them from the agency
-    side regardless of what MSC's dropdown lists)."""
+    side regardless of what MSC's dropdown lists). Senior discount is only
+    generated when the cabin has at least 2 senior (65+) passengers —
+    confirmed hard rule, same as core/calculator_msc.py's
+    _filter_out_ineligible_senior_discount (added 2026-08-18 after a real
+    false positive on booking 3000030, a single 83-year-old traveling
+    alone: MSC's own dropdown lists SENIOR DISCOUNT regardless of party
+    composition, but it can't actually be applied to a lone senior)."""
     from core.models import MscDiscountApplicationMethod, MscDiscountCandidate
 
     if staged.get("is_group_rate"):
@@ -1905,10 +2045,12 @@ def generate_discount_candidates(staged: dict) -> list:
         # dropdown tiers — do not generate dropdown candidates for them.
         candidates = []
     else:
+        senior_count = staged.get("senior_count", 0)
         candidates = [
             MscDiscountCandidate(label=opt, method=MscDiscountApplicationMethod.DROPDOWN_OPTION)
             for opt in (staged.get("discount_options") or [])
             if "MIL-CIV" not in opt.upper() and "MILITARY" not in opt.upper()
+            and (senior_count >= 2 or "SENIOR" not in opt.upper())
         ]
 
     # Voyagers Club insertion is intentionally NOT added here — it needs
@@ -1997,7 +2139,7 @@ async def _wait_for_post_discount_price(page, category: str, is_guaranteed: bool
     required a rate/promo tab to be found (`.cs-price-code-box`) as the
     ONLY path to a price, and returned INSUFFICIENT_DATA the instant that
     specific DOM structure was absent, even though a real live test on
-    2000017 proved MSC can accept and price a discount selection while
+    3000026 proved MSC can accept and price a discount selection while
     rendering a DIFFERENT page structure with no tabs at all. Rate tabs
     are one possible validation signal, not a requirement — this tries
     multiple real, evidence-based strategies and only gives up after a
@@ -2012,7 +2154,7 @@ async def _wait_for_post_discount_price(page, category: str, is_guaranteed: bool
          present.
       2. "Total Stateroom Price: $X" — the literal, confirmed-real Price
          Breakdown line format (see this project's own forensic capture
-         of booking 2000017's breakdown_text) — a fallback in case the
+         of booking 3000026's breakdown_text) — a fallback in case the
          resulting page shows a breakdown-style total instead of (or in
          addition to) a category-listing row.
 
@@ -2049,7 +2191,7 @@ async def test_discount_candidate(state: dict, booking_id: str, candidate, page=
     price — never an assumed percentage times the current total.
 
     CONFIRMED REAL GAP this closes (forensic investigation, bookings
-    2000017/2000020): evaluate_msc_booking()'s DISCOUNT_ADD/
+    3000026/3000029): evaluate_msc_booking()'s DISCOUNT_ADD/
     DISCOUNT_TIER_UPGRADE checks only ever detect that a discount is
     ELIGIBLE — they never apply it, so a booking can show `OPPORTUNITY`
     with no dollar figure attached (DISCOUNT_ADD never sets
@@ -2062,7 +2204,7 @@ async def test_discount_candidate(state: dict, booking_id: str, candidate, page=
     recalculated price after the discount is actually selected.
 
     CONFIRMED REAL BUG, fixed 2026-08-13 (first live test, booking
-    2000017): every field was previously reset to its model default on
+    3000026): every field was previously reset to its model default on
     ANY early return, because each failure path built a brand-new
     MscDiscountTestResult from scratch. `_evidence` below accumulates
     everything actually established as the pipeline proceeds; every
@@ -2472,6 +2614,7 @@ async def _check_booking_msc(state: dict, booking_id: str, page=None) -> dict:
         "club_discount_offered": staged.get("club_discount_offered"),
         "discount_catalog": discount_catalog,
         "all_seniors": staged.get("all_seniors"),
+        "senior_count": staged.get("senior_count"),
         "has_voyagers": staged.get("has_voyagers"),
         "occupancy_fix": staged.get("occupancy_fix"),
     }
@@ -2503,7 +2646,34 @@ async def _check_booking_msc(state: dict, booking_id: str, page=None) -> dict:
     from core.calculator_msc import evaluate_msc_booking
 
     essentials = _extract_booking_essentials(booking_data["summary_text"])
-    current_discounts = _extract_discounts_with_implied(booking_data["summary_text"], booking_data.get("breakdown_text"))
+    # CONFIRMED REAL BUG, fixed 2026-08-26: this used to RE-DERIVE the
+    # discounts from `booking_data["summary_text"]`/`["breakdown_text"]`,
+    # which _lookup_one_booking deliberately TRUNCATES to 4000 chars each
+    # (see its own return dict). `breakdown_text` is `inner_text("body")` —
+    # the whole page plus the itemized per-passenger modal — so past 4000
+    # characters the `Discount Description:` / `MSC Club Discount:` /
+    # `SRN Non commissionable fares` lines get cut off. The result was an
+    # EMPTY current_discounts on a booking that really does have a
+    # disclosed discount, which makes `already_has_any_discount` False and
+    # produces a FALSE "no discount applied, add one" DISCOUNT_ADD
+    # opportunity — the 3000016 / 3000024 incident class.
+    #
+    # _lookup_one_booking ALREADY computes this correctly on the full,
+    # untruncated text and returns it as `current_discounts`. Use that
+    # instead of recomputing from the lossy copy. Falls back to the old
+    # re-derivation only if the key is genuinely absent (an older captured
+    # record replayed through msc_run_calculator.py, for instance).
+    current_discounts = booking_data.get("current_discounts")
+    if current_discounts is None:
+        logger.warning(
+            "msc.current_discounts_recomputed_from_truncated_text",
+            booking_id=booking_id,
+            note="booking_data had no precomputed current_discounts — falling back to the "
+                 "truncated summary/breakdown text, which can miss a real disclosed discount",
+        )
+        current_discounts = _extract_discounts_with_implied(
+            booking_data["summary_text"], booking_data.get("breakdown_text")
+        )
     due_amount = _parse_dollars_safe(essentials.get("due_amount"))
     result = evaluate_msc_booking(
         booking_id=booking_id,
@@ -2519,10 +2689,12 @@ async def _check_booking_msc(state: dict, booking_id: str, page=None) -> dict:
         today_discount_options=staged.get("discount_options"),
         today_discount_catalog=discount_catalog,
         has_voyagers=staged.get("has_voyagers", False),
-        all_seniors=staged.get("all_seniors", False),
+        senior_count=staged.get("senior_count", 0),
+        senior_discount_verifiable=_srn_reference_available(booking_data["summary_text"]),
         today_price_tab_confirmed=bool(rate_tab_match.get("matched")),
         is_group_rate=staged.get("is_group_rate", False),
         club_discount_offered=staged.get("club_discount_offered"),
+        final_payment_date_passed=bool(essentials.get("final_payment_date_passed")),
     )
 
     os.makedirs(os.path.dirname(LIVE_CHECK_RESULTS_PATH), exist_ok=True)
@@ -2647,13 +2819,6 @@ async def run_command(state: dict, command: str) -> str:
                     closed.append(idx)
             except Exception as e:
                 closed.append(f"{idx} FAILED: {e}")
-            # Confirmed real bug 2026-08-10: open_batch_tabs's bookkeeping
-            # dict never got cleaned up here, so closing a tab another way
-            # (this command) left a stale entry behind — the NEXT
-            # open_batch_tabs call would then report a misleadingly high
-            # "staged N tab(s)" count including tabs that no longer exist.
-            if state.get("batch_tabs", {}).pop(idx, None) is not None:
-                pass
         if active_page_closed:
             fallback = next((p for p in state["pages"] if p is not None), None)
             if fallback is not None:
@@ -2760,303 +2925,19 @@ async def run_command(state: dict, command: str) -> str:
         preview = (data.get("listing_text") or data.get("booking_text") or "")[:800]
         return f"saved rate check for {booking_id}\n---\n{preview}"
 
-    if command.startswith("stage_booking:"):
-        booking_id = command[len("stage_booking:"):].strip()
-        # Confirmed real bug 2026-08-10: the OLD open_batch_tabs flow
-        # attached a NEW page.on("response", ...) listener per booking,
-        # each closing over that booking's id — since this single-tab
-        # flow reuses the SAME page across many bookings, that pattern
-        # would stack an ever-growing pile of stale listeners, each still
-        # tagging fresh responses with whatever booking_id it was created
-        # with. Fixed by attaching exactly ONE listener per page (tracked
-        # here) that reads the CURRENT booking id from state at call
-        # time, instead of a value frozen into the closure.
-        state["current_staging_booking_id"] = booking_id
-        # Same staleness fix as _check_booking_msc above — clear any
-        # earlier check's leftover catalog entry before this booking's
-        # own fresh staging begins.
-        state.setdefault("discount_catalog_by_booking", {}).pop(booking_id, None)
-        attached_pages = state.setdefault("capture_listener_attached_pages", set())
-        if id(page) not in attached_pages:
-            os.makedirs(os.path.dirname(NETWORK_CAPTURE_PATH), exist_ok=True)
-            page.on(
-                "response",
-                lambda r: track_background_task(
-                    state.setdefault("_background_tasks", set()),
-                    asyncio.create_task(
-                        _capture_msc_response(
-                            r, state.get("current_staging_booking_id", "unknown"), NETWORK_CAPTURE_PATH, state
-                        )
-                    ),
-                ),
-            )
-            attached_pages.add(id(page))
-        staged = await _stage_booking_for_confirm(page, booking_id)
-        # DiscountPaxTypeCmd fires as part of the same page load that
-        # _stage_booking_for_confirm already waited through, but its
-        # capture (an async fire-and-forget listener) can lag slightly
-        # behind that function returning — poll briefly rather than
-        # assuming it's already landed in state.
-        if staged.get("status") == "staged":
-            for _ in range(6):
-                if (state.get("discount_catalog_by_booking") or {}).get(booking_id):
-                    break
-                await page.wait_for_timeout(500)
-            staged["discount_catalog"] = (state.get("discount_catalog_by_booking") or {}).get(booking_id)
-        state["staged"] = staged
-        if staged.get("status") == "session_expired":
-            return f"{booking_id}: SESSION EXPIRED — run relogin, then try stage_booking again"
-        if not staged.get("found"):
-            return f"{booking_id}: NOT FOUND"
-        if staged.get("status") == "cancelled_or_postponed_placeholder":
-            return (
-                f"{booking_id}: SKIPPED — departure year {staged.get('departure_year')} is a "
-                f"placeholder date, this sailing is cancelled/postponed"
-            )
-        if staged.get("status") == "explicitly_cancelled":
-            return f"{booking_id}: SKIPPED — booking status is CANCELED (confirmed via status word / REINSTATE BOOKING button)"
-        if staged.get("status") == "fcc_placeholder_rebooking":
-            return f"{booking_id}: SKIPPED — cancelled sailing rebooked to a Future Cruise Credit placeholder"
-        if staged.get("status") == "advance_failed":
-            return f"{booking_id}: SKIPPED — 'Book Same Departure' click didn't advance, needs a manual look"
-        group_note = (
-            " [GROUP RATE — no individual-search tab will match this, comparison won't be apples-to-apples]"
-            if staged.get("is_group_rate") else ""
-        )
-        occ = staged.get("occupancy_fix")
-        occ_note = f" [occupancy corrected {occ['before']} -> {occ['after']}]" if occ and occ.get("adjusted") else ""
-        if occ and occ.get("stalled"):
-            occ_note += " [WARNING: occupancy fix stalled before reaching the required count — verify manually]"
-        if occ and occ.get("skipped_empty_passengers"):
-            occ_note += " [WARNING: passenger extraction returned empty — occupancy NOT verified, verify manually]"
-        return (
-            f"{booking_id}: category={staged['category']} current_value=${staged['current_value']} "
-            f"rate={staged.get('rate_name')!r}{group_note}{occ_note} — ready, click CONFIRM AND PROCEED, "
-            f"then run harvest_staged_booking"
-        )
+    # REMOVED 2026-08-14: the legacy manual multi-tab flow (stage_booking /
+    # harvest_staged_booking / open_batch_tabs / harvest_batch_tabs) required
+    # Neon to manually click "CONFIRM AND PROCEED" between staging and
+    # harvesting every booking -- exactly the human-in-the-loop "watch then
+    # review" step this project has moved away from. The fully automated
+    # check_booking / check_booking_batch / check_booking_batch2 commands
+    # below (added 2026-08-11) do lookup -> stage -> confirm -> harvest ->
+    # evaluate in one call with zero human clicks and have been the
+    # recommended flow since; this dispatcher no longer exposes the manual
+    # commands at all. Their underlying helpers (_stage_booking_for_confirm,
+    # _confirm_and_proceed_click, _match_rate_tab, etc.) are unchanged and
+    # still power the automated flow.
 
-    if command == "harvest_staged_booking":
-        staged = state.get("staged")
-        if not staged or staged.get("status") != "staged":
-            return "ERROR: no booking currently staged — run stage_booking:<id> first"
-        booking_id = staged["booking_id"]
-        category = staged["category"]
-        rate_name = staged.get("rate_name")
-
-        listing_text = await page.inner_text("body")
-        if "CRU_034" in listing_text or "No data found for the given input" in listing_text:
-            record = {
-                "booking_id": booking_id,
-                "captured_at": datetime.now().isoformat(),
-                "found": True,
-                "category": category,
-                "current_value": staged["current_value"],
-                "today_price_same_category": None,
-                "listing_text": listing_text[:4000],
-                "listing_confirmed": False,
-                "status": "sailing_already_departed_or_no_data",
-            }
-            os.makedirs(os.path.dirname(RATE_CHECK_DATA_PATH), exist_ok=True)
-            with open(RATE_CHECK_DATA_PATH, "a", encoding="utf-8") as f:
-                f.write(json.dumps(record, ensure_ascii=False) + "\n")
-            state["staged"] = None
-            return f"{booking_id}: sailing already departed / no data (CRU_034)"
-
-        rate_tab_match = None
-        if staged.get("is_group_rate"):
-            rate_tab_match = {"matched": False, "reason": "Group Rate booking — no individual-search tab exists", "active_tab": None}
-        else:
-            rate_tab_match = await _match_rate_tab(page, rate_name)
-            if rate_tab_match["matched"]:
-                listing_text = await page.inner_text("body")  # re-read after the tab switch changed prices
-
-        today_price = _find_today_price(listing_text, category, staged.get("is_guaranteed", False))
-        listing_confirmed = "Select the Offer" in listing_text or "Prices are per stateroom" in listing_text
-        record = {
-            "booking_id": booking_id,
-            "captured_at": datetime.now().isoformat(),
-            "found": True,
-            "category": category,
-            "current_value": staged["current_value"],
-            "rate_name": rate_name,
-            "is_group_rate": staged.get("is_group_rate", False),
-            "rate_tab_match": rate_tab_match,
-            "today_price_same_category": today_price,
-            "listing_text": listing_text[:4000],
-            "listing_confirmed": listing_confirmed,
-            "discount_options": staged.get("discount_options"),
-            "club_discount_offered": staged.get("club_discount_offered"),
-            # The real backend discount catalog for this sailing (see
-            # _extract_discount_catalog) — this is what reveals a
-            # per-sailing "Voyagers Selection" promo (MSVG10W/MSVG15W)
-            # that the discount_options dropdown-scrape above never
-            # would, since that promo renders in the crown modal instead.
-            "discount_catalog": staged.get("discount_catalog"),
-            "all_seniors": staged.get("all_seniors"),
-            "has_voyagers": staged.get("has_voyagers"),
-        }
-        os.makedirs(os.path.dirname(RATE_CHECK_DATA_PATH), exist_ok=True)
-        with open(RATE_CHECK_DATA_PATH, "a", encoding="utf-8") as f:
-            f.write(json.dumps(record, ensure_ascii=False) + "\n")
-        state["staged"] = None
-        match_note = (
-            f"tab matched: {rate_tab_match['active_tab']!r}" if rate_tab_match.get("matched")
-            else f"NO TAB MATCH ({rate_tab_match.get('reason')}) — price may not be apples-to-apples"
-        )
-        return (
-            f"{booking_id} (cat {category}): current=${staged['current_value']} today=${today_price} "
-            f"confirmed={listing_confirmed} | {match_note}"
-        )
-
-    if command.startswith("open_batch_tabs:"):
-        ids = [b.strip() for b in command[len("open_batch_tabs:"):].split(",") if b.strip()]
-        # Lowered from 2 to 1 after a confirmed real incident 2026-08-10:
-        # two concurrent tabs triggered a genuine server-side cookie
-        # conflict (_ERR_INVALID_COOKIE) that silently corrupted a tab's
-        # content (showed an unrelated sailing/passenger, no visible
-        # error). Prefer stage_booking/harvest_staged_booking (single-tab,
-        # immune to this) for any new work — this command is kept only
-        # for reference/comparison.
-        MAX_BATCH_TABS = 1
-        if len(ids) > MAX_BATCH_TABS:
-            return (
-                f"ERROR: {len(ids)} ids requested, max is {MAX_BATCH_TABS} tab at once "
-                f"(confirmed cookie-conflict risk with more than one — use stage_booking/"
-                f"harvest_staged_booking instead for real batch work)"
-            )
-        os.makedirs(os.path.dirname(NETWORK_CAPTURE_PATH), exist_ok=True)
-        state.setdefault("batch_tabs", {})
-        results = []
-        for booking_id in ids:
-            try:
-                new_page = await state["context"].new_page()
-                state["pages"].append(new_page)
-                tab_index = len(state["pages"]) - 1
-                new_page.on(
-                    "response",
-                    lambda r, bid=booking_id: track_background_task(
-                        state.setdefault("_background_tasks", set()),
-                        asyncio.create_task(
-                            _capture_msc_response(r, bid, NETWORK_CAPTURE_PATH)
-                        ),
-                    ),
-                )
-                staged = await _stage_booking_for_confirm(new_page, booking_id)
-                if staged.get("status") == "session_expired":
-                    results.append(
-                        f"tab[{tab_index}] {booking_id}: SESSION EXPIRED — Neon needs to log back in "
-                        f"in the main browser window before any more lookups will work"
-                    )
-                    await new_page.close()
-                    break  # every remaining id would fail the same way — stop wasting tabs/time
-                if not staged["found"]:
-                    results.append(f"tab[{tab_index}] {booking_id}: NOT FOUND")
-                    await new_page.close()
-                elif staged.get("status") == "cancelled_or_postponed_placeholder":
-                    results.append(
-                        f"tab[{tab_index}] {booking_id}: SKIPPED — departure year "
-                        f"{staged.get('departure_year')} is a placeholder date, this sailing is "
-                        f"cancelled/postponed, nothing to check here"
-                    )
-                    await new_page.close()
-                elif staged.get("status") == "fcc_placeholder_rebooking":
-                    results.append(
-                        f"tab[{tab_index}] {booking_id}: SKIPPED — this is a cancelled sailing "
-                        f"rebooked to a Future Cruise Credit placeholder date, nothing to check here"
-                    )
-                    await new_page.close()
-                elif staged.get("status") == "advance_failed":
-                    results.append(
-                        f"tab[{tab_index}] {booking_id}: SKIPPED — 'Book Same Departure' click "
-                        f"didn't advance the page for an unexplained reason, needs a manual look"
-                    )
-                    await new_page.close()
-                else:
-                    state["batch_tabs"][tab_index] = staged
-                    results.append(
-                        f"tab[{tab_index}] {booking_id}: category={staged['category']} "
-                        f"current_value=${staged['current_value']} — ready, click CONFIRM AND PROCEED"
-                    )
-            except Exception as e:
-                results.append(f"FAIL {booking_id}: {e}")
-        # leave the ORIGINAL tab as the active one so Neon isn't fighting
-        # over focus with whichever tab this loop last touched
-        state["page"] = state["pages"][0]
-        return (
-            f"staged {len(state['batch_tabs'])} tab(s), ready for your click:\n"
-            + "\n".join(results)
-            + "\n\nClick CONFIRM AND PROCEED in each tab, then run harvest_batch_tabs."
-        )
-
-    if command == "harvest_batch_tabs":
-        batch_tabs = state.get("batch_tabs") or {}
-        if not batch_tabs:
-            return "ERROR: no staged tabs — run open_batch_tabs first"
-        os.makedirs(os.path.dirname(RATE_CHECK_DATA_PATH), exist_ok=True)
-        results = []
-        for tab_index, staged in batch_tabs.items():
-            booking_id = staged["booking_id"]
-            category = staged["category"]
-            try:
-                tab_page = state["pages"][tab_index]
-                listing_text = await tab_page.inner_text("body")
-                # A dummy check on a sailing that already departed comes back
-                # with this exact backend error instead of a category listing
-                # — real MSC behavior, not a tooling bug, so label it plainly
-                # rather than leaving it looking like an unconfirmed capture.
-                if "CRU_034" in listing_text or "No data found for the given input" in listing_text:
-                    record = {
-                        "booking_id": booking_id,
-                        "captured_at": datetime.now().isoformat(),
-                        "found": True,
-                        "category": category,
-                        "current_value": staged["current_value"],
-                        "today_price_same_category": None,
-                        "listing_text": listing_text[:4000],
-                        "listing_confirmed": False,
-                        "status": "sailing_already_departed_or_no_data",
-                    }
-                    result_line = f"{booking_id}: sailing already departed / no data (CRU_034)"
-                else:
-                    today_price = _find_today_price(
-                        listing_text, category, staged.get("is_guaranteed", False)
-                    )
-                    record = {
-                        "booking_id": booking_id,
-                        "captured_at": datetime.now().isoformat(),
-                        "found": True,
-                        "category": category,
-                        "current_value": staged["current_value"],
-                        "today_price_same_category": today_price,
-                        "listing_text": listing_text[:4000],
-                        "listing_confirmed": "Select the Offer" in listing_text or "Prices are per stateroom" in listing_text,
-                        # Passed through from staging (captured before the
-                        # Confirm click) — needed by calculator_msc.py.
-                        "discount_options": staged.get("discount_options"),
-                        "club_discount_offered": staged.get("club_discount_offered"),
-                        "all_seniors": staged.get("all_seniors"),
-                        "has_voyagers": staged.get("has_voyagers"),
-                    }
-                    result_line = (
-                        f"{booking_id} (cat {category}): current=${staged['current_value']} "
-                        f"today=${today_price} confirmed={record['listing_confirmed']}"
-                    )
-                with open(RATE_CHECK_DATA_PATH, "a", encoding="utf-8") as f:
-                    f.write(json.dumps(record, ensure_ascii=False) + "\n")
-                results.append(result_line)
-            except Exception as e:
-                results.append(f"FAIL {booking_id}: {e}")
-            finally:
-                # Free the memory immediately — Neon's machine is RAM-limited
-                # and runs other work alongside this, no reason to keep a
-                # harvested tab open.
-                try:
-                    await state["pages"][tab_index].close()
-                    state["pages"][tab_index] = None
-                except Exception:
-                    pass
-        state["batch_tabs"] = {}
-        return f"harvested {len(results)} tab(s), saved to {RATE_CHECK_DATA_PATH}:\n" + "\n".join(results)
 
     if command == "confirm_and_proceed":
         # Historically restricted to Neon's own confirm_and_proceed.ps1

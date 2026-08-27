@@ -157,6 +157,92 @@ def _load_watchlist(path: str) -> list[str]:
     return booking_ids
 
 
+def remove_paid_in_full_from_watchlist(path: str, results) -> list[str]:
+    """Remove bookings CONFIRMED PAID_IN_FULL from a watchlist file, so a
+    booking that's already paid off stops being re-checked on every future
+    run/pass.
+
+    Only ever removes a booking whose result status is exactly
+    BookingStatus.PAID_IN_FULL — never on ERROR, never on a guess, and
+    never for a booking this run didn't actually check. Preserves
+    comments/blank lines and the order/formatting of every other line
+    untouched. Returns the list of booking IDs actually removed (empty if
+    none were).
+    """
+    paid_in_full_ids = {r.booking_id for r in results if r.status.value == "PAID_IN_FULL"}
+    if not paid_in_full_ids:
+        return []
+
+    with open(path, "r", encoding="utf-8") as f:
+        lines = f.readlines()
+
+    removed: list[str] = []
+    kept_lines: list[str] = []
+    for line in lines:
+        stripped = line.strip()
+        if stripped and not stripped.startswith("#") and stripped in paid_in_full_ids:
+            removed.append(stripped)
+            continue
+        kept_lines.append(line)
+
+    if removed:
+        # CONFIRMED CRITICAL RISK, fixed 2026-08-26: this used to write the
+        # file in place with `open(path, "w")`, which TRUNCATES to zero bytes
+        # immediately and only then writes the kept lines back. A Ctrl+C,
+        # process kill, power loss, or disk-full between those two moments
+        # left `watchlist.txt` empty or half-written — i.e. the entire client
+        # watchlist destroyed. That was a live risk, not a theoretical one:
+        # this function runs inside run_persistent_watchlist_scan.py's hot
+        # loop (every scan), and Ctrl+C is the documented way to stop that
+        # script. Now written atomically: full content to a temp file in the
+        # SAME directory (so os.replace can't cross a filesystem boundary),
+        # flushed and fsync'd so the bytes are really on disk, then
+        # os.replace() — which is atomic on both Windows and POSIX, so any
+        # interruption leaves the ORIGINAL file fully intact.
+        import os
+        import tempfile
+
+        directory = os.path.dirname(os.path.abspath(path))
+        # Keep a rolling one-deep backup before replacing, so even a logic
+        # error here (removing something it shouldn't) is recoverable.
+        try:
+            import shutil
+            shutil.copy2(path, path + ".bak")
+        except Exception:
+            pass  # a missing backup must never block the real write
+
+        fd, tmp_path = tempfile.mkstemp(dir=directory, prefix=".watchlist_", suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.writelines(kept_lines)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_path, path)
+        except Exception:
+            try:
+                os.unlink(tmp_path)
+            except Exception:
+                pass
+            raise
+
+        # AUDIT TRAIL, added 2026-08-26: nothing anywhere used to record
+        # WHICH bookings were dropped or when — callers only printed the
+        # list, so a wrong PAID_IN_FULL determination silently and
+        # permanently removed a real client booking from all future scans
+        # with no way to find out what was lost. Appended (never rewritten)
+        # next to the watchlist itself.
+        try:
+            from datetime import datetime, timezone
+            stamp = datetime.now(timezone.utc).isoformat()
+            with open(path + ".removals.log", "a", encoding="utf-8") as log:
+                for booking_id in removed:
+                    log.write(f"{stamp}\t{booking_id}\tPAID_IN_FULL\n")
+        except Exception:
+            pass  # an audit-log failure must never lose the real removal
+
+    return removed
+
+
 async def _run_scan(args):
     from config.settings import settings
     from core.calculator import total_optimization_savings
@@ -249,17 +335,46 @@ async def _run_scan(args):
                 print(f"     {r.note}")
         print()
 
+    # EXPORTS FIRST, watchlist mutation LAST — reordered 2026-08-26. This
+    # path used to prune the watchlist BEFORE writing the reports, so any
+    # failure in the file read/write (a non-UTF-8 hand edit, a permissions
+    # problem, the atomic-write path erroring) propagated and the
+    # just-completed scan's CSV and Excel were NEVER WRITTEN, even though
+    # every result was sitting in memory. The `watch` path and
+    # run_persistent_watchlist_scan.py already had this order right; only
+    # `scan` had it backwards. Reports are the deliverable — write them
+    # before touching anything mutable.
+
     # CSV export
     if args.output:
-        csv_content = export_results_csv(job.results)
-        with open(args.output, "w", encoding="utf-8") as f:
-            f.write(csv_content)
-        print(f"\n📁 CSV saved to: {args.output}")
+        try:
+            csv_content = export_results_csv(job.results)
+            with open(args.output, "w", encoding="utf-8") as f:
+                f.write(csv_content)
+            print(f"\n📁 CSV saved to: {args.output}")
+        except Exception as e:
+            print(f"\n⚠  CSV export FAILED (results are still in the database): {e}")
 
     # Excel export
     if args.excel:
-        export_results_excel(job.results, args.excel)
-        print(f"📊 Excel report saved to: {args.excel}")
+        try:
+            export_results_excel(job.results, args.excel)
+            print(f"📊 Excel report saved to: {args.excel}")
+        except Exception as e:
+            print(f"⚠  Excel export FAILED (often: the file is open in Excel). "
+                  f"Results are still in the database. {e}")
+
+    # Confirmed paid-in-full bookings don't need to be re-checked next
+    # time — only removes from the watchlist FILE, never the bookings.txt
+    # source when --bookings was used directly (comma list has no file to
+    # edit).
+    if args.bookings_file:
+        try:
+            removed = remove_paid_in_full_from_watchlist(args.bookings_file, job.results)
+            if removed:
+                print(f"💳 Removed {len(removed)} paid-in-full booking(s) from {args.bookings_file}: {', '.join(removed)}\n")
+        except Exception as e:
+            print(f"⚠  Could not prune paid-in-full bookings from {args.bookings_file}: {e}")
 
     # Summary
     opts = [r for r in job.results if r.status.value == "OPTIMIZATION"]
@@ -358,9 +473,31 @@ async def _run_watch(args):
                 with open(alerts_path, "a", encoding="utf-8") as f:
                     for r in hits:
                         icon = "✅" if r.status.value == "OPTIMIZATION" else "⚠️"
-                        line = f"{started.isoformat()}Z  {r.status.value:12s}  {r.booking_id:12s}  ${r.net_saving:>10.2f}  {r.note}"
+                        # FIXED 2026-08-26: `started` is already
+                        # timezone-aware (datetime.now(timezone.utc)), so
+                        # isoformat() emits the +00:00 offset and appending a
+                        # literal "Z" on top produced
+                        # "2026-08-26T16:04:47.018913+00:00Z" — not valid
+                        # ISO-8601/RFC-3339, which datetime.fromisoformat()
+                        # and every standard parser reject. Every alert line
+                        # ever written to alerts.log was unparseable. The
+                        # offset already conveys UTC; the "Z" was redundant
+                        # AND wrong.
+                        line = f"{started.isoformat()}  {r.status.value:12s}  {r.booking_id:12s}  ${r.net_saving:>10.2f}  {r.note}"
                         f.write(line + "\n")
                         print(f"   {icon} {r.booking_id}: {r.status.value} — ${r.net_saving:.2f}")
+
+            # Confirmed paid-in-full bookings don't need to be re-checked on
+            # a later pass of THIS SAME watch run — drop them from the
+            # in-memory list too, not just the file, so an overnight watch
+            # stops burning time re-confirming a booking that's already
+            # paid off.
+            if args.bookings_file:
+                removed = remove_paid_in_full_from_watchlist(args.bookings_file, job.results)
+                if removed:
+                    print(f"   💳 Removed {len(removed)} paid-in-full booking(s) from {args.bookings_file}: {', '.join(removed)}")
+                    removed_set = set(removed)
+                    booking_ids = [b for b in booking_ids if b not in removed_set]
 
             if deadline and time.monotonic() >= deadline:
                 print("\n⏰ Duration reached — stopping watch.")

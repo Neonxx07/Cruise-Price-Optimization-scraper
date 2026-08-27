@@ -24,6 +24,8 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 
+from glom import Coalesce, glom
+
 from config.settings import settings
 from core.calculator import calculate_goccl, make_error_result
 from core.models import BookingResult, CruiseLine
@@ -32,6 +34,61 @@ from utils.logging import get_logger
 from .base import BaseScraper, is_dead_browser_error
 
 logger = get_logger(__name__)
+
+# CONFIRMED REAL GAP, 2026-08-25: no live GoCCL capture has ever confirmed a
+# real per-booking guest-count/occupancy field anywhere in window.initialData
+# (see read_current_price_and_selection's own docstring below and
+# core/calculator.py's calculate_goccl guests_count_verified handling) --
+# every real call site today falls back to a global default. These are
+# PLAUSIBLE, UNCONFIRMED candidate paths based on common booking-JSON naming
+# conventions -- NOT a claim that any of them is real. Coalesce tries each in
+# order and returns whichever resolves first, or its default (None) if none
+# do -- this NEVER fabricates a guest count; it only surfaces one IF a real
+# field happens to exist under one of these names, for a human to confirm
+# against the dump this now captures (see check_booking's dump_raw call).
+# If a real path is ever confirmed against live data, promote it to
+# read_current_price_and_selection's actual return value and set
+# guests_count_verified=True at the real call site -- do not do that here.
+_GUEST_COUNT_CANDIDATE_PATHS = [
+    Coalesce("guestCount", default=None),
+    Coalesce("numGuests", default=None),
+    Coalesce("occupancy.total", default=None),
+    Coalesce("occupancy.guestCount", default=None),
+    Coalesce("stateroom.occupancy.total", default=None),
+    Coalesce(("passengers", len), default=None),
+    Coalesce(("guests", len), default=None),
+    Coalesce("booking.guestCount", default=None),
+]
+_GUEST_COUNT_CANDIDATE_NAMES = [
+    "guestCount", "numGuests", "occupancy.total", "occupancy.guestCount",
+    "stateroom.occupancy.total", "passengers (count)", "guests (count)",
+    "booking.guestCount",
+]
+
+
+def _probe_guest_count_candidates(data: dict) -> dict:
+    """Safely try every candidate path above against a real
+    window.initialData capture, returning only the ones that actually
+    resolved to something — never raises, never guesses which (if any)
+    is the real field. Purely diagnostic: NOT wired into guests_count or
+    guests_count_verified anywhere. Look at this dict in a real capture
+    (data/raw_responses.jsonl or a raw dump) to find out whether any of
+    these paths is real before ever trusting one."""
+    found = {}
+    for name, spec in zip(_GUEST_COUNT_CANDIDATE_NAMES, _GUEST_COUNT_CANDIDATE_PATHS):
+        try:
+            value = glom(data, spec)
+        except Exception:
+            # Broad on purpose: this is a best-effort diagnostic probe over
+            # an unconfirmed JSON shape, not a decision input -- a
+            # malformed candidate path (e.g. `len()` on a None where a
+            # list was hoped for) must never crash the scrape, and
+            # Coalesce's own default only covers its own "not found" case,
+            # not every possible shape mismatch further down a path.
+            continue
+        if value is not None:
+            found[name] = value
+    return found
 
 # Guests count matters: the category table shows "Average Per Person," but
 # the review screen's GROSS AMOUNT is the full per-cabin total (guests x
@@ -141,6 +198,14 @@ class GoCCLScraper(BaseScraper):
             "current_offer_code": rate.get("code") or "",
             "current_category": category.get("code") or "",
             "current_stateroom_type": stateroom_type.get("name") or "",
+            # Diagnostic only, see _probe_guest_count_candidates above -- not
+            # used for guests_count/guests_count_verified anywhere.
+            "guest_count_candidates": _probe_guest_count_candidates(data),
+            # Full raw blob, captured (2026-08-25) so a future real
+            # occupancy field can actually be found and confirmed against
+            # this booking's own real data instead of guessed — previously
+            # only the four narrow fields above were ever dumped.
+            "_raw_initial_data": data,
         }
 
     async def open_modify_booking(self) -> None:
@@ -256,6 +321,21 @@ class GoCCLScraper(BaseScraper):
             self.log_action(
                 "read_offer_code_comparison", booking_id=booking_id, count=len(offer_codes),
             )
+
+            # See _probe_guest_count_candidates -- surfaced loudly (not just
+            # buried in the raw dump) the first time any candidate path ever
+            # resolves to something real, so it actually gets noticed and
+            # checked rather than sitting unread in a JSONL file.
+            guest_candidates = current.get("guest_count_candidates") or {}
+            if guest_candidates:
+                logger.warning(
+                    "goccl.guest_count_candidate_found", booking_id=booking_id,
+                    candidates=guest_candidates,
+                )
+                self.log_action(
+                    "guest_count_candidate_found", booking_id=booking_id,
+                    candidates=guest_candidates,
+                )
 
             if capture_market_data:
                 self.last_market_data = {

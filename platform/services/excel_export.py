@@ -20,7 +20,7 @@ COLS = [
     "Old Total ($)", "New Total ($)", "Price Drop ($)", "OBC Change ($)",
     "Net Saving ($)", "Category", "New Category", "Note",
     "Lost Packages", "Lost Fares", "Re-addable Fares", "Gained Fares",
-    "Checked At",
+    "Lost Travel Protection", "Promos Before", "Promos After", "Checked At",
 ]
 
 _FILLS = {
@@ -50,7 +50,7 @@ _THIN = Border(
     left=Side(style="thin"), right=Side(style="thin"),
     top=Side(style="thin"), bottom=Side(style="thin"),
 )
-_COL_WIDTHS = [14, 12, 14, 10, 13, 13, 13, 13, 13, 10, 12, 30, 24, 24, 24, 24, 20]
+_COL_WIDTHS = [14, 12, 14, 10, 13, 13, 13, 13, 13, 10, 12, 30, 24, 24, 24, 24, 24, 30, 30, 20]
 
 
 def _row(r: BookingResult) -> list:
@@ -71,6 +71,9 @@ def _row(r: BookingResult) -> list:
         " | ".join(r.lost_fares),
         " | ".join(r.re_addable_fares),
         " | ".join(r.gained_fares),
+        " | ".join(r.lost_travel_protection),
+        r.old_promos,
+        r.new_promos,
         r.checked_at.isoformat() if r.checked_at else "",
     ]
 

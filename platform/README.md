@@ -1,6 +1,6 @@
 # Cruise Intelligence System
 
-> Enterprise-grade repricing intelligence for Royal Caribbean, Celebrity, Norwegian, Carnival & MSC Cruises.
+> Enterprise-grade repricing intelligence for Royal Caribbean, Celebrity & Norwegian Cruise Line.
 
 Evolved from the CruiseIntel Chrome Extension into a scalable, production-ready Python system.
 
@@ -17,14 +17,10 @@ Evolved from the CruiseIntel Chrome Extension into a scalable, production-ready 
 │   (orchestration + persist)      │     (TTL-based)         │
 ├───────────────────┬──────────────┴─────────────────────────┤
 │                     │                                        │
-│  ┌───────────┐ ┌─────────┐ ┌─────────┐ ┌──────────────┐    │
-│  │ ESPRESSO  │ │   NCL   │ │  GoCCL  │ │  MSC (via    │    │
-│  │  Scraper  │ │ Scraper │ │ Scraper │ │  session     │    │
-│  │           │ │         │ │         │ │  controller) │    │
-│  └───────────┘ └─────────┘ └─────────┘ └──────────────┘    │
-│         all Playwright-driven; MSC uses a long-lived         │
-│         browser session + command dispatch, not a            │
-│         one-shot scrape (see DOCUMENTATION.md)                │
+│  ┌─────────────┐   │   ┌──────────────┐                    │
+│  │  ESPRESSO   │   │   │     NCL      │                    │
+│  │  Scraper    │   │   │   Scraper    │  ← Playwright      │
+│  └─────────────┘   │   └──────────────┘                    │
 │                     │                                        │
 ├─────────────────────┴────────────────────────────────────────┤
 │              Price Calculator + Confidence Scorer             │
@@ -66,17 +62,8 @@ python main.py api
 ### 4. Run a CLI Scan
 
 ```bash
-python main.py scan --bookings "1234567,7654321" --cruise-line ESPRESSO -o results.csv
+python main.py scan --bookings "4097990,64756965" --cruise-line ESPRESSO -o results.csv
 ```
-
-### 5. MSC Cruises (separate workflow)
-
-MSC never allows a direct in-portal reprice, so it isn't driven through `main.py scan` —
-instead `msc_session_controller.py` keeps one long-lived browser session open and
-`msc_commands.py` dispatches read-only lookup/check commands against it (see
-`DOCUMENTATION.md`'s "MSC Cruises Reference" section for the full flow). Credentials
-are stored via `msc_save_credentials.py` using the OS credential manager (`keyring`),
-never in a file.
 
 ---
 
@@ -98,13 +85,8 @@ never in a file.
 ## Project Structure
 
 ```
-├── core/               # Business logic (calculator, calculator_msc, confidence, models)
-├── scraper/            # Playwright scrapers (ESPRESSO, NCL, GoCCL)
-├── msc_session_controller.py  # Long-lived MSC browser session
-├── msc_commands.py            # MSC command dispatch (lookup/check/discount parsing)
-├── msc_save_credentials.py / msc_clear_credentials.py  # OS credential manager setup
-├── msc_run_calculator.py      # Offline reprocessing of captured MSC data
-├── msc_dedupe_data.py         # Collapse captured MSC data to latest-per-booking
+├── core/               # Business logic (calculator, confidence, models)
+├── scraper/            # Playwright scrapers (ESPRESSO, NCL)
 ├── api/                # FastAPI server + routes
 ├── services/           # Orchestration, caching, CSV export
 ├── models/             # SQLAlchemy database models

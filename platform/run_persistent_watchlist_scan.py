@@ -24,6 +24,7 @@ from datetime import datetime
 from config.settings import settings
 from core.calculator import total_optimization_savings
 from core.models import CruiseLine
+from main import remove_paid_in_full_from_watchlist
 from models.database import init_db
 from services.booking_service import BookingService
 from services.csv_export import export_results_csv
@@ -68,6 +69,21 @@ async def run_one_scan(service: BookingService, booking_ids: list[str]) -> None:
         capture_market_data=True,
         capture_everything=True,
         keep_browser_open=True,
+        # CONFIRMED REAL BUG, fixed 2026-08-26: this was MISSING, so it
+        # defaulted to False — directly contradicting this same file's own
+        # comment further down claiming "watch-runs specifically pass
+        # bypass_cache=True anyway." Only main.py's `watch` subcommand and
+        # the GUI's "force live recheck" actually passed it.
+        #
+        # Why it matters: this script's entire purpose is "edit
+        # watchlist.txt → rescan." With the cache live, any booking that
+        # returned NO_SAVING in the previous 12 hours was served from cache
+        # as SKIPPED_TODAY and NEVER checked against the portal — so a real
+        # price drop landing an hour after a NO_SAVING was invisible until
+        # the TTL lapsed. Worse, a cache hit `continue`s before any DB
+        # write, so there was no record of the skip either (confirmed: zero
+        # SKIPPED_TODAY rows exist across 4,002 real booking rows).
+        bypass_cache=True,
     )
 
     while job.status.value in ("PENDING", "RUNNING"):
@@ -104,18 +120,52 @@ async def run_one_scan(service: BookingService, booking_ids: list[str]) -> None:
                 print(f"     {r.note}")
         print()
 
+    # HARDENED 2026-08-26: every step below used to run bare, so a single
+    # PermissionError from `wb.save()` — the NORMAL state when the operator
+    # has yesterday's report open in Excel — propagated out of run_one_scan,
+    # out of main(), and killed THE ENTIRE PERSISTENT PROCESS, taking the
+    # logged-in browser session with it. That meant the just-completed
+    # scan's reports were lost AND the operator had to redo the manual
+    # MFA login. A missing `reports/` directory did the same (main.py
+    # mkdirs it; this script never did). Each step is now independently
+    # guarded — a report-writing failure must never cost the session.
+    from pathlib import Path
+    try:
+        Path("reports").mkdir(parents=True, exist_ok=True)
+    except Exception as e:
+        print(f"⚠  Could not create reports/ directory: {e}")
+
     csv_path = f"reports/report_{stamp}_watchlist.csv"
     xlsx_path = f"reports/report_{stamp}_watchlist.xlsx"
-    csv_content = export_results_csv(job.results)
-    with open(csv_path, "w", encoding="utf-8") as f:
-        f.write(csv_content)
-    print(f"📁 CSV saved to: {csv_path}")
-    export_results_excel(job.results, xlsx_path)
-    print(f"📊 Excel saved to: {xlsx_path}")
+    try:
+        csv_content = export_results_csv(job.results)
+        with open(csv_path, "w", encoding="utf-8") as f:
+            f.write(csv_content)
+        print(f"📁 CSV saved to: {csv_path}")
+    except Exception as e:
+        print(f"⚠  CSV export FAILED (results are still in the database): {e}")
+    try:
+        export_results_excel(job.results, xlsx_path)
+        print(f"📊 Excel saved to: {xlsx_path}")
+    except Exception as e:
+        print(f"⚠  Excel export FAILED (often: the file is open in Excel). "
+              f"Results are still in the database and the CSV above. {e}")
 
     opts = [r for r in job.results if r.status.value == "OPTIMIZATION"]
     total_saving = total_optimization_savings(job.results)
     print(f"\n💰 Total savings found: ${total_saving:.2f} across {len(opts)} booking(s)")
+
+    # Confirmed paid-in-full bookings don't need to be re-checked on the
+    # next auto-triggered scan of this same file. Guarded for the same
+    # reason as the exports above — and deliberately LAST, so a failure
+    # here can never cost the reports (main.py's `scan` path had these in
+    # the opposite order; see the note there).
+    try:
+        removed = remove_paid_in_full_from_watchlist(WATCHLIST_PATH, job.results)
+        if removed:
+            print(f"💳 Removed {len(removed)} paid-in-full booking(s) from {WATCHLIST_PATH}: {', '.join(removed)}")
+    except Exception as e:
+        print(f"⚠  Could not prune paid-in-full bookings from the watchlist: {e}")
 
 
 async def main():
@@ -172,7 +222,12 @@ async def main():
         if current_hash != last_hash:
             booking_ids = _load_watchlist(WATCHLIST_PATH)
             await run_one_scan(service, booking_ids)
-            last_hash = current_hash
+            # Re-read AFTER the scan, not the pre-scan current_hash — a
+            # scan that found paid-in-full bookings just rewrote this file
+            # itself (see remove_paid_in_full_from_watchlist above), and
+            # that self-edit must not look like a fresh user edit that
+            # immediately re-triggers another full rescan next loop tick.
+            last_hash = _watchlist_hash()
             print(f"\n🔵 Idle — watching {WATCHLIST_PATH} for changes "
                   f"(checks every {POLL_INTERVAL_S}s, browser stays open).")
         await asyncio.sleep(POLL_INTERVAL_S)
