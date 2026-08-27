@@ -312,7 +312,6 @@ We welcome contributions! See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
 
 If this project saved you time or money, donations are welcome:
 
-[![Donate with PayPal](https://img.shields.io/badge/PayPal-Donate-00457C.svg?logo=paypal&logoColor=white)](https://paypal.me/neonx07)
 [![Donate USDC on Solana](https://img.shields.io/badge/USDC-Solana-9945FF.svg?logo=solana&logoColor=white)](#-support-this-project)
 
 **USDC (Solana):**
