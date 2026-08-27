@@ -272,6 +272,44 @@ def _get_packages(items: list[dict]) -> list[dict]:
     ]
 
 
+# ── Travel Protection Detection ─────────────────────────────────
+#
+# CONFIRMED against real data (2026-08-25): mining all 532 captured
+# ESPRESSO invoice responses (data/raw_responses.jsonl) for every distinct
+# invoice-item name found exactly ONE real travel-protection-shaped line
+# item — "GRP TVL PRTC" (64 occurrences, almost certainly "Group Travel
+# Protection"). Before this fix it fell through to _get_packages() and
+# was indistinguishable from an ordinary drink-package/Wi-Fi perk in
+# lost_pkg_names — losing insurance/trip-protection coverage is a
+# materially different, more consequential kind of loss (it can affect
+# cancellation/refund eligibility, not just a bundled perk), so it
+# deserves to be called out on its own rather than blended in. The
+# additional patterns below are curated synonyms for the same real-world
+# product category (industry-standard naming — CSA/Allianz/"CFAR" are
+# common travel-protection product names/abbreviations), following this
+# project's established practice of building a little defensively around
+# one confirmed real example rather than coding to only the single exact
+# string seen so far — same shape as MSC's negative-Due-Amount handling.
+# None of these extras have been confirmed against a real captured
+# invoice; if one is ever seen, note it here as confirmed.
+_TRAVEL_PROTECTION_PATTERNS = [
+    re.compile(r"\bTVL\s*PRTC\b", re.IGNORECASE),           # CONFIRMED real: "GRP TVL PRTC"
+    re.compile(r"travel\s*protect", re.IGNORECASE),          # unconfirmed synonym
+    re.compile(r"trip\s*protect", re.IGNORECASE),            # unconfirmed synonym
+    re.compile(r"trip\s*insur", re.IGNORECASE),               # unconfirmed synonym
+    re.compile(r"cancel(?:l)?ation\s*waiver", re.IGNORECASE), # unconfirmed synonym
+    re.compile(r"\bCFAR\b", re.IGNORECASE),                   # "Cancel For Any Reason" — unconfirmed
+]
+
+
+def _is_travel_protection(item: dict) -> bool:
+    """Whether an invoice item is a travel-protection/trip-insurance
+    product rather than an ordinary package/perk — see the confirmed
+    real example and rationale above."""
+    name = item.get("name", "") or item.get("normalizedName", "") or ""
+    return any(p.search(name) for p in _TRAVEL_PROTECTION_PATTERNS)
+
+
 # ── Re-Addable Fare Detection ──────────────────────────────────
 
 _READDABLE_PATTERNS = [
@@ -362,11 +400,21 @@ def calculate_espresso(raw_data: dict, booking_id: str, price_category: str | No
             if norm_str(i.get("name", "") or i.get("normalizedName", ""))
             and norm_str(i.get("name", "") or i.get("normalizedName", "")) not in new_pkg_names
         ]
+        # lost_pkg_value stays a sum over ALL lost items (travel protection
+        # included) — the financial net_saving math is unchanged by this
+        # split. Only the NAMES are separated, so a human reviewing the
+        # result sees travel-protection loss called out distinctly from an
+        # ordinary lost drink/Wi-Fi package — see _is_travel_protection.
         lost_pkg_value = round2(sum(safe_float(i.get("amount", 0)) for i in lost_pkgs))
         lost_pkg_names = [
             i.get("name", "") or i.get("normalizedName", "")
             for i in lost_pkgs
-            if i.get("name") or i.get("normalizedName")
+            if (i.get("name") or i.get("normalizedName")) and not _is_travel_protection(i)
+        ]
+        lost_travel_protection = [
+            f"{i.get('name', '') or i.get('normalizedName', '')} (${safe_float(i.get('amount', 0)):.2f})"
+            for i in lost_pkgs
+            if (i.get("name") or i.get("normalizedName")) and _is_travel_protection(i)
         ]
 
         # Fare analysis (moved before `net` — a truly-lost fare's real
@@ -402,6 +450,13 @@ def calculate_espresso(raw_data: dict, booking_id: str, price_category: str | No
 
         # Status determination
         re_add_note = (" — re-add: " + ", ".join(re_addable_fares)) if re_addable_fares else ""
+        # Surfaced regardless of status/branch below — a client losing trip
+        # insurance/travel-protection coverage is worth flagging even on a
+        # NO_SAVING or TRAP result, not just an OPTIMIZATION.
+        protection_note = (
+            f" — ALSO LOSES TRAVEL PROTECTION: {', '.join(lost_travel_protection)} "
+            "(confirm this doesn't affect cancellation/trip-insurance coverage before repricing)"
+        ) if lost_travel_protection else ""
 
         if net > 0 and lost_pkg_value > 0 and net < lost_pkg_value:
             # Net saving is positive on paper, but it's smaller than the
@@ -434,6 +489,8 @@ def calculate_espresso(raw_data: dict, booking_id: str, price_category: str | No
             extra = (" — can re-add: " + ", ".join(re_addable_fares)) if re_addable_fares else ""
             note = f"no saving{extra}"
 
+        note = note + protection_note
+
         # Confidence scoring
         old_cruise = _get_cruise_fare(old_items)
         new_cruise = _get_cruise_fare(new_items)
@@ -452,6 +509,7 @@ def calculate_espresso(raw_data: dict, booking_id: str, price_category: str | No
             net_saving=net,
             lost_pkg_value=lost_pkg_value,
             lost_pkg_names=lost_pkg_names,
+            lost_travel_protection=lost_travel_protection,
             lost_fares=truly_lost_fares,
             re_addable_fares=re_addable_fares,
             gained_fares=gained_fares,
@@ -510,6 +568,90 @@ def _ncl_addon_value(addon_name: str | None) -> float:
         if key in lower:
             return float(val)
     return 0.0
+
+
+# ── NCL promo-loss hard rules ───────────────────────────────────
+#
+# HARD RULE, stated directly by the project owner 2026-08-26:
+#
+#   "if LATRIPLE is before only we do not optimize the booking, and we
+#    optimize if it is after, or if a booking does not have LATRIPLE
+#    before but does have it after then we optimize also"
+#
+# Restated as the single condition that actually matters: a booking must
+# NEVER be recommended for repricing when LATRIPLE is present BEFORE and
+# absent AFTER — i.e. when the reprice would LOSE it. Every other
+# combination is fine:
+#   before=Y after=N -> BLOCK (this is the whole point of the rule)
+#   before=Y after=Y -> allow (kept, nothing lost)
+#   before=N after=Y -> allow (gained -- explicitly called out as OK)
+#   before=N after=N -> allow (never involved)
+#
+# This is deliberately a HARD gate, not a value subtraction: unlike a
+# lost addon (which has a dollar figure that can be netted off), the
+# instruction here is categorical -- don't recommend it at all. Real
+# confirmed example, booking 3000003: promos went from
+# "...EASYFARE, LATRIPLE, MAP10OFF..." to "...EASYFARE | LATREW |
+# MAP10OFF..." -- LATRIPLE lost, LATREW gained -- while the fare dropped
+# $72. Under this rule that $72 is NOT a recommendable saving.
+#
+# WHAT LATRIPLE ACTUALLY IS (researched 2026-08-26, moderate-high
+# confidence — it's an internal B2B promo marker with no official NCL
+# documentation, so this comes from corroborating travel-agent/cruiser
+# discussion rather than a primary source): LATRIPLE = **triple Latitudes
+# points** (NCL's loyalty program is "Latitudes Rewards"), applying to
+# guests 1-2 on the reservation. LATREW, which replaced it on the real
+# 3000003 example, is the BASELINE marker for standard 1-point-per-night
+# accrual. So a LATRIPLE -> LATREW swap is a silent downgrade from 3x to
+# 1x loyalty points.
+#
+# Why that justifies a hard block rather than a dollar subtraction:
+# the loss has no invoice line item to net off, it's irreversible once
+# the booking is repriced, and Latitudes tiers gate real recurring
+# benefits (free bags, priority, dining/excursion credits). Trading ~14
+# extra points per guest on a 7-night sailing for a small fare drop is a
+# decision the CLIENT would have to consent to — not something to
+# recommend automatically.
+#
+# Kept as a named list + helper (rather than inline) so more codes can be
+# added if the project owner identifies others that must never be lost.
+#
+# ⚠ OPEN QUESTION FOR THE PROJECT OWNER, raised 2026-08-26: **FREESRVC
+# is a strong candidate to add here and is BETTER documented than
+# LATRIPLE.** A real NCL travel-agent promo flyer confirms FREESRVC =
+# "Free Pre-Paid Service Charges" for guests 1-2 on Balcony and above —
+# worth roughly $20-25 per person per night, i.e. plausibly $300-500 on
+# a real sailing. Two of the four bookings checked live on 2026-08-26
+# (3000007 and 3000006) LOST "FREE PREPAID SERVICE CHARGES" on the
+# reprice while gaining a $50 On-Board Credit Certificate, and were still
+# reported as OPTIMIZATION at $20 and $60. If that trade is bad, those
+# two are false positives of the same shape LATRIPLE was added to
+# prevent. Deliberately NOT added without the project owner's explicit
+# say-so, since it would change real recommendations on real bookings.
+NCL_NEVER_LOSE_PROMOS: frozenset[str] = frozenset({"LATRIPLE"})
+
+
+def _split_promo_codes(promos: str | None) -> set[str]:
+    """Parse an NCL promo string into a set of uppercased codes.
+
+    Real formats confirmed 2026-08-26 from live data: the booking header
+    reads comma-separated ("DISC50, EASYFARE, LATRIPLE, SHX50") while the
+    category-grid row reads pipe-separated ("DISC50 | EASYFARE | LATREW").
+    Both are handled, along with stray whitespace/empties."""
+    if not promos:
+        return set()
+    text = promos.replace("|", ",")
+    return {part.strip().upper() for part in text.split(",") if part.strip()}
+
+
+def ncl_lost_protected_promos(old_promos: str | None, new_promos: str | None) -> list[str]:
+    """Protected promo codes present BEFORE but missing AFTER.
+
+    Returns a sorted list (empty when nothing protected is lost). See
+    NCL_NEVER_LOSE_PROMOS for the rule and its rationale."""
+    before = _split_promo_codes(old_promos)
+    after = _split_promo_codes(new_promos)
+    return sorted((before & NCL_NEVER_LOSE_PROMOS) - after)
 
 
 # ── NCL Calculator ──────────────────────────────────────────────
@@ -576,8 +718,21 @@ def calculate_ncl(
         lost_addon_value = round2(lost_addon_value)
         net = round2(price_drop - lost_addon_value)
 
+        # HARD GATE, project owner's rule 2026-08-26 — checked BEFORE any
+        # status is assigned, so a protected-promo loss can never come
+        # back as OPTIMIZATION regardless of how good the fare drop
+        # looks. See NCL_NEVER_LOSE_PROMOS for the full rule.
+        lost_protected = ncl_lost_protected_promos(old_promos, new_promos)
+
         # Status determination
-        if net > 0:
+        if lost_protected:
+            status = BookingStatus.TRAP
+            note = (
+                f"NCL do NOT reprice — would LOSE {', '.join(lost_protected)} "
+                f"(present before, gone after) for only ${round(net)}; "
+                f"this promo must never be given up on a reprice"
+            )
+        elif net > 0:
             status = BookingStatus.OPTIMIZATION
             addon_note = (
                 " — verify addons: " + ", ".join(lost_addon_names)
@@ -591,7 +746,12 @@ def calculate_ncl(
             note = "NCL no saving"
 
         # Confidence scoring (simplified for NCL)
-        if price_drop > 0 and lost_addon_value == 0:
+        if lost_protected:
+            # Not a confidence question — this is a hard "don't do it."
+            # Scored lowest so it can never sort near a real opportunity
+            # in any report that ranks by confidence.
+            confidence = 1
+        elif price_drop > 0 and lost_addon_value == 0:
             confidence = 5
         elif price_drop > 0 and lost_addon_value < price_drop:
             confidence = 4
@@ -614,6 +774,12 @@ def calculate_ncl(
             lost_pkg_value=lost_addon_value,
             lost_pkg_names=lost_addon_names,
             confidence=confidence,
+            # Recorded so a protected-promo TRAP verdict is auditable and
+            # so exports can show both promo columns separately, matching
+            # the project owner's own report — see BookingResult's fields.
+            old_promos=old_promos or "",
+            new_promos=new_promos or "",
+            lost_fares=lost_protected,
         )
 
     except Exception as e:
@@ -800,7 +966,7 @@ def calculate_goccl(
 #   3. REJECTED 2026-08-01, CONFIRMED WRONG AGAINST REAL DATA: compared a
 #      strictly-higher-tier candidate's category-table price directly
 #      against the booking's real invoice TOTAL. Produced 6 false
-#      UPGRADE_AVAILABLE results in one run (bookings 1000004, 1000005,
+#      UPGRADE_AVAILABLE results in one run (bookings 3000002, 3000035,
 #      3000036, 3000037, 3000038, 3000039) that were manually checked and
 #      found not to exist. Root cause: ESPRESSO's own on-page disclaimer
 #      confirms the category table's price is PER-PERSON, TRIPLE-OCCUPANCY
@@ -860,6 +1026,21 @@ def _room_type_from_row(row: dict) -> str | None:
 
 
 def _price_from_row(row: dict) -> float | None:
+    """TRIED price_parser here 2026-08-25, REVERTED after real-data
+    verification caught a serious regression: rowText is a messy
+    multi-field blob containing OTHER bare numbers (e.g. "WLT(0)",
+    "AVL(2)") alongside the real price, and Price.fromstring() on the
+    whole string grabbed one of those instead of the price for several
+    real rows (confirmed: "RS...WLT(0)...8,782.00" parsed as $0.00, not
+    $8,782.00). The exact-".XX"-decimal-shape requirement below isn't
+    fragility here — it's the thing that disambiguates the real price
+    from those other embedded whole numbers, which is why it stays as a
+    plain regex rather than being "hardened" to accept whole dollars too
+    (unlike the GoCCL/MSC cases, where the fix target was already an
+    isolated, single-purpose line/field with nothing else to confuse it
+    with). Confirmed zero real whole-dollar prices across all 83,296
+    ESPRESSO category rows captured so far, so this specific fragility
+    class was never actually live here in the first place."""
     m = _ROW_PRICE_RE.search(row.get("rowText", "") or "")
     return safe_float(m.group(1).replace(",", "")) if m else None
 
@@ -1028,7 +1209,7 @@ def make_upgrade_available_result(
 # response, so the old, purely-reactive paid-status check never even ran
 # for it.
 #
-# WIDENED 2026-08-04 from 1.5% to 5%: booking 1000003 ($370.84 due on
+# WIDENED 2026-08-04 from 1.5% to 5%: booking 3000001 ($370.84 due on
 # $8,892.68, 4.17%) was reported by Neon as one that should have been
 # caught and wasn't — the 1.5% rule was working exactly as designed
 # ($370.84 is real money still owed, final payment isn't even due for
@@ -1038,7 +1219,7 @@ def make_upgrade_available_result(
 # a smooth continuum with no natural gap near 4.17%, so there's no
 # "objectively correct" cutoff to discover here the way there was for the
 # free-upgrade fix — this is a business-risk-tolerance choice, not a fact.
-# 5% was chosen as the smallest round number that clears 1000003 with a
+# 5% was chosen as the smallest round number that clears 3000001 with a
 # little headroom; it also newly classifies ~37 additional bookings out of
 # 468 (~8%) as paid-in-full compared to the old 1.5% rule, i.e. that many
 # fewer bookings get scored for repricing at all. If that's too aggressive

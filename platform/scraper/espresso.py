@@ -106,7 +106,27 @@ class EspressoScraper(BaseScraper):
         # reservations.do) when we get here — that can take longer than
         # the generic 30s action timeout, so wait for the search box
         # itself with a dedicated, longer timeout before touching it.
-        await self.wait_for(self._SEARCH_INPUT_SELECTOR, timeout=settings.scraper_login_timeout_ms)
+        try:
+            await self.wait_for(self._SEARCH_INPUT_SELECTOR, timeout=settings.scraper_login_timeout_ms)
+        except Exception:
+            # CONFIRMED REAL PATTERN, 2026-08-17 run: 9 consecutive bookings
+            # (15:39-16:12) all failed here with a generic Playwright
+            # timeout, one of them (3000032) showing in its own error log
+            # that the page navigated through an OAuth endSession call and
+            # landed on /login WHILE this wait was in progress — the
+            # session died in the gap between _check_login() passing (just
+            # before this call) and the search box actually appearing, so
+            # the existing "Not logged in" checks around this call never
+            # caught it. Re-checking login here doesn't fix the retry — it
+            # already retries via retry_async — but it turns a cryptic raw
+            # timeout into a clear, correctly-labeled error so it's obvious
+            # from the note/error field alone that this was a session
+            # logout, not a slow page or a real portal error.
+            if not await self._check_login():
+                raise RuntimeError(
+                    "Session logged out while searching — please log into ESPRESSO again"
+                )
+            raise
         await self.page.fill(self._SEARCH_INPUT_SELECTOR, "")
         await self.page.fill(self._SEARCH_INPUT_SELECTOR, booking_id)
         await self.page.click(self._SEARCH_BUTTON_SELECTOR)
@@ -385,7 +405,7 @@ class EspressoScraper(BaseScraper):
         button), then reads the confirmed total back via _read_top_prices()
         rather than parsing repriceModalCheck's JSON body.
 
-        Confirmed live 2026-08-01 (booking 1000004, candidate J3):
+        Confirmed live 2026-08-01 (booking 3000002, candidate J3):
         repriceModalCheck can return {"key": "skipRepriceModal"} — meaning
         this booking can't COMMIT a reprice into this category — while
         sb.summary.price.allocationPrice still updates to the real
@@ -477,6 +497,13 @@ class EspressoScraper(BaseScraper):
             await self.navigate(settings.espresso_base_url)
             if not await self._check_login():
                 raise RuntimeError("Not logged in — please log into ESPRESSO first")
+
+            # Early-warning structure check (once per session, not once
+            # per booking — see check_structure_drift's docstring). Never
+            # blocks the actual search below even if this itself fails to
+            # find the element — that failure is informative on its own.
+            await self.check_structure_drift("espresso_search_input", self._SEARCH_INPUT_SELECTOR)
+            await self.check_structure_drift("espresso_search_button", self._SEARCH_BUTTON_SELECTOR)
 
             logger.info("espresso.search", booking_id=booking_id)
             self.log_action("search_booking", booking_id=booking_id)

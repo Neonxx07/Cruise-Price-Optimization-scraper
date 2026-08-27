@@ -21,6 +21,49 @@ structlog>=23.2.0
 # followed by running any MSC script raised ModuleNotFoundError.
 keyring>=24.0.0
 
+# Robust price/date text parsing (msc_commands.py) -- ADDED 2026-08-24,
+# researched and tested against this project's own real captured strings
+# before adopting. Replaces hand-rolled regexes that require an EXACT
+# format (e.g. "\d+\.\d{2}", exactly 2-digit month/day) and silently
+# return no match at all on a real, valid variant -- the same bug CLASS
+# already confirmed once on GoCCL (a whole-dollar "$1,418" with no cents
+# broke a regex requiring exactly 2 decimal digits). price-parser handles
+# whole-dollar amounts, stray spaces, and currency prefixes; dateparser
+# handles non-zero-padded dates ("8/9/2026") the project's own rigid
+# \d{2}/\d{2}/\d{4} pattern would silently fail to match. Neither library
+# preserves a negative/parenthetical sign on its own -- that detection
+# stays as its own separate, already-existing check in msc_commands.py.
+price-parser>=0.3.4
+dateparser>=1.2.0
+
+# Fuzzy fallback tier for _select_matching_tab (msc_commands.py) -- ADDED
+# 2026-08-25, only after validating the exact threshold/gap combo against
+# EVERY existing tab-matching test case (including the historical "$654
+# vs $26" and OBC-vs-non-OBC incidents) to confirm zero behavior change
+# for any case the existing 5 tiers already handle -- this only ever
+# activates as tier 6, after all five find nothing. See
+# _select_matching_tab's docstring for the validated 80%-similarity /
+# 20-point-gap thresholds.
+rapidfuzz>=3.0.0
+
+# Multi-factor pattern mining for analyze_history.py -- ADDED 2026-08-25.
+# Classical frequent-itemset/association-rule mining (apriori), not an
+# LLM or a trained model -- finds combinations a single-column breakdown
+# can't (e.g. a category that only clears a meaningful sample size when
+# combined with cruise_line). pandas is mlxtend's own hard dependency for
+# this, not separately used elsewhere in this project.
+mlxtend>=0.23.0
+pandas>=2.0.0
+
+# Safe nested-path extraction for GoCCL's window.initialData (scraper/goccl.py)
+# -- ADDED 2026-08-25. No real GoCCL capture has ever confirmed a per-booking
+# guest-count/occupancy field's real name or nesting -- glom lets
+# read_current_price_and_selection() try several plausible candidate paths
+# defensively (via glom.Coalesce) and get back a clean "genuinely not found"
+# result instead of a raised KeyError/IndexError or a silently wrong .get()
+# chain, WITHOUT ever guessing a value when none of the candidates match.
+glom>=25.0
+
 # Utilities
 # httpx: no direct `import httpx` anywhere in this project's own code
 # (confirmed via project-wide grep, 2026-08-13 audit) -- kept rather

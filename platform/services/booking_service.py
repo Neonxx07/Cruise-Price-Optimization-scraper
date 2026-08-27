@@ -263,17 +263,41 @@ class BookingService:
         headless: bool | None = None,
     ) -> None:
         """Execute the batch scan."""
-        if keep_browser_open:
-            scraper = await self.get_or_create_scraper(job.cruise_line)
-        else:
-            scraper = self._get_scraper(job.cruise_line)
-        scraper.raw_dump_dir = raw_dump_dir
-        scraper.capture_everything = capture_everything
-        scraper.on_action = on_action
-
+        # MOVED INSIDE THE TRY, 2026-08-26: acquiring the scraper used to
+        # happen BEFORE the try/except/finally below, so anything it raised
+        # (a browser relaunch failure inside get_or_create_scraper →
+        # scraper.start(), or _get_scraper's ValueError for an unsupported
+        # cruise line) escaped _run_batch entirely — leaving job.status
+        # permanently RUNNING with no completed_at. The GUI polls while
+        # status is PENDING/RUNNING, so that meant a GUI stuck at "Starting
+        # queue processing…" FOREVER, with Stop doing nothing. Now inside
+        # the try, so the except sets FAILED and the finally records it.
+        scraper = None
         consecutive_failures = 0
 
+        # ADDED 2026-08-26: CacheService.cleanup_expired() existed but had
+        # ZERO callers anywhere in the project, so eviction only ever
+        # happened lazily inside get() — i.e. only for a key someone
+        # happened to look up. The live DB confirmed the result: all 414
+        # cache rows were expired, the newest by over a week, growing
+        # monotonically forever. Once per batch is cheap and bounds it.
+        # Guarded because a housekeeping failure must never stop a scan.
         try:
+            purged = await self.cache.cleanup_expired()
+            if purged:
+                logger.info("batch.cache_cleanup", purged=purged)
+        except Exception as e:
+            logger.warning("batch.cache_cleanup_failed", error=str(e))
+
+        try:
+            if keep_browser_open:
+                scraper = await self.get_or_create_scraper(job.cruise_line)
+            else:
+                scraper = self._get_scraper(job.cruise_line)
+            scraper.raw_dump_dir = raw_dump_dir
+            scraper.capture_everything = capture_everything
+            scraper.on_action = on_action
+
             if not keep_browser_open:
                 await scraper.start(headless=headless)
 
@@ -286,8 +310,26 @@ class BookingService:
                 job.current_booking_id = booking_id
                 job.progress_done = i
 
-                # Smart cache check
-                cached = None if bypass_cache else await self.cache.get(job.cruise_line.value, booking_id)
+                # Smart cache check.
+                #
+                # GUARDED 2026-08-26: this was the ONE unguarded await left in
+                # the per-booking loop. The 2026-08-12 fix wrapped every step
+                # BELOW the scrape in its own try/except so "one booking fails,
+                # the rest continue" — but this line sits above that and was
+                # bare. CacheService.get() does a SELECT and, on an expired
+                # entry, a DELETE + commit; any failure (SQLite lock from a
+                # concurrent process — a real scenario, see the cross-process
+                # note in DOCUMENTATION.md) propagated to the outer handler,
+                # marked the WHOLE job FAILED and abandoned every remaining
+                # booking. Fails OPEN (cached=None → check it live), which is
+                # the safe direction: a redundant live check costs a page load,
+                # a skipped one costs a real client's price drop.
+                cached = None
+                if not bypass_cache:
+                    try:
+                        cached = await self.cache.get(job.cruise_line.value, booking_id)
+                    except Exception as e:
+                        logger.warning("batch.cache_read_failed", booking_id=booking_id, error=str(e))
                 if cached:
                     logger.info("batch.cached", booking_id=booking_id, hours_ago=cached["hours_ago"])
                     result = make_skipped_result(
@@ -377,13 +419,6 @@ class BookingService:
                 else:
                     consecutive_failures = 0
 
-                # Cache NO_SAVING results (skipped in bypass mode — see above)
-                if not bypass_cache and result.status == BookingStatus.NO_SAVING:
-                    try:
-                        await self.cache.set_no_saving(job.cruise_line.value, booking_id)
-                    except Exception as e:
-                        logger.error("batch.cache_save_failed", booking_id=booking_id, error=str(e))
-
                 job.results.append(result)
                 job.progress_done = i + 1
 
@@ -391,8 +426,50 @@ class BookingService:
                 try:
                     await self._save_result_to_db(result)
                     await self._save_price_history(result)
+                    persisted = True
                 except Exception as e:
-                    logger.error("batch.persist_failed", booking_id=booking_id, error=str(e))
+                    persisted = False
+                    # CONFIRMED GAP, fixed 2026-08-26: this used to log only
+                    # booking_id + error, so a real OPTIMIZATION whose INSERT
+                    # failed (SQLite lock, disk full) left no recoverable
+                    # record of WHAT was lost. The CLI/GUI still have it in
+                    # job.results, but the API path relies purely on the DB.
+                    # Log the whole finding so it can be re-entered by hand.
+                    logger.error(
+                        "batch.persist_failed", booking_id=booking_id, error=str(e),
+                        status=result.status.value, net_saving=result.net_saving,
+                        old_total=result.old_total, new_total=result.new_total,
+                        price_category=result.price_category, note=result.note,
+                    )
+
+                # Cache NO_SAVING results (skipped in bypass mode — see above).
+                #
+                # MOVED BELOW THE PERSIST, 2026-08-26: this used to run BEFORE
+                # the DB write, so if the write failed the cache entry still
+                # survived — suppressing the booking for the full 12h TTL
+                # while there was no DB record of it at all. The cache was
+                # actively protecting a hole in the data. Only cache a result
+                # that actually made it to disk.
+                #
+                # AND gated on `old_total > 0`: ESPRESSO's
+                # make_skip_reprice_result() returns status=NO_SAVING for a
+                # booking whose price was never read at ALL (a
+                # "price program change not allowed" restriction). 862 of the
+                # 2,345 NO_SAVING rows in the real DB are this class — every
+                # one with old_total=0. Caching those as "checked, no saving"
+                # suppressed a booking for 12h on the basis of a comparison
+                # that never happened. A real NO_SAVING always has a real
+                # old_total to compare against.
+                if (
+                    not bypass_cache
+                    and result.status == BookingStatus.NO_SAVING
+                    and persisted
+                    and result.old_total > 0
+                ):
+                    try:
+                        await self.cache.set_no_saving(job.cruise_line.value, booking_id)
+                    except Exception as e:
+                        logger.error("batch.cache_save_failed", booking_id=booking_id, error=str(e))
 
                 if on_progress:
                     try:
@@ -435,11 +512,30 @@ class BookingService:
                 await self.close_live_scraper()
 
         finally:
-            if not keep_browser_open:
-                await scraper.stop()
-            job.completed_at = datetime.utcnow()
-            job.current_booking_id = None
-            await self._update_job_in_db(job)
+            # CONFIRMED REAL CORRUPTION, fixed 2026-08-26: these statements
+            # used to run bare, so if `scraper.stop()` raised (a dead browser
+            # or a Playwright teardown error — exactly the situation this
+            # path exists to clean up after), NOTHING below it ran: the job
+            # was never marked complete/failed in the DB and its stop flag
+            # was never popped. The live DB shows the damage — 18 of 52
+            # scan_jobs rows are stuck at status='RUNNING', progress_done=0,
+            # completed_at=NULL, including one with progress_total=278. A
+            # stuck-RUNNING job also makes the GUI poll forever (it waits on
+            # PENDING/RUNNING). Each step is now independently guarded so
+            # the job status and the stop-flag cleanup ALWAYS happen.
+            # `scraper` is None if acquisition itself failed (see the note
+            # where it's now acquired inside the try).
+            if not keep_browser_open and scraper is not None:
+                try:
+                    await scraper.stop()
+                except Exception as e:
+                    logger.warning("batch.scraper_stop_failed", job_id=job.job_id, error=str(e))
+            try:
+                job.completed_at = datetime.utcnow()
+                job.current_booking_id = None
+                await self._update_job_in_db(job)
+            except Exception as e:
+                logger.error("batch.job_status_update_failed", job_id=job.job_id, error=str(e))
             self._stop_flags.pop(job.job_id, None)
             logger.info(
                 "batch.complete",

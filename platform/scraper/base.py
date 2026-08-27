@@ -120,6 +120,11 @@ class BaseScraper(ABC):
         # of data already fetched, nothing new is requested because of it.
         self.raw_dump_dir: Optional[str] = None
         self.last_market_data: dict | None = None
+        # Structure-drift checks (see check_structure_drift) only need to
+        # run once per browser session, not once per booking — the page
+        # layout doesn't change between bookings within the same run.
+        # Tracks which `name`s have already been checked this session.
+        self._structure_checked: set[str] = set()
 
         # Action log: every navigate/search/click/API-call step, so a scan
         # can be replayed/audited after the fact. Always recorded in
@@ -148,6 +153,16 @@ class BaseScraper(ABC):
         # stop() wait for in-flight captures before closing the JSONL
         # handles/browser out from under them.
         self._background_tasks: set = set()
+
+        # ADDED 2026-08-26, for the first live NCL run: when set, wraps
+        # the whole session in Playwright's own built-in tracing (no new
+        # dependency) — a single .zip file capturing a full DOM/network/
+        # console/screenshot timeline, viewable afterward with
+        # `playwright show-trace <path>` without needing another live
+        # session against the real portal to diagnose a failure. Off by
+        # default (None) — zero behavior change for every existing
+        # caller/cruise line unless explicitly opted into.
+        self.trace_path: Optional[str] = None
 
     def _storage_state_path(self) -> Optional[str]:
         """Where the saved login session (cookies + localStorage) lives.
@@ -198,8 +213,26 @@ class BaseScraper(ABC):
         # through now cleans up what was already started before re-raising.
         self._playwright = await async_playwright().start()
         try:
+            resolved_headless = settings.browser_headless if headless is None else headless
+
+            # PINNED, confirmed 2026-08-14: ESPRESSO (secure.cruisingpower.com)
+            # never works headless — its Akamai bot-detection reliably blocks
+            # or breaks headless sessions. This used to be a bug reachable
+            # from every entry point (CLI --headless, easy_menu.py's default
+            # "just press Enter" answer, and any GUI scan that didn't
+            # explicitly pop a visible window) — any of those would silently
+            # launch ESPRESSO headless and produce broken/failed scans.
+            # Enforced here, in the one place every scraper subclass launches
+            # its browser through, so no caller can accidentally bypass it.
+            if self.cruise_line == CruiseLine.ESPRESSO and resolved_headless:
+                logger.warning(
+                    "browser.espresso_headless_forced_visible",
+                    note="cruisingpower.com never works headless — overriding to a visible window",
+                )
+                resolved_headless = False
+
             launch_args: dict = {
-                "headless": settings.browser_headless if headless is None else headless,
+                "headless": resolved_headless,
             }
 
             # Proxy support (design-ready)
@@ -220,6 +253,11 @@ class BaseScraper(ABC):
                 if os.path.exists(storage_state_path):
                     context_args["storage_state"] = storage_state_path
             self._context = await self._browser.new_context(**context_args)
+
+            if self.trace_path:
+                await self._context.tracing.start(screenshots=True, snapshots=True, sources=True)
+                logger.info("browser.tracing_started", cruise_line=self.cruise_line.value, path=self.trace_path)
+
             self._page = await self._context.new_page()
 
             self._page.set_default_timeout(settings.scraper_timeout_ms)
@@ -285,6 +323,19 @@ class BaseScraper(ABC):
         # at all), browser.close()/playwright.stop() were skipped
         # entirely, leaking the Chromium process and the Playwright
         # driver subprocess. Each step now fails on its own.
+        # Tracing must be stopped/saved BEFORE the context closes — kept
+        # as its own try/except so a tracing failure can never skip the
+        # context/browser/playwright cleanup below (same lesson as the
+        # 2026-08-13 fix on the three calls right after this one).
+        if self.trace_path and self._context:
+            try:
+                import os
+                os.makedirs(os.path.dirname(self.trace_path) or ".", exist_ok=True)
+                await self._context.tracing.stop(path=self.trace_path)
+                logger.info("browser.tracing_saved", cruise_line=self.cruise_line.value, path=self.trace_path)
+            except Exception as e:
+                logger.warning("browser.tracing_stop_error", error=str(e))
+
         try:
             if self._context:
                 await self._context.close()
@@ -339,10 +390,49 @@ class BaseScraper(ABC):
             and self._browser.is_connected()
         )
 
-    async def navigate(self, url: str, wait_until: str = "domcontentloaded") -> None:
-        """Navigate to a URL and wait for load."""
-        logger.debug("navigate", url=url)
-        await self.page.goto(url, wait_until=wait_until)
+    async def navigate(self, url: str, wait_until: str = "domcontentloaded", attempts: int = 3) -> None:
+        """Navigate to a URL and wait for load, retrying a transient hang.
+
+        ADDED 2026-08-26 at the project owner's report that "sometimes the
+        website hangs and gives errors" (NCL specifically, but this
+        applies to every portal here — ESPRESSO's own error history in
+        DOCUMENTATION.md includes isolated `Failed to fetch`/`ERR_ABORTED`
+        navigation blips that cascaded into the NEXT booking also failing).
+
+        A page navigation is a GET — idempotent — so retrying one is safe,
+        unlike the mutating confirm/cancel-edit clicks, which must NEVER
+        be retried (a retried submit could double-submit against a real
+        booking). That distinction is the whole reason this retry lives
+        here on `navigate` rather than being wrapped around wider flows.
+
+        A dead browser is re-raised immediately without burning retries —
+        BookingService's restart path can only trigger on an exception
+        that actually propagates, and retrying a closed browser just
+        delays recovery (same lesson as the 2026-08-13 fixes in
+        ncl.py/goccl.py's own exception handling).
+        """
+        last_error: Exception | None = None
+        delay = 2.0
+        for attempt in range(1, attempts + 1):
+            try:
+                logger.debug("navigate", url=url, attempt=attempt)
+                await self.page.goto(url, wait_until=wait_until)
+                if attempt > 1:
+                    logger.info("browser.navigate_recovered", url=url, attempt=attempt)
+                return
+            except Exception as e:
+                if is_dead_browser_error(e):
+                    raise
+                last_error = e
+                if attempt < attempts:
+                    logger.warning(
+                        "browser.navigate_retry", url=url, attempt=attempt,
+                        of=attempts, error=str(e)[:200],
+                    )
+                    await asyncio.sleep(delay)
+                    delay *= 1.5
+        logger.error("browser.navigate_failed", url=url, attempts=attempts, error=str(last_error)[:200])
+        raise last_error  # type: ignore[misc]
 
     async def wait_for(self, selector: str, timeout: int | None = None) -> None:
         """Wait for an element to appear on page."""
@@ -518,6 +608,72 @@ class BaseScraper(ABC):
             logger.warning("failure_snapshot.meta_error", booking_id=booking_id, step=step, exc_info=True)
 
         self.log_action("failure_snapshot", booking_id=booking_id, step=step, error=error, file=base)
+
+    # Persistent ACROSS runs (unlike raw_dump_dir, which is per-scan) --
+    # a baseline needs to survive to be compared against every future
+    # run, not just this one.
+    STRUCTURE_BASELINE_DIR = "data/structure_baselines"
+
+    async def check_structure_drift(self, name: str, selector: str = "body") -> dict:
+        """Capture an ARIA-accessibility-tree snapshot of `selector` and
+        compare it against a saved baseline for `name`. On the first call
+        for a given name, saves the current snapshot AS the baseline and
+        reports "baseline_created" — there's nothing to compare against
+        yet. Never raises and never blocks/fails a scan; purely an early-
+        warning signal, logged so it shows up without needing to be
+        actively watched for.
+
+        ADDED 2026-08-25, motivated by a real, recurring incident class:
+        ESPRESSO's search form was rebuilt on Mantine at some point,
+        silently breaking the old `#reservationid`/`#searchReservationBtn`
+        selectors (see EspressoScraper._SEARCH_INPUT_SELECTOR's docstring
+        — both the old ID selector and the new `data-qa` one are now tried
+        together as a result, discovered only after the fact). An ARIA
+        snapshot is based on role + accessible name, which tends to
+        survive exactly the kind of framework rewrite that breaks CSS
+        selectors/ids — this won't fix a break by itself, but it's a free
+        (no LLM, no extra dependency — aria_snapshot() is a built-in
+        Playwright method) way to notice a structural change is coming
+        before a live scan mysteriously starts failing.
+
+        Chosen granularity deliberately: pass a `selector` scoped to a
+        stable container (e.g. the search form), not the whole page body
+        by default in practice — the page body includes booking-specific
+        content that differs on every single call and would never
+        register as "unchanged," making the comparison useless."""
+        import os
+
+        if name in self._structure_checked:
+            return {"status": "skipped_already_checked_this_session"}
+        self._structure_checked.add(name)
+
+        try:
+            snapshot = await self.page.locator(selector).aria_snapshot()
+        except Exception as e:
+            logger.warning("structure_watch.capture_failed", name=name, selector=selector, error=str(e))
+            return {"status": "capture_failed", "error": str(e)}
+
+        baseline_dir = self.STRUCTURE_BASELINE_DIR
+        os.makedirs(baseline_dir, exist_ok=True)
+        baseline_path = os.path.join(baseline_dir, f"{_sanitize_filename_component(name)}.yaml")
+
+        if not os.path.exists(baseline_path):
+            await asyncio.to_thread(_write_text_file, baseline_path, snapshot)
+            logger.info("structure_watch.baseline_created", name=name, path=baseline_path)
+            return {"status": "baseline_created", "path": baseline_path}
+
+        with open(baseline_path, encoding="utf-8") as f:
+            baseline = f.read()
+
+        if snapshot.strip() == baseline.strip():
+            return {"status": "unchanged"}
+
+        logger.warning(
+            "structure_watch.structure_changed", name=name, path=baseline_path,
+            note="page structure differs from the saved baseline -- a portal redesign may have broken a selector",
+        )
+        self.log_action("structure_changed", name=name, path=baseline_path)
+        return {"status": "changed", "baseline": baseline, "current": snapshot}
 
     async def fill_and_submit(self, selector: str, value: str, submit_selector: str) -> None:
         """Fill an input and click submit."""

@@ -177,6 +177,56 @@ def test_regression_total_optimization_savings_excludes_trap_and_no_saving():
     assert total_optimization_savings(results) == 50.0
 
 
+# ── Travel protection classification (added 2026-08-25) ──────────
+#
+# Backed by real data: mining all 532 captured ESPRESSO invoice responses
+# (data/raw_responses.jsonl) found exactly one real travel-protection-
+# shaped line item, "GRP TVL PRTC" (64 occurrences) — previously
+# indistinguishable from an ordinary lost package. See
+# core/calculator.py's _is_travel_protection and core/models.py's
+# lost_travel_protection field docstrings.
+
+
+def test_real_example_grp_tvl_prtc_is_classified_as_travel_protection_not_a_package():
+    raw = _espresso_raw(
+        old_total=1000.0, new_total=1000.0,
+        old_pkgs=[{"name": "GRP TVL PRTC", "amount": 64.0}],
+        new_pkgs=[],
+    )
+    r = calculate_espresso(raw, "TVLPRTC1")
+    assert r.lost_travel_protection == ["GRP TVL PRTC ($64.00)"]
+    assert r.lost_pkg_names == []  # not double-counted as an ordinary package
+    assert "TRAVEL PROTECTION" in r.note
+    assert r.lost_pkg_value == 64.0  # financial math unchanged
+
+
+def test_ordinary_package_loss_is_not_misclassified_as_travel_protection():
+    raw = _espresso_raw(
+        old_total=1000.0, new_total=1000.0,
+        old_pkgs=[{"name": "All-Inclusive Drink Package", "amount": 594.0}],
+        new_pkgs=[],
+    )
+    r = calculate_espresso(raw, "TVLPRTC2")
+    assert r.lost_travel_protection == []
+    assert r.lost_pkg_names == ["All-Inclusive Drink Package"]
+    assert "TRAVEL PROTECTION" not in r.note
+
+
+def test_mixed_lost_package_and_travel_protection_both_reported_separately():
+    raw = _espresso_raw(
+        old_total=1000.0, new_total=1000.0,
+        old_pkgs=[
+            {"name": "All-Inclusive Drink Package", "amount": 594.0},
+            {"name": "GRP TVL PRTC", "amount": 64.0},
+        ],
+        new_pkgs=[],
+    )
+    r = calculate_espresso(raw, "TVLPRTC3")
+    assert r.lost_pkg_names == ["All-Inclusive Drink Package"]
+    assert r.lost_travel_protection == ["GRP TVL PRTC ($64.00)"]
+    assert r.lost_pkg_value == 658.0  # both still contribute to the same total
+
+
 # ── REGRESSION: round2() precision, ROUND_HALF_UP ─────────────────
 
 

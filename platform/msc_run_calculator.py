@@ -25,6 +25,7 @@ from msc_commands import (
     _extract_passengers,
     _find_today_price,
     _is_paid_in_full,
+    _srn_reference_available,
 )
 from core.calculator_msc import evaluate_msc_booking
 from core.models import MSC_PAID_IN_FULL_DUE_THRESHOLD
@@ -79,10 +80,13 @@ def main():
 
         essentials = _extract_booking_essentials(booking["summary_text"])
         current_discounts = _extract_discounts_with_implied(booking["summary_text"], booking.get("breakdown_text"))
-        # Recomputed fresh rather than trusting booking["all_seniors"] —
-        # same staleness issue as today_price below: older captures
-        # predate the passenger-DOB parsing being added at all.
-        all_seniors = _extract_passengers(booking["summary_text"])["all_seniors"]
+        # Recomputed fresh rather than trusting booking["senior_count"]/
+        # ["all_seniors"] — same staleness issue as today_price below:
+        # older captures predate the passenger-DOB parsing being added at
+        # all (and older ones still won't have senior_count specifically —
+        # see core/calculator_msc.py's 2026-08-18 all_seniors -> senior_count
+        # correction, booking 3000030).
+        senior_count = _extract_passengers(booking["summary_text"])["senior_count"]
         category = essentials.get("category") or rate.get("category")
 
         # Recompute today's price fresh from the stored raw listing text
@@ -119,10 +123,12 @@ def main():
             today_discount_options=rate.get("discount_options"),
             today_discount_catalog=rate.get("discount_catalog"),
             has_voyagers=rate.get("has_voyagers", False),
-            all_seniors=all_seniors,
+            senior_count=senior_count,
+            senior_discount_verifiable=_srn_reference_available(booking["summary_text"]),
             today_price_tab_confirmed=bool((rate.get("rate_tab_match") or {}).get("matched")),
             is_group_rate=rate.get("is_group_rate", False),
             club_discount_offered=rate.get("club_discount_offered"),
+            final_payment_date_passed=bool(essentials.get("final_payment_date_passed")),
         )
         # current_discounts is None (not []) when _extract_discounts
         # couldn't confirm the Price Breakdown modal actually rendered —
@@ -131,22 +137,25 @@ def main():
         # SRN-math-detected silent discount (see
         # _extract_discounts_with_implied) genuinely does account for
         # the senior-discount blind spot this caveat was built for, so
-        # the caveat should only fire when NEITHER caught it.
+        # the caveat should only fire when NEITHER caught it. Gated on
+        # senior_count >= 2 (not just "any senior"), matching the real
+        # eligibility rule corrected 2026-08-18 — a lone senior was never
+        # actually eligible, so there's nothing to caveat for them.
         has_named_or_implied = any(d.get("kind") in ("named", "implied") for d in (current_discounts or []))
-        results.append((result, all_seniors, has_named_or_implied))
+        results.append((result, senior_count >= 2, has_named_or_implied))
 
     print(f"\n=== {len(results)} booking(s) evaluated ===")
-    for result, all_seniors, has_named_or_implied in results:
+    for result, senior_eligible, has_named_or_implied in results:
         flag = "OPPORTUNITY FOUND" if result.has_any_opportunity else "no opportunity"
         print(f"\n{result.booking_id} ({result.category}) — {flag}")
         for c in result.checks:
             print(f"   {c.type.value}: {c.status.value} — {c.note}")
-        if all_seniors and not has_named_or_implied:
+        if senior_eligible and not has_named_or_implied:
             print(
-                "   CAVEAT: passengers are all 65+ but no discount was found (explicit disclosure OR "
-                "SRN-implied) — either genuinely no discount is applied, or the cruise length isn't in "
-                "STANDARD_NCF_BY_NIGHTS yet so the implied-discount math couldn't run; verify the SRN "
-                "line by hand before trusting DISCOUNT_ADD on this one"
+                "   CAVEAT: this cabin has 2+ senior (65+) passengers but no discount was found (explicit "
+                "disclosure OR SRN-implied) — either genuinely no discount is applied, or the cruise length "
+                "isn't in STANDARD_NCF_BY_NIGHTS yet so the implied-discount math couldn't run; verify the "
+                "SRN line by hand before trusting DISCOUNT_ADD on this one"
             )
 
     os.makedirs(os.path.dirname(RESULTS_PATH), exist_ok=True)
@@ -165,14 +174,14 @@ def main():
             "VOYAGERS_SELECTION", "VOYAGERS_SELECTION Note",
             "Senior-Blind-Spot Caveat",
         ])
-        for result, all_seniors, has_named in results:
+        for result, senior_eligible, has_named in results:
             by_type = {c.type.value: c for c in result.checks}
             row = [result.booking_id, result.category, result.has_any_opportunity]
             for check_type in ("PRICE_MATCH", "DISCOUNT_ADD", "DISCOUNT_TIER_UPGRADE", "VOYAGERS_SELECTION"):
                 c = by_type.get(check_type)
                 row.append(c.status.value if c else "")
                 row.append(c.note if c else "")
-            row.append("all 65+, no disclosed discount" if (all_seniors and not has_named) else "")
+            row.append("2+ seniors, no disclosed discount" if (senior_eligible and not has_named) else "")
             writer.writerow(row)
     print(f"Saved {len(results)} result(s) to {RESULTS_CSV_PATH}")
 

@@ -49,6 +49,14 @@ class Settings(BaseSettings):
     # Non-empty by default so login persists across scans and app restarts —
     # set to "" (e.g. in .env) to force a fresh incognito-style session every run.
     browser_user_data_dir: str = _DEFAULT_BROWSER_PROFILE_DIR
+    # PINNED FACT, confirmed 2026-08-14: this default is a real trap for
+    # ESPRESSO specifically. ESPRESSO (secure.cruisingpower.com) NEVER works
+    # headless — its Akamai bot detection reliably blocks/breaks headless
+    # sessions. This setting still defaults True because NCL/GOCCL run fine
+    # headless; ESPRESSO's own browser launch (scraper/base.py's
+    # BaseScraper.start()) unconditionally overrides to a visible window
+    # regardless of this setting or any caller-supplied `headless` argument
+    # — do not try to "fix" that by making ESPRESSO respect this flag again.
     browser_headless: bool = True
     scraper_timeout_ms: int = 30000
     scraper_retry_attempts: int = 3
@@ -83,6 +91,11 @@ class Settings(BaseSettings):
     espresso_home_url: str = "https://secure.cruisingpower.com/home"
     espresso_base_url: str = "https://secure.cruisingpower.com/espresso/protected/reservations.do"
     ncl_search_url: str = "https://seawebagents.ncl.com/tva/search/"
+    # CONFIRMED 2026-08-26 from a real recorded session: NCL's agent login
+    # page is its own URL, distinct from the search URL above. Used by
+    # NclScraper.auto_login. No MFA/SSO was observed on this account —
+    # a plain username/password form, unlike ESPRESSO.
+    ncl_login_url: str = "https://seawebagents.ncl.com/Security/login/"
     goccl_search_url: str = "https://www.goccl.com/BookingEngine/BookingSearch/SearchForReservations.aspx"
     msc_home_url: str = "https://www.mscbook.com/us/home"
     # Param order here must stay byte-identical to what msc_commands.py's
@@ -108,9 +121,32 @@ class Settings(BaseSettings):
     # anywhere in the code (confirmed via grep). This logic lives in the
     # root-level msc_commands.py/msc_session_controller.py — a
     # standalone scraper/msc.py was never built.
-    # Windows Credential Manager service name used by
+    # OS secure-credential-store service name used by
     # msc_save_credentials.py / msc_clear_credentials.py — must match.
     msc_credential_service: str = "msc_book_login"
+    # Same idea for ESPRESSO (Royal Caribbean/Celebrity), added 2026-08-18
+    # for save_login.py/clear_login.py. NOTE: ESPRESSO requires MFA at
+    # login (see main.py's _run_login_check) — saving this credential
+    # does NOT enable a fully unattended login the way MSC's auto_login()
+    # does. It only lets the username/password fields be filled in
+    # automatically; the human still completes MFA. Actually auto-filling
+    # those fields on the real cruisingpower.com login page is separate,
+    # not-yet-built work (needs the real form selectors captured first,
+    # same discipline as everywhere else in this project) — this setting
+    # only names where the credential itself is stored.
+    espresso_credential_service: str = "espresso_cruisingpower_login"
+    # Same idea for NCL (SeaWeb Agents), added 2026-08-26 while bringing
+    # NCL support online for the first time — save_login.py/clear_login.py
+    # can now store an NCL credential the same way. NCL's login flow in
+    # `main.py`/`scraper/ncl.py` is currently fully human-driven (no
+    # auto-fill wired up, same unbuilt state as ESPRESSO's). UNCONFIRMED
+    # as of this writing (no live NCL login has been run through this
+    # codebase yet): NCL may now route agent login through a newer SSO
+    # layer ("Norwegian Central", norwegiancentral.ncl.com) rather than a
+    # direct seawebagents.ncl.com credential form — verify which path a
+    # real login actually takes before assuming a saved username/password
+    # here is even the right shape of credential to store.
+    ncl_credential_service: str = "ncl_seawebagents_login"
 
     # ── GoCCL ───────────────────────────────────────────────────
     # Guests count matters: GoCCL's offer-code comparison table shows

@@ -11,6 +11,9 @@ from typing import Callable
 from core.models import BookingResult, BookingStatus, CruiseLine
 from services.booking_service import BookingService
 from models.database import init_db
+from utils.logging import get_logger
+
+logger = get_logger(__name__)
 
 
 class QueueStatus(str, Enum):
@@ -55,6 +58,20 @@ class BookingQueueManager:
     @property
     def is_running(self) -> bool:
         return self._running
+
+    @property
+    def last_job_status(self) -> str | None:
+        """Terminal status of the most recent job, or None if none ran.
+
+        ADDED 2026-08-26: the GUI had NO way to read this — `_job` is
+        private and nothing outside this class touched it — so all three
+        terminal states (COMPLETED, FAILED, STOPPED) were reported
+        identically as "Queue processing complete." The FAILED case is the
+        damaging one: `_run_batch` marks a job FAILED and breaks out of the
+        loop when a browser restart fails, leaving every remaining booking
+        unscanned, while the GUI told the operator the whole watchlist was
+        repriced."""
+        return self._job.status.value if self._job else None
 
     def has_live_session(self, cruise_line: CruiseLine) -> bool:
         return self._service.has_live_session(cruise_line)
@@ -174,6 +191,23 @@ class BookingQueueManager:
         self._stop_requested = True
         return True
 
+    def mark_running(self, booking_id: str) -> None:
+        """Mark one queued item RUNNING without going through
+        start_processing/BookingService — used by the GUI's MSC path
+        (see msc_live_service.py), which drives its own batch loop instead
+        of BookingService.start_scan but still wants this same queue list
+        to reflect progress."""
+        item = self._find_item(booking_id)
+        if item is not None:
+            item.status = QueueStatus.RUNNING
+
+    def mark_done(self, booking_id: str, is_error: bool = False) -> None:
+        """Mark one queued item DONE/ERROR — the MSC-path counterpart to
+        mark_running above."""
+        item = self._find_item(booking_id)
+        if item is not None:
+            item.status = QueueStatus.ERROR if is_error else QueueStatus.DONE
+
     def _on_progress(self, job) -> None:
         if not job.current_booking_id:
             return
@@ -201,10 +235,32 @@ class BookingQueueManager:
                 continue
             item.status = QueueStatus.ERROR if result.status == BookingStatus.ERROR else QueueStatus.DONE
             self._results.append(result)
+            # CONFIRMED CRITICAL BUG, fixed 2026-08-26: these two callbacks
+            # used to be invoked BARE. They run GUI code (_append_result_row /
+            # _refresh_summary / _update_queue_view), and if any of it raised,
+            # the exception propagated out of here → out of start_processing's
+            # poll loop → its `finally` cleared `_running` and
+            # `_current_job_id` → the GUI showed "Processing failed" and
+            # RE-ENABLED Start. Meanwhile `_run_batch` is a detached asyncio
+            # Task still driving the live browser: clicking Start again then
+            # ran TWO concurrent batches on one Playwright page, and because
+            # `_current_job_id` was cleared, Stop could no longer stop the
+            # orphaned job at all.
+            #
+            # BookingService already wraps its own `on_progress` callback for
+            # exactly this reason, and BaseScraper.log_action wraps
+            # `on_action` — this was the one remaining unguarded callback
+            # boundary. A display failure must never take down the scan.
             if on_result:
-                on_result(result)
+                try:
+                    on_result(result)
+                except Exception:
+                    logger.exception("gui.on_result_callback_failed", booking_id=result.booking_id)
             if on_state_change:
-                on_state_change(self.get_snapshot())
+                try:
+                    on_state_change(self.get_snapshot())
+                except Exception:
+                    logger.exception("gui.on_state_change_callback_failed")
 
     def _find_item(self, booking_id: str) -> QueueItem | None:
         normalized = self._normalize_id(booking_id)
