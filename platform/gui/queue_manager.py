@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import pathlib
 from collections import deque
 from dataclasses import dataclass
 from enum import Enum
@@ -36,6 +37,14 @@ class QueueSnapshot:
     running: int
     done: int
     error: int
+    # ADDED 2026-08-27: the backend already hands _on_progress a ScanJob
+    # carrying current_booking_id / progress_done / progress_total, but
+    # only current_booking_id was used (to flip a row's status) and the
+    # counts were discarded — so the standard path showed no progress at
+    # all while the MSC path already showed "checking X (3/26)".
+    current_booking_id: str | None = None
+    progress_done: int = 0
+    progress_total: int = 0
 
 
 StateCallback = Callable[[QueueSnapshot], None]
@@ -73,6 +82,16 @@ class BookingQueueManager:
         repriced."""
         return self._job.status.value if self._job else None
 
+    @property
+    def last_job_error(self) -> str | None:
+        """WHY the most recent job failed, if it recorded a reason.
+
+        ADDED 2026-08-27 together with ScanJob.error: `last_job_status`
+        told the GUI a job FAILED but not why, so the operator saw a bare
+        "SCAN FAILED" and had to open the log to find out whether the
+        browser died, the session logged out, or a restart failed."""
+        return getattr(self._job, "error", None) if self._job else None
+
     def has_live_session(self, cruise_line: CruiseLine) -> bool:
         return self._service.has_live_session(cruise_line)
 
@@ -82,7 +101,13 @@ class BookingQueueManager:
         running = sum(1 for item in items if item.status == QueueStatus.RUNNING)
         done = sum(1 for item in items if item.status == QueueStatus.DONE)
         error = sum(1 for item in items if item.status == QueueStatus.ERROR)
-        return QueueSnapshot(items=items, queued=queued, running=running, done=done, error=error)
+        job = self._job
+        return QueueSnapshot(
+            items=items, queued=queued, running=running, done=done, error=error,
+            current_booking_id=getattr(job, "current_booking_id", None) if job else None,
+            progress_done=getattr(job, "progress_done", 0) if job else 0,
+            progress_total=getattr(job, "progress_total", 0) if job else 0,
+        )
 
     def add_booking(self, booking_id: str) -> bool:
         booking_id = self._normalize_id(booking_id)
@@ -98,6 +123,34 @@ class BookingQueueManager:
             if self.add_booking(booking_id):
                 added.append(booking_id)
         return added
+
+    def add_bookings_from_file(self, path: str) -> tuple[list[str], str | None]:
+        """Load booking IDs from a text file (one per line, or comma
+        separated) and queue them. Returns (added_ids, error_message).
+
+        ADDED 2026-08-27: the GUI read NO watchlist file at all — the queue
+        could only be filled by typing or pasting — while `main.py` and
+        `run_persistent_watchlist_scan.py` both work from watchlist files.
+        Neon hit this directly: he put NCL bookings in `Watchlistncl.txt`,
+        pressed Start, and nothing ran, because the desktop app never looks
+        at that file. Returns the error instead of raising so the caller can
+        show it without a traceback."""
+        try:
+            raw = pathlib.Path(path).read_text(encoding="utf-8", errors="replace")
+        except OSError as exc:
+            return [], f"Could not read {path}: {exc}"
+        # An EMPTY file is called out explicitly rather than reported as
+        # "0 new bookings" — Neon's Watchlistncl.txt was 0 bytes and the
+        # silent no-op was indistinguishable from a broken Start button.
+        if not raw.strip():
+            return [], f"{pathlib.Path(path).name} is empty — it contains no booking IDs."
+        added = self.add_bookings_bulk(raw)
+        if not added:
+            return [], (
+                f"{pathlib.Path(path).name} has content but no NEW booking IDs "
+                f"(they may all be queued already)."
+            )
+        return added, None
 
     def remove_booking(self, booking_id: str) -> bool:
         booking_id = self._normalize_id(booking_id)
@@ -209,14 +262,20 @@ class BookingQueueManager:
             item.status = QueueStatus.ERROR if is_error else QueueStatus.DONE
 
     def _on_progress(self, job) -> None:
-        if not job.current_booking_id:
-            return
-        item = self._find_item(job.current_booking_id)
-        if item is None:
-            return
-        item.status = QueueStatus.RUNNING
+        # Marks the in-flight booking RUNNING when we can find its row, but
+        # ALWAYS notifies — previously an early `return` here meant a
+        # progress update for a booking not in the queue list (a cache
+        # skip, or a row the operator removed) dropped the whole update,
+        # so the counters silently stalled.
+        if job.current_booking_id:
+            item = self._find_item(job.current_booking_id)
+            if item is not None:
+                item.status = QueueStatus.RUNNING
         if self._on_state_change:
-            self._on_state_change(self.get_snapshot())
+            try:
+                self._on_state_change(self.get_snapshot())
+            except Exception:
+                logger.exception("gui.on_progress_callback_failed")
 
     def _sync_completed_results(
         self,

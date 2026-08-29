@@ -86,3 +86,22 @@ openpyxl>=3.1.0
 
 # Packaging
 pyinstaller>=6.2.0
+
+# Concurrent multi-cruise-line scanning (added 2026-08-27) --
+# services/resource_governor.py + services/multi_line_coordinator.py.
+#
+# psutil: CPU/RAM sampling for the throttle gate. Critically, it is used
+# to sum RSS across CHILD processes -- Chromium runs each renderer/GPU/
+# utility as a separate OS process, so measuring only our own RSS would
+# understate real memory use by an order of magnitude and the throttle
+# would never fire. Pattern taken from apify/crawlee-python's
+# _utils/system.py, which does exactly this.
+psutil>=7.0.0
+# filelock: single-instance guard so two controllers can't fight over the
+# same portal session / storage_state file / SQLite db. >=3.29.0
+# specifically because that release added STALE-LOCK DETECTION ON
+# WINDOWS -- i.e. it correctly reclaims a lock whose holder died without
+# cleaning up, which is the crash case that would otherwise wedge the app
+# permanently. Raw O_EXCL + PID checks are unreliable on Windows because
+# PIDs get reused.
+filelock>=3.29.0

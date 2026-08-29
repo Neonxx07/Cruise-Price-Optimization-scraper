@@ -246,3 +246,78 @@ def test_promo_parsing_handles_both_real_separators():
     assert _split_promo_codes("  latriple ,, ") == {"LATRIPLE"}   # case + stray separators
     assert _split_promo_codes(None) == set()
     assert _split_promo_codes("") == set()
+
+
+# ── FREESRVC hard gate (added on the project owner's instruction) ──────
+#
+# "this is the same cse like latriple FREESRVC add rule please norwegian"
+# FREESRVC = "Free Pre-Paid Service Charges" (guests 1-2, Balcony and
+# above) per a real NCL travel-agent promo flyer — roughly $20-25 per
+# person per night, so plausibly $300-500 on a real sailing.
+
+
+def test_freesrvc_lost_blocks_optimization_real_example_3000007():
+    """REAL live-verified case (2026-08-26): promos went from
+    '...EASYFARE, FREESRVC, INTSHO...' to '...EASYFARE | FITOBC |
+    INTSHO...' — FREESRVC replaced by a $50 OBC certificate — while the
+    fare dropped only $20. Reported as OPTIMIZATION before this rule."""
+    from core.calculator import calculate_ncl
+    from core.models import BookingStatus
+
+    r = calculate_ncl(
+        "3000007", "BA", 2878.00, 2858.00, [],
+        "DISC50, EASYFARE, FREESRVC, INTSHO, SHX50",
+        "DISC50 | EASYFARE | FITOBC | INTSHO | SHX50",
+    )
+    assert r.status == BookingStatus.TRAP
+    assert "FREESRVC" in r.note
+
+
+def test_freesrvc_lost_blocks_optimization_real_example_3000006():
+    """Second real live-verified case, same shape, $60 fare drop."""
+    from core.calculator import calculate_ncl
+    from core.models import BookingStatus
+
+    r = calculate_ncl(
+        "3000006", "MB", 828.00, 768.00, [],
+        "DISC50, EASYFARE, FREESRVC, INTSHO, LATITUDE, LATREW, NCLHBENE, SHX50",
+        "DISC50 | EASYFARE | FITOBC | INTSHO | LATREW | NCLHBENE | SHX50",
+    )
+    assert r.status == BookingStatus.TRAP
+    assert "FREESRVC" in r.note
+
+
+def test_freesrvc_kept_still_allows_optimization():
+    """Retained on both sides -> nothing lost -> normal optimization."""
+    from core.calculator import calculate_ncl
+    from core.models import BookingStatus
+
+    r = calculate_ncl(
+        "X", "BA", 2878.00, 2858.00, [],
+        "DISC50, FREESRVC", "DISC50 | FREESRVC",
+    )
+    assert r.status == BookingStatus.OPTIMIZATION
+
+
+def test_booking_without_freesrvc_unaffected_real_example_3000004():
+    """REAL live-verified control case: 3000004 never had FREESRVC, so
+    it must still be a clean OPTIMIZATION. Proves the rule doesn't
+    over-block."""
+    from core.calculator import calculate_ncl
+    from core.models import BookingStatus
+
+    r = calculate_ncl(
+        "3000004", "IA", 3388.00, 3348.00, [],
+        "DISC50, EASYFARE, INTSHO, SHX50",
+        "DISC50 | EASYFARE | INTSHO | SHX50",
+    )
+    assert r.status == BookingStatus.OPTIMIZATION
+
+
+def test_both_protected_promos_lost_are_both_reported():
+    """If a reprice would lose BOTH, the note must name both so the
+    operator sees the full cost, not just the first one found."""
+    from core.calculator import ncl_lost_protected_promos
+
+    lost = ncl_lost_protected_promos("LATRIPLE, FREESRVC, DISC50", "DISC50 | LATREW | FITOBC")
+    assert lost == ["FREESRVC", "LATRIPLE"]   # sorted

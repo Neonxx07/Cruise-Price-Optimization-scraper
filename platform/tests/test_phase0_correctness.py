@@ -607,7 +607,18 @@ def qapp_and_loop_phase0():
     app = QApplication.instance() or QApplication([])
     loop = qasync.QEventLoop(app)
     _asyncio.set_event_loop(loop)
-    yield app, loop
+    try:
+        yield app, loop
+    finally:
+        # See the matching teardown in test_gui_shutdown.py: an unclosed
+        # qasync loop raises "Signal source has been deleted" from
+        # BaseEventLoop.__del__ at interpreter shutdown, printing a
+        # traceback after an otherwise green run.
+        _asyncio.set_event_loop(None)
+        try:
+            loop.close()
+        except Exception:
+            pass
 
 
 class _FakeQueueManagerAlreadyRunning:
@@ -629,15 +640,21 @@ def test_regression_on_start_does_not_reenable_controls_when_scan_already_runnin
     unconditionally re-enable every control, even when start_processing()
     failed simply because a real scan was ALREADY running -- reopening a
     window for Login/Start to race against that still-running scan."""
-    from gui.windows import MainWindow
+    # UPDATED 2026-08-28: `_on_start` and the controls it guards moved from
+    # MainWindow onto CruiseLinePanel when the GUI became tabbed, and the
+    # cruise-line DROPDOWN is gone — a panel IS its cruise line, which is
+    # what makes concurrent lines possible at all. The re-entrancy property
+    # under test is unchanged: a refused start must not re-enable Start or
+    # Login while the real scan is still running.
+    from core.models import CruiseLine
+    from gui.windows import CruiseLinePanel
 
     app, loop = qapp_and_loop_phase0
     monkeypatch.setattr(QMessageBox, "critical", staticmethod(lambda *a, **k: None))
     monkeypatch.setattr(QMessageBox, "warning", staticmethod(lambda *a, **k: None))
 
-    win = MainWindow()
+    win = CruiseLinePanel(CruiseLine.ESPRESSO)
     win.queue_manager = _FakeQueueManagerAlreadyRunning()
-    win.cruise_line_selector.setCurrentIndex(0)
 
     win.start_button.setEnabled(False)
     win.login_button.setEnabled(False)
@@ -803,44 +820,68 @@ def test_calculate_goccl_wrong_stateroom_type_excluded():
 
 # ── Required coverage: NCL addon/FOBC business logic (in context) ────────
 
-def test_ncl_fobc_lost_addon_correctly_subtracted():
-    """Independently derived: $150 price drop, but losing FOBC costs the
-    $150 OBC certificate addon -> net = 150-150 = 0 -> not > 0 -> since
-    price_drop(150) > 0 and net(0) <= 0 -> TRAP."""
+def test_ncl_lost_obc_certificate_correctly_subtracted():
+    """$150 price drop, but the $150 OBC certificate is forfeited -> net =
+    150-150 = 0 -> not > 0 -> price_drop(150) > 0 and net(0) <= 0 -> TRAP.
+
+    UPDATED 2026-08-27. This test previously drove the loss off the
+    old_promos/new_promos "FOBC" SUBSTRING, which is the mechanism Neon
+    confirmed produces false positives in production: bookings 3000055
+    and 3000054 both forfeited a real OBC certificate while their promo
+    strings contained no "FOBC" at all, so nothing was subtracted and both
+    came back GREEN as OPTIMIZATION. The loss now comes from the REAL
+    before/after addon diff (`new_addons`), so this test supplies one.
+
+    The assertion moved from lost_pkg_value to obc_change because OBC loss
+    is now routed into obc_change — which is what lets the project's
+    canonical OBC_LOSS_MIN_RATIO rule apply to NCL at all."""
     addons = [{"name": "On-Board Credit Certificate $150", "qty": 1}]
     result = calculate_ncl(
         "N1", "BA", invoice_total=1000.0, new_res_total=850.0,
-        addons=addons, old_promos="FOBC SAVE10", new_promos="SAVE10",
+        addons=addons, old_promos="SAVE10", new_promos="SAVE10",
+        new_addons=[],
     )
     assert result.status == BookingStatus.TRAP
-    assert result.lost_pkg_value == 150.0
+    assert result.obc_change == -150.0
+    assert result.net_saving == 0.0
 
 
-def test_ncl_fobc_retained_addons_not_subtracted():
-    """Same addons, but FOBC is retained on both sides -> lost_fobc=False
-    -> lost_addon_value must stay 0 regardless of what addons exist."""
+def test_ncl_retained_addons_not_subtracted():
+    """An addon still present AFTER the reprice must never be subtracted.
+
+    UPDATED 2026-08-27: retention used to be expressed as "FOBC on both
+    sides"; it is now expressed the honest way — the addon appears in both
+    the before AND after lists, so the diff finds nothing lost."""
     addons = [{"name": "On-Board Credit Certificate $150", "qty": 1}]
     result = calculate_ncl(
         "N2", "BA", invoice_total=1000.0, new_res_total=850.0,
-        addons=addons, old_promos="FOBC SAVE10", new_promos="FOBC SAVE10",
+        addons=addons, old_promos="SAVE10", new_promos="SAVE10",
+        new_addons=list(addons),
     )
     assert result.status == BookingStatus.OPTIMIZATION
+    assert result.obc_change == 0.0
     assert result.lost_pkg_value == 0.0
     assert result.net_saving == 150.0
 
 
 def test_ncl_duplicate_addons_counted_once():
-    """calculate_ncl's own de-dup (`seen` set) must prevent the same addon
-    name from being subtracted twice."""
+    """The same addon line rendered twice for ONE guest must be subtracted
+    once, not twice ($150, never $300).
+
+    UPDATED 2026-08-27 for the addon-diff mechanism (see
+    test_ncl_lost_obc_certificate_correctly_subtracted). The de-dup moved
+    into ncl_lost_addons and is now keyed on (guest, name) rather than name
+    alone — so this case still collapses to one, while the same perk held
+    by TWO DIFFERENT guests correctly counts twice."""
     addons = [
         {"name": "On-Board Credit Certificate $150", "qty": 1},
         {"name": "On-Board Credit Certificate $150", "qty": 1},
     ]
     result = calculate_ncl(
         "N3", "BA", invoice_total=1000.0, new_res_total=850.0,
-        addons=addons, old_promos="FOBC", new_promos="",
+        addons=addons, old_promos="", new_promos="", new_addons=[],
     )
-    assert result.lost_pkg_value == 150.0  # not 300.0
+    assert result.obc_change == -150.0  # not -300.0
 
 
 # ── Required coverage: MSC current_total_price fallback ──────────────────

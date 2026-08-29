@@ -65,21 +65,46 @@ async def test_stop_is_idempotent():
 
 
 class _FakeLocator:
-    def __init__(self, snapshot: str | Exception):
+    """Models a real Playwright locator closely enough to catch the bug the
+    old fake hid.
+
+    UPDATED 2026-08-27. The old fake had no `.first`, and no `match_count`
+    concept — so it could not represent the situation that actually broke
+    production: a comma-OR selector matching MORE THAN ONE element.
+    `page.click(sel)` is non-strict and clicks the first match (so scrapes
+    worked), but `locator(sel).aria_snapshot()` is STRICT and raises, which
+    is why `espresso_search_button.yaml` was never created while
+    `espresso_search_input.yaml` was. `check_structure_drift` now calls
+    `.first`; this fake makes a bare `aria_snapshot()` on a multi-match
+    locator raise, exactly as Playwright does, so the fix is genuinely
+    exercised instead of assumed."""
+
+    def __init__(self, snapshot: str | Exception, match_count: int = 1):
         self._snapshot = snapshot
+        self._match_count = match_count
+
+    @property
+    def first(self):
+        return _FakeLocator(self._snapshot, match_count=1)
 
     async def aria_snapshot(self):
+        if self._match_count > 1:
+            raise RuntimeError(
+                f"strict mode violation: locator resolved to "
+                f"{self._match_count} elements"
+            )
         if isinstance(self._snapshot, Exception):
             raise self._snapshot
         return self._snapshot
 
 
 class _FakePage:
-    def __init__(self, snapshot: str | Exception):
+    def __init__(self, snapshot: str | Exception, match_count: int = 1):
         self._snapshot = snapshot
+        self._match_count = match_count
 
     def locator(self, selector):
-        return _FakeLocator(self._snapshot)
+        return _FakeLocator(self._snapshot, match_count=self._match_count)
 
 
 @pytest.mark.asyncio
@@ -156,3 +181,45 @@ async def test_structure_drift_only_checks_once_per_session(tmp_path):
 
     assert first["status"] == "baseline_created"
     assert second["status"] == "skipped_already_checked_this_session"
+
+
+@pytest.mark.asyncio
+async def test_regression_multi_match_selector_still_creates_a_baseline(tmp_path):
+    """CONFIRMED REAL BUG, fixed 2026-08-27.
+
+    This project deliberately uses comma-OR selectors so a portal redesign
+    can't break a scrape — EspressoScraper._SEARCH_BUTTON_SELECTOR is
+    '#searchReservationBtn, [aria-label="Search by Reservation ID, Name or
+    Date"]'. When both halves match, Playwright's STRICT locator API raises
+    on aria_snapshot() even though page.click() is happy. That exception was
+    caught and logged as a warning, so the drift monitor silently watched
+    only ONE of the two selectors it was wired to watch: after the real
+    2026-08-27 ESPRESSO run, data/structure_baselines/ held
+    espresso_search_input.yaml and no espresso_search_button.yaml at all.
+    """
+    s = EspressoScraper()
+    s.STRUCTURE_BASELINE_DIR = str(tmp_path)
+    s._page = _FakePage("- button \"Search\"", match_count=3)
+
+    result = await s.check_structure_drift("espresso_search_button", "#a, #b, #c")
+
+    assert result["status"] == "baseline_created", (
+        f"a multi-match selector must still be snapshotted via .first, got {result}"
+    )
+    assert (tmp_path / "espresso_search_button.yaml").exists()
+
+
+@pytest.mark.asyncio
+async def test_both_espresso_selectors_get_a_baseline(tmp_path):
+    """The end-to-end shape of the bug: espresso.py asks for baselines on
+    BOTH the search input and the search button. Before the fix only one
+    file appeared. Both selectors are multi-match by construction."""
+    s = EspressoScraper()
+    s.STRUCTURE_BASELINE_DIR = str(tmp_path)
+    s._page = _FakePage("- textbox \"Search by Reservation ID, Name or Date\"", match_count=2)
+
+    await s.check_structure_drift("espresso_search_input", s._SEARCH_INPUT_SELECTOR)
+    await s.check_structure_drift("espresso_search_button", s._SEARCH_BUTTON_SELECTOR)
+
+    created = sorted(f.name for f in tmp_path.glob("*.yaml"))
+    assert created == ["espresso_search_button.yaml", "espresso_search_input.yaml"], created

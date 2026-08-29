@@ -17,6 +17,31 @@ from pathlib import Path
 
 import uvicorn
 
+# CONFIRMED REAL CRASH, fixed 2026-08-27. Running
+# `python main.py scan --cruise-line NCL --bookings-file ...` died with
+# `UnicodeEncodeError: 'charmap' codec can't encode character '⚓'`
+# at main.py's own "⚓ Scanning N booking(s)" line — BEFORE a single
+# booking was checked. Windows gives a non-interactive child process a
+# cp1252 stdout, and this file's status output is full of emoji
+# (⚓ 🚀 💳 ✅ ⚠), so the whole CLI was unusable for any piped/redirected
+# run on this machine.
+#
+# This is the SAME defect class as the 2026-07-31 incident where a 💳 in
+# a paid-in-full note raised UnicodeEncodeError during CSV export and
+# destroyed both the CSV and the Excel report for a 72-booking run (that
+# one was fixed by passing encoding="utf-8" to open(); the print path was
+# missed). Fixing it at the stream instead of hunting every emoji.
+#
+# errors="replace" not "strict": a console that genuinely cannot render a
+# glyph should print a placeholder, never abort a scan.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, OSError, ValueError):
+        # Not a real reconfigurable stream (pytest capture, a pipe wrapper).
+        # Never let output plumbing stop the CLI from starting.
+        pass
+
 
 def cmd_api(args):
     """Start the FastAPI server."""
@@ -35,15 +60,17 @@ def cmd_api(args):
     )
 
 
-def _scraper_for(cruise_line):
-    """Factory: get the right scraper for the cruise line (CLI entry points)."""
+def _scraper_for(cruise_line, market: str | None = None):
+    """Factory: get the right scraper for the cruise line (CLI entry points).
+
+    `market` applies to NCL only — see NclScraper.__init__ / --market."""
     from core.models import CruiseLine
     from scraper.espresso import EspressoScraper
     from scraper.goccl import GoCCLScraper
     from scraper.ncl import NclScraper
 
     if cruise_line == CruiseLine.NCL:
-        return NclScraper()
+        return NclScraper(market=market)
     if cruise_line == CruiseLine.GOCCL:
         return GoCCLScraper()
     return EspressoScraper()
@@ -87,7 +114,7 @@ async def _run_login_check(args):
     print(f"LOGIN CHECK: browser_headless={login_headless}")
 
     cruise_line = CruiseLine(args.cruise_line.upper())
-    scraper = _scraper_for(cruise_line)
+    scraper = _scraper_for(cruise_line, getattr(args, 'market', None))
 
     # Only this one login session runs visibly (if requested) — does not
     # affect settings.browser_headless, so scans started afterward keep
@@ -245,7 +272,7 @@ def remove_paid_in_full_from_watchlist(path: str, results) -> list[str]:
 
 async def _run_scan(args):
     from config.settings import settings
-    from core.calculator import total_optimization_savings
+    from core.calculator import total_optimization_savings, unconfirmed_candidate_total
     from core.models import CruiseLine
     from models.database import init_db
     from services.booking_service import BookingService
@@ -290,11 +317,15 @@ async def _run_scan(args):
         booking_ids,
         cruise_line,
         on_progress=on_progress,
+        bypass_cache=getattr(args, "no_cache", False),
         raw_dump_dir=args.capture_raw,
         capture_market_data=args.capture_market_data,
         capture_everything=args.capture_everything,
         on_action=on_action if args.capture_everything else None,
         headless=args.headless_mode,
+        # Without this, --market selected the LOGIN account and the scan
+        # then silently used the default one (see BookingService._run_batch).
+        market=getattr(args, "market", None),
     )
 
     # Wait for completion
@@ -307,10 +338,11 @@ async def _run_scan(args):
     print(f"📊 Results: {len(job.results)} bookings checked\n")
 
     icons = {"OPTIMIZATION": "✅", "UPGRADE_AVAILABLE": "🆙", "TRAP": "⚠️", "NO_SAVING": "⏭", "ERROR": "❌",
-             "PAID_IN_FULL": "💳", "WLT": "⏭", "SKIPPED_TODAY": "⏩"}
+             "PAID_IN_FULL": "💳", "WLT": "⏭", "SKIPPED_TODAY": "⏩",
+             "NOT_ON_THIS_ACCOUNT": "🇨🇦"}
     status_order = [
         "OPTIMIZATION", "UPGRADE_AVAILABLE", "TRAP", "WLT", "PAID_IN_FULL",
-        "NO_SAVING", "SKIPPED_TODAY", "ERROR",
+        "NO_SAVING", "SKIPPED_TODAY", "NOT_ON_THIS_ACCOUNT", "ERROR",
     ]
     by_status: dict[str, list] = {}
     for r in job.results:
@@ -379,7 +411,10 @@ async def _run_scan(args):
     # Summary
     opts = [r for r in job.results if r.status.value == "OPTIMIZATION"]
     total_saving = total_optimization_savings(job.results)
+    unconf_n, unconf_total = unconfirmed_candidate_total(job.results)
     print(f"\n💰 Total savings found: ${total_saving:.2f} across {len(opts)} booking(s)")
+    if unconf_n:
+        print(f"   {unconf_n} UNCONFIRMED candidate(s) worth ${unconf_total:,.2f} excluded from the total - verify before trusting")
 
 
 def cmd_watch(args):
@@ -448,6 +483,7 @@ async def _run_watch(args):
                 capture_market_data=args.capture_market_data,
                 capture_everything=args.capture_everything,
                 headless=args.headless_mode,
+                market=getattr(args, "market", None),
             )
 
             while job.status.value in ("PENDING", "RUNNING"):
@@ -534,6 +570,13 @@ def main():
     )
     login_parser.add_argument("--cruise-line", default="ESPRESSO", help="ESPRESSO, NCL, or GOCCL")
     login_parser.add_argument(
+        "--market", default=None,
+        help="NCL only: which agent account to use — US or CA. NCL runs a "
+             "SEPARATE SeaWeb account per market, so Canadian (CAD) bookings "
+             "are invisible on the US login and vice versa. Defaults to "
+             "settings.ncl_default_market.",
+    )
+    login_parser.add_argument(
         "--timeout-minutes", type=float, default=15.0,
         help="How long to wait for login before giving up (default: 15)",
     )
@@ -547,6 +590,20 @@ def main():
              "(blank lines and '#' comments ignored). Overrides --bookings.",
     )
     scan_parser.add_argument("--cruise-line", default="ESPRESSO", help="ESPRESSO, NCL, or GOCCL")
+    scan_parser.add_argument(
+        "--no-cache", action="store_true",
+        help="Ignore the NO_SAVING TTL cache and check every booking live. "
+             "Without this, a booking already checked today comes back "
+             "SKIPPED_TODAY — which made a 84-booking baseline run 62%% "
+             "skipped and therefore useless as a measurement.",
+    )
+    scan_parser.add_argument(
+        "--market", default=None,
+        help="NCL only: which agent account to use — US or CA. NCL runs a "
+             "SEPARATE SeaWeb account per market, so Canadian (CAD) bookings "
+             "are invisible on the US login and vice versa. Defaults to "
+             "settings.ncl_default_market.",
+    )
     scan_parser.add_argument("--output", "-o", help="Output CSV file path")
     scan_parser.add_argument("--excel", "-x", help="Output color-coded .xlsx report file path")
     scan_parser.add_argument(
@@ -589,6 +646,13 @@ def main():
              "(blank lines and '#' comments ignored). Overrides --bookings.",
     )
     watch_parser.add_argument("--cruise-line", default="ESPRESSO", help="ESPRESSO, NCL, or GOCCL")
+    watch_parser.add_argument(
+        "--market", default=None,
+        help="NCL only: which agent account to use — US or CA. NCL runs a "
+             "SEPARATE SeaWeb account per market, so Canadian (CAD) bookings "
+             "are invisible on the US login and vice versa. Defaults to "
+             "settings.ncl_default_market.",
+    )
     watch_parser.add_argument(
         "--interval-minutes", type=int, default=60, help="Minutes between passes (default: 60)",
     )

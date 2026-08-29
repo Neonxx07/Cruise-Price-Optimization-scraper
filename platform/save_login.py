@@ -42,7 +42,16 @@ from config.settings import settings
 CRUISE_LINES = {
     "1": ("MSC", settings.msc_credential_service),
     "2": ("ESPRESSO (Royal Caribbean / Celebrity)", settings.espresso_credential_service),
-    "3": ("NCL (Norwegian Cruise Line)", settings.ncl_credential_service),
+    # NCL runs a SEPARATE SeaWeb agent account per market — confirmed by
+    # Neon 2026-08-27 after 25 Canadian bookings all returned
+    # "Reservation is not found" against the US login. Each market needs
+    # its own credentials stored under its own service name.
+    #
+    # The US entry keeps the ORIGINAL, unsuffixed service name so anything
+    # already saved keeps working with no migration; the suffix rule here
+    # must stay in step with NclScraper.credential_service.
+    "3": ("NCL — US account (USD)", settings.ncl_credential_service),
+    "4": ("NCL — Canada account (CAD)", f"{settings.ncl_credential_service}_ca"),
 }
 
 # Strips bracketed-paste escape sequences some terminals wrap pasted text
@@ -247,7 +256,14 @@ def main() -> None:
             "they can be filled in for you, but you'll still complete the MFA step yourself "
             "every time. It is not a fully hands-off login the way MSC's is.\n"
         )
-    if service_name == settings.ncl_credential_service:
+    if service_name.startswith(settings.ncl_credential_service):
+        if service_name != settings.ncl_credential_service:
+            print(
+                f"\nSaving the {label} credential under a SEPARATE keyring "
+                f"entry ({service_name}) — it does NOT overwrite the US one. "
+                f"Run this script again and pick the other NCL option to "
+                f"store both accounts."
+            )
         print(
             "Note: NCL's login flow isn't wired up to auto-fill anything yet — this only "
             "stores the credential for later. Also unconfirmed as of this writing: NCL may "

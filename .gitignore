@@ -24,6 +24,14 @@ env/
 *.db-wal
 *.db-journal
 *.sqlite3
+# ...and any hand-made copy of one. A timestamped backup (e.g.
+# cruise_intel.db.backup_20260827_150330) is a full copy of the live
+# database and did NOT match the `*.db` rule above -- it slipped through
+# on 2026-08-29. Keep these suffix-tolerant.
+*.db.backup*
+*.db.bak*
+*.db.copy*
+*.sqlite3.backup*
 
 # Scan output / captured data -- all of this is real, live scrape output
 # (real booking IDs, real prices, real portal page captures), regenerated
@@ -34,8 +42,22 @@ env/
 *.jsonl
 /platform/data/
 /platform/watch_runs/
-/platform/watchlist.txt
-/platform/watchlist.txt.bak*
+
+# Booking-ID input lists. These are ALLOWLISTED, not blocklisted, and that
+# is deliberate: the previous rules named specific files
+# (`/platform/watchlist.txt`), and on 2026-08-29 a batch of new ad-hoc
+# lists -- Watchlistncl.txt, Watchlistncl_us.txt, Watchlistncl_ca.txt,
+# Watchlistncl_recheck.txt, ncl_diag.txt, ncl_pilot.txt -- carried 167 real
+# customer booking numbers straight past them. Naming each new file will
+# always lose that race, so ignore every loose .txt/.bak under platform/
+# and re-admit only the ones that are genuinely source.
+# Trailing wildcards matter: a real file was named
+# `watchlist.txt.bak_2026-08-17`, which ends in neither `.txt` nor `.bak`.
+/platform/*.txt
+/platform/*.txt.*
+/platform/*.bak*
+!/platform/requirements.txt
+!/platform/requirements-dev.txt
 
 # Generated reports (CSV/XLSX exports) -- regenerate via a scan, not source data
 *.csv

@@ -22,7 +22,7 @@ import sys
 from datetime import datetime
 
 from config.settings import settings
-from core.calculator import total_optimization_savings
+from core.calculator import total_optimization_savings, unconfirmed_candidate_total
 from core.models import CruiseLine
 from main import remove_paid_in_full_from_watchlist
 from models.database import init_db
@@ -94,9 +94,10 @@ async def run_one_scan(service: BookingService, booking_ids: list[str]) -> None:
     print(f"📊 Results: {len(job.results)} bookings checked\n")
 
     icons = {"OPTIMIZATION": "✅", "UPGRADE_AVAILABLE": "🆙", "TRAP": "⚠️", "NO_SAVING": "⏭", "ERROR": "❌",
-             "PAID_IN_FULL": "💳", "WLT": "⏭", "SKIPPED_TODAY": "⏩"}
+             "PAID_IN_FULL": "💳", "WLT": "⏭", "SKIPPED_TODAY": "⏩",
+             "NOT_ON_THIS_ACCOUNT": "🇨🇦"}
     status_order = ["OPTIMIZATION", "UPGRADE_AVAILABLE", "TRAP", "WLT", "PAID_IN_FULL",
-                     "NO_SAVING", "SKIPPED_TODAY", "ERROR"]
+                     "NO_SAVING", "SKIPPED_TODAY", "NOT_ON_THIS_ACCOUNT", "ERROR"]
     by_status: dict[str, list] = {}
     for r in job.results:
         by_status.setdefault(r.status.value, []).append(r)
@@ -153,7 +154,10 @@ async def run_one_scan(service: BookingService, booking_ids: list[str]) -> None:
 
     opts = [r for r in job.results if r.status.value == "OPTIMIZATION"]
     total_saving = total_optimization_savings(job.results)
+    unconf_n, unconf_total = unconfirmed_candidate_total(job.results)
     print(f"\n💰 Total savings found: ${total_saving:.2f} across {len(opts)} booking(s)")
+    if unconf_n:
+        print(f"   {unconf_n} UNCONFIRMED candidate(s) worth ${unconf_total:,.2f} excluded from the total - verify before trusting")
 
     # Confirmed paid-in-full bookings don't need to be re-checked on the
     # next auto-triggered scan of this same file. Guarded for the same
@@ -170,6 +174,44 @@ async def run_one_scan(service: BookingService, booking_ids: list[str]) -> None:
 
 async def main():
     setup_logging(settings.log_level)
+
+    # SESSION-SAFETY GUARD, added 2026-08-27. Scope is per-PORTAL
+    # ("espresso_driver"), not global: this script only ever drives
+    # ESPRESSO (CruiseLine.ESPRESSO is hardcoded below), so it must block
+    # another ESPRESSO driver — the GUI running an ESPRESSO scan, or a
+    # second copy of this script — while deliberately NOT blocking the MSC
+    # driver, which is a different portal and a different account and can
+    # safely run alongside.
+    #
+    # What it prevents, concretely: ESPRESSO allows ONE active session per
+    # account, so a second login evicts this one and the evicted scan
+    # grinds through timeouts; both processes write
+    # storage_state_ESPRESSO.json (last writer wins, so a dead session can
+    # overwrite a good one); both rewrite watchlist.txt; and both contend
+    # on cruise_intel.db.
+    from services.resource_governor import SingleInstanceGuard
+
+    guard = SingleInstanceGuard("espresso_driver")
+    if not guard.acquire():
+        print("=" * 68)
+        print("  ANOTHER ESPRESSO DRIVER IS ALREADY RUNNING — refusing to start.")
+        print(f"  Holder: {guard.holder_pid() or 'unknown'}")
+        print()
+        print("  ESPRESSO allows one active session per account, so starting a")
+        print("  second one would evict the first and leave both scans failing.")
+        print("  Close the other scanner (or the GUI's ESPRESSO scan) first.")
+        print("=" * 68)
+        sys.exit(1)
+
+    try:
+        await _run_forever()
+    finally:
+        guard.release()
+
+
+async def _run_forever():
+    """The real watch loop. Split out from main() so the single-instance
+    guard wraps every exit path, including sys.exit and exceptions."""
     await init_db()
 
     service = BookingService()

@@ -55,6 +55,42 @@ def should_delete_command_file(processed_command: str, current_file_content: str
 
 
 async def main():
+    # SESSION-SAFETY GUARD, added 2026-08-27. Without this, a second
+    # controller could start and: (1) open a second MSC session on an
+    # account the portal only allows ONE active session for — the "logon
+    # ID used in another location" kick this whole design exists to avoid;
+    # (2) delete the first controller's in-flight command.txt/result.txt
+    # (see the stale-file cleanup right below, which is exactly why the
+    # lock must be taken BEFORE it runs); (3) both poll command.txt and
+    # both execute the same command, driving one real booking from two
+    # browsers at once; (4) clobber storage_state_MSC.json, letting a dead
+    # session overwrite a live one.
+    #
+    # Acquired before ANY destructive setup, and released in the finally.
+    from services.resource_governor import SingleInstanceGuard
+
+    guard = SingleInstanceGuard("msc_driver")
+    if not guard.acquire():
+        print("=" * 68)
+        print("  ANOTHER MSC DRIVER IS ALREADY RUNNING — refusing to start.")
+        print(f"  Holder: {guard.holder_pid() or 'unknown'}")
+        print()
+        print("  Two MSC drivers fight over the same portal session and can")
+        print("  corrupt each other's command/result files and saved session.")
+        print("  Close the other controller (or the GUI's MSC scan) first.")
+        print("=" * 68)
+        return
+
+    try:
+        await _run_controller()
+    finally:
+        guard.release()
+
+
+async def _run_controller():
+    """The real controller loop. Split out from main() so the
+    single-instance guard above wraps every path, including early
+    returns and exceptions."""
     os.makedirs(CONTROL_DIR, exist_ok=True)
     for stale in (COMMAND_PATH, RESULT_PATH, START_SIGNAL):
         if os.path.exists(stale):

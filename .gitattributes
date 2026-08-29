@@ -1,0 +1,30 @@
+# Normalize line endings on the way into the repository.
+#
+# This project is edited from both Windows and macOS. Without this file,
+# a round-trip through the Windows working copy rewrote whole files as
+# CRLF, and git then reported them as fully rewritten: on 2026-08-27
+# msc_commands.py showed 6,226 changed lines when only 82 were real, and
+# csv_export.py/excel_export.py showed ~200 and ~284 changed lines when
+# nothing at all had changed. That noise hides real edits during review,
+# which is exactly when sensitive-data mistakes slip through.
+#
+# `text=auto eol=lf` stores everything with LF in the repo while leaving
+# each developer's working copy alone.
+* text=auto eol=lf
+
+# Windows-only launchers genuinely need CRLF in the working tree; cmd.exe
+# can mis-parse LF-only .bat/.cmd files.
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
+
+# Never touch binaries.
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.zip binary
+*.xlsx binary
+*.db binary
+*.pdf binary

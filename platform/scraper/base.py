@@ -27,6 +27,22 @@ def _write_text_file(path: str, content: str) -> None:
         f.write(content)
 
 
+# Signatures that mean the browser PROCESS or its CDP transport is gone —
+# not that one page load failed. See is_dead_browser_error for why
+# `net::ERR_*` is excluded from this list.
+_DEAD_TRANSPORT_SIGNATURES = (
+    "has been closed",
+    "target closed",
+    "crash",
+    "protocol error",      # CDP protocol gone
+    "websocket",           # the CDP websocket dropped
+    "connection closed",
+    "econnrefused",        # cannot reach the browser at all
+    "browser closed",
+    "browser has disconnected",
+)
+
+
 def is_dead_browser_error(exc: Exception) -> bool:
     """Whether an exception means the underlying Playwright browser/context/
     page died mid-scrape (as opposed to a normal portal-level failure like a
@@ -44,9 +60,32 @@ def is_dead_browser_error(exc: Exception) -> bool:
     "closed" (page.is_closed() can still report False on a crashed page),
     and the previous "has been closed"/"target closed" strings alone would
     never recognize it, silently letting every remaining booking in a batch
-    fail identically with no self-healing restart."""
+    fail identically with no self-healing restart.
+
+    WIDENED 2026-08-27 (forensic review) after checking this against the
+    transient-error set that Playwright/Browserless production guidance
+    names for connection retry. Five real dead-transport signatures were
+    NOT matched: "protocol error", "websocket", "connection closed",
+    "econnrefused", and "browser closed". When the browser dies with one of
+    those, BookingService's restart path never fires and EVERY remaining
+    booking in the batch fails one at a time against a corpse — which is
+    the shape of the cascading-failure runs already seen on both lines.
+
+    DELIBERATELY STILL EXCLUDED: page-level network errors, i.e. anything
+    matching `net::ERR_*` (ERR_CONNECTION_RESET, ERR_NAME_NOT_RESOLVED,
+    ERR_INTERNET_DISCONNECTED...). Those mean ONE navigation failed while
+    the browser is perfectly healthy. Treating them as a dead browser would
+    trigger a restart, and on ESPRESSO a single close-and-reopen is enough
+    to break the session outright (DOCUMENTATION.md section L) — so a
+    misclassification here does real damage rather than merely wasting
+    time. A transient page error must stay an ordinary per-booking failure
+    handled by the existing retry, not a browser teardown.
+    """
     msg = str(exc).lower()
-    return "has been closed" in msg or "target closed" in msg or "crash" in msg
+    # Page-level network failure: browser is alive, this navigation is not.
+    if "net::err" in msg:
+        return False
+    return any(s in msg for s in _DEAD_TRANSPORT_SIGNATURES)
 
 
 def _sanitize_filename_component(value: str) -> str:
@@ -164,6 +203,22 @@ class BaseScraper(ABC):
         # caller/cruise line unless explicitly opted into.
         self.trace_path: Optional[str] = None
 
+        # ADDED 2026-08-27 — concurrent multi-cruise-line scanning.
+        # When set to a SharedBrowserPool, start() attaches to that pool's
+        # per-cruise-line isolated BrowserContext instead of launching its
+        # OWN Chromium process, and stop() releases just that context
+        # rather than tearing the browser down. This is what makes
+        # ESPRESSO + MSC + NCL run at once without three full browser
+        # processes (see scraper/browser_pool.py for the isolation and
+        # headless-constraint rationale).
+        #
+        # None = the original standalone behavior, completely unchanged:
+        # this scraper owns its own playwright driver + browser + context.
+        # Every existing caller (CLI, the MSC subsystem, one-shot scans)
+        # keeps that path untouched.
+        self._pool = None  # type: ignore[var-annotated]
+        self._owns_browser: bool = True
+
     def _storage_state_path(self) -> Optional[str]:
         """Where the saved login session (cookies + localStorage) lives.
 
@@ -190,8 +245,27 @@ class BaseScraper(ABC):
             settings.browser_user_data_dir, f"storage_state_{self.cruise_line.value}.json",
         )
 
+    def attach_pool(self, pool) -> None:
+        """Use a SharedBrowserPool's isolated context instead of launching
+        our own browser. Must be called BEFORE start().
+
+        See the `_pool` note in __init__ for why. Kept as an explicit
+        opt-in method rather than a constructor arg so every existing
+        `EspressoScraper()` / `NclScraper()` / `GoCCLScraper()` call site
+        keeps working with zero changes.
+        """
+        self._pool = pool
+        self._owns_browser = False
+
     async def start(self, headless: Optional[bool] = None) -> None:
         """Launch the browser and create a page.
+
+        When a SharedBrowserPool is attached (see attach_pool), no browser
+        is launched here at all — this scraper gets that pool's isolated
+        per-cruise-line context and only creates its own page in it. The
+        `headless` argument is then ignored, because headless is a
+        launch-level flag owned by the pool (a shared browser is always
+        headed; ESPRESSO can never be headless).
 
         Args:
             headless: Overrides settings.browser_headless for this session
@@ -211,6 +285,29 @@ class BaseScraper(ABC):
         # restart attempt for the remaining lifetime of the app. Every step
         # below is unchanged when it succeeds; only a failure partway
         # through now cleans up what was already started before re-raising.
+        # POOLED PATH (2026-08-27): attach to the shared browser's isolated
+        # context for this cruise line. Deliberately returns early — none
+        # of the launch/proxy/storage_state logic below applies, because
+        # the pool already owns all of it (including loading this line's
+        # own storage_state, which is why session isolation is preserved).
+        if self._pool is not None:
+            self._context = await self._pool.acquire_context(self.cruise_line)
+            self._browser = getattr(self._pool, "_browser", None)
+            self._page = await self._context.new_page()
+            self._page.set_default_timeout(settings.scraper_timeout_ms)
+            if self.capture_everything:
+                def _on_response_pooled(r):
+                    track_background_task(
+                        self._background_tasks, asyncio.create_task(self._capture_response(r)),
+                    )
+                self._page.on("response", _on_response_pooled)
+            logger.info(
+                "browser.started_pooled",
+                cruise_line=self.cruise_line.value,
+                note="using shared browser's isolated context — no separate Chromium launched",
+            )
+            return
+
         self._playwright = await async_playwright().start()
         try:
             resolved_headless = settings.browser_headless if headless is None else headless
@@ -296,6 +393,35 @@ class BaseScraper(ABC):
         and safe to call when the browser/context is already dead
         (exactly the path booking_service.py's dead-browser recovery
         exercises on every mid-scan Playwright crash)."""
+        # POOLED PATH (2026-08-27): the pool owns the browser, the context
+        # and this cruise line's storage_state. Closing only OUR page here
+        # is essential — calling the standalone teardown below would close
+        # the shared browser and kill every OTHER cruise line's live,
+        # logged-in session mid-scan. Session saving and context lifetime
+        # are the pool's job (see SharedBrowserPool.release_context).
+        if self._pool is not None:
+            if self._background_tasks:
+                try:
+                    await asyncio.wait(list(self._background_tasks), timeout=5)
+                except Exception as e:
+                    logger.warning("browser.background_task_wait_error", error=str(e))
+            try:
+                if self._page is not None and not self._page.is_closed():
+                    await self._page.close()
+            except Exception as e:
+                logger.warning("browser.pooled_page_close_error", error=str(e))
+            for handle in self._jsonl_handles.values():
+                try:
+                    handle.close()
+                except Exception:
+                    pass
+            self._jsonl_handles = {}
+            self._page = None
+            self._context = None
+            self._browser = None
+            logger.info("browser.stopped_pooled", cruise_line=self.cruise_line.value)
+            return
+
         try:
             storage_state_path = self._storage_state_path()
             if storage_state_path and self._context:
@@ -648,9 +774,30 @@ class BaseScraper(ABC):
         self._structure_checked.add(name)
 
         try:
-            snapshot = await self.page.locator(selector).aria_snapshot()
+            # `.first` is REQUIRED, not defensive. CONFIRMED BUG, found
+            # 2026-08-27 from a real run: this project deliberately uses
+            # comma-OR selectors so a portal redesign can't break a
+            # scrape (e.g. EspressoScraper._SEARCH_BUTTON_SELECTOR is
+            # '#searchReservationBtn, [aria-label="Search by Reservation
+            # ID, Name or Date"]' — see its docstring). `page.click(sel)`
+            # is NON-strict and just clicks the first match, so the scrape
+            # works fine — but `locator(sel).aria_snapshot()` IS strict and
+            # raises a strict-mode violation the moment two elements
+            # match. That exception landed here, got logged as a warning
+            # and swallowed (this method never blocks a scan by design),
+            # so `espresso_search_button.yaml` was NEVER created while
+            # `espresso_search_input.yaml` was — the drift alarm silently
+            # covered only half of what it was wired to watch, and nothing
+            # surfaced that because "capture_failed" looks like ordinary
+            # noise. Snapshotting the first match is the correct behaviour
+            # here: it's the same element page.click would act on.
+            snapshot = await self.page.locator(selector).first.aria_snapshot()
         except Exception as e:
-            logger.warning("structure_watch.capture_failed", name=name, selector=selector, error=str(e))
+            # Escalated from warning to error: a capture failure means this
+            # baseline is not being watched AT ALL, which is exactly the
+            # silent-coverage-gap that hid the bug above.
+            logger.error("structure_watch.capture_failed", name=name, selector=selector, error=str(e))
+            self.log_action("structure_watch_capture_failed", name=name, error=str(e))
             return {"status": "capture_failed", "error": str(e)}
 
         baseline_dir = self.STRUCTURE_BASELINE_DIR
