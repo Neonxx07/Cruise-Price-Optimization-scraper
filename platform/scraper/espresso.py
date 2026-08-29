@@ -77,13 +77,83 @@ class EspressoScraper(BaseScraper):
 
     cruise_line = CruiseLine.ESPRESSO
 
+    # Auth HOSTS (matched on the hostname) and auth PATH segments (matched
+    # on the path). Split deliberately, and never as a bare substring of the
+    # whole URL.
+    #
+    # CONFIRMED FALSE POSITIVE, caught by this file's own test before it
+    # ever ran live: a first version listed "sso" as a whole-URL substring,
+    # and "sso" appears inside **"espresso"** - so
+    # `/espresso/protected/reservations.do` was classed as a login page and
+    # EVERY booking would have failed with "Not logged in". Short substrings
+    # against a full URL are not safe; host and path are checked separately.
+    _AUTH_HOST_PREFIXES = ("auth.", "idp.", "sso.", "login.", "signin.")
+    _AUTH_PATH_SEGMENTS = (
+        "/login", "/signin", "/sign-in", "/oauth", "/oauth2",
+        "/sso/", "/saml", "/federate", "/as/authorization",
+    )
+
     async def _check_login(self) -> bool:
-        """Verify user is logged in, based on whatever page we're currently on."""
-        url = self.page.url
-        if "login" in url or "signin" in url:
-            logger.warning("login.required", msg="Not logged in — please log into ESPRESSO first")
+        """Whether we are really authenticated on the page we are on now.
+
+        CONFIRMED REAL BUG, fixed 2026-08-28. Neon: "i log in twice in one
+        time i press on check log in and start i log in again". This used to
+        be PURELY a URL test:
+
+            if "login" in url or "signin" in url: return False
+            return "cruisingpower.com" in url
+
+        ESPRESSO authenticates through an OAuth SSO hop on
+        `auth.cruisingpower.com` (the redirect chain is documented in
+        _search_booking: login -> auth.cruisingpower.com -> oauth callback
+        -> reservations.do). That host contains NEITHER "login" NOR
+        "signin", and it IS on cruisingpower.com - so this returned **True
+        while the browser was still showing the login form**.
+
+        The consequence is exactly the double-login: BookingService.
+        check_login polls this, saw True within ~10s, reported
+        "Login status: OK" before the human had typed anything, and Start
+        then drove into the real login wall - so the operator logged in a
+        SECOND time. It also meant the 2026-08-04 "same URL twice" guard
+        could not help: both polls agreed, on the login page.
+
+        Now three independent checks, cheapest first:
+          1. the URL is not an auth/SSO host,
+          2. we are on cruisingpower.com at all,
+          3. no password field is present - the decisive one, because it is
+             true of a login form whatever the URL says. Same signal
+             NclScraper.auto_login already uses to detect a rejected login.
+        """
+        from urllib.parse import urlsplit
+
+        url = (self.page.url or "").lower()
+        parts = urlsplit(url)
+        host, path = parts.netloc, parts.path
+        if host.startswith(self._AUTH_HOST_PREFIXES) or any(
+            seg in path for seg in self._AUTH_PATH_SEGMENTS
+        ):
+            logger.warning(
+                "login.required", url=url,
+                msg="on an auth/SSO page - please log into ESPRESSO",
+            )
             return False
-        return "cruisingpower.com" in url
+        if "cruisingpower.com" not in url:
+            logger.warning("login.required", url=url, msg="not on ESPRESSO at all")
+            return False
+        try:
+            # A password box on screen means the form is still up even
+            # though the URL looks like the app. Bounded and non-fatal: a
+            # probe failure must not be read as "logged out" (that would
+            # refuse a perfectly good session).
+            if await self.page.locator("input[type='password']").count() > 0:
+                logger.warning(
+                    "login.required", url=url,
+                    msg="password field present - login form still showing",
+                )
+                return False
+        except Exception as exc:
+            logger.debug("login.password_probe_failed", error=str(exc))
+        return True
 
     # ESPRESSO's reservation search box was rebuilt on Mantine at some
     # point — the old plain `#reservationid` input/`#searchReservationBtn`

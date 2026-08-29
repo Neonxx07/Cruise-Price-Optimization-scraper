@@ -24,7 +24,20 @@ def qapp_and_loop():
     app = QApplication.instance() or QApplication([])
     loop = qasync.QEventLoop(app)
     asyncio.set_event_loop(loop)
-    yield app, loop
+    try:
+        yield app, loop
+    finally:
+        # Close the loop HERE rather than leaving it to interpreter
+        # shutdown. Left open, BaseEventLoop.__del__ runs after Qt has
+        # already torn down its objects and qasync's close() raises
+        # "RuntimeError: Signal source has been deleted" — harmless (the
+        # suite still exits 0) but it prints two tracebacks after a green
+        # run, which reads like a failure.
+        asyncio.set_event_loop(None)
+        try:
+            loop.close()
+        except Exception:
+            pass
 
 
 class _FakeQueueManagerRunning:
@@ -68,36 +81,40 @@ def test_regression_shutdown_stops_scan_before_closing_browser(qapp_and_loop):
     in-flight scrape fail and triggered booking_service's dead-browser
     recovery to spin up a SECOND browser while the app was already
     quitting."""
-    from gui.windows import MainWindow
+    from gui.windows import CruiseLinePanel
 
     app, loop = qapp_and_loop
-    win = MainWindow()
-    win.queue_manager = _FakeQueueManagerRunning()
-    win._shutting_down = False
-    quit_called = {"v": False}
-    QApplication.instance().quit = lambda: quit_called.update(v=True)
+    # UPDATED 2026-08-28: shutdown became PER PANEL when the GUI went
+    # tabbed — several lines can hold live browsers at once, so
+    # MainWindow._shutdown_all() awaits every panel's shutdown() rather
+    # than closing one session. The ordering rule under test is unchanged
+    # and still load-bearing: STOP the scan before CLOSING the browser.
+    from core.models import CruiseLine
 
-    loop.run_until_complete(win._shutdown_and_close())
+    win = CruiseLinePanel(CruiseLine.ESPRESSO)
+    win.queue_manager = _FakeQueueManagerRunning()
+
+    loop.run_until_complete(win.shutdown())
 
     qm = win.queue_manager
     assert qm.stop_called, "stop_processing() was never called"
     assert qm.close_called, "close_live_session() was never called"
-    assert quit_called["v"], "quit() was never called"
+    # quit() is the SHELL's job now (MainWindow._shutdown_all), not a
+    # panel's — a panel closing must not take the app down while other
+    # tabs are still shutting down.
 
 
 def test_shutdown_idle_still_closes_browser_and_quits(qapp_and_loop):
-    from gui.windows import MainWindow
+    from gui.windows import CruiseLinePanel
 
     app, loop = qapp_and_loop
-    win = MainWindow()
-    win.queue_manager = _FakeQueueManagerIdle()
-    win._shutting_down = False
-    quit_called = {"v": False}
-    QApplication.instance().quit = lambda: quit_called.update(v=True)
+    from core.models import CruiseLine
 
-    loop.run_until_complete(win._shutdown_and_close())
+    win = CruiseLinePanel(CruiseLine.ESPRESSO)
+    win.queue_manager = _FakeQueueManagerIdle()
+
+    loop.run_until_complete(win.shutdown())
 
     qm = win.queue_manager
     assert not qm.stop_called, "stop_processing() should not be called when nothing is running"
     assert qm.close_called
-    assert quit_called["v"]

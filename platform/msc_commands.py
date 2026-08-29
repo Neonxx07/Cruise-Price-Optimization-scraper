@@ -123,7 +123,7 @@ Commands (one per line in data/msc_control/command.txt):
 
   --- Live discount price-testing (added 2026-08-13) ---
   CONFIRMED REAL GAP this closes, from a forensic investigation of
-  bookings 3000026/3000029: evaluate_msc_booking() can detect a
+  bookings 3000026/74242969: evaluate_msc_booking() can detect a
   discount is ELIGIBLE but never determines what it's actually worth —
   MSC represents at least one real discount (Senior) as a non-literal,
   dynamically-computed rate with no percentage anywhere to parse, and the
@@ -187,6 +187,7 @@ import importlib
 import json
 import os
 import re
+import time
 from datetime import datetime
 
 import dateparser
@@ -602,7 +603,7 @@ def _extract_booking_essentials(text: str) -> dict:
 
     "Guaranteed Cabin" bookings use a completely different line format —
     no cabin number, no parenthetical code, e.g. 'Cabin  1 - Guaranteed
-    Cabin INT' — confirmed on bookings 3000020/3000028, where the first
+    Cabin INT' — confirmed on bookings 3000020/74173329, where the first
     regex returned None for both. Falls back to a second pattern for
     that format.
 
@@ -1315,6 +1316,27 @@ def _extract_discount_catalog(response_body: str) -> list:
     return catalog
 
 
+_CABIN_LINE_RE = re.compile(r"^\s*Cabin\s+(\d+)\s*-", re.IGNORECASE | re.MULTILINE)
+
+
+def _count_cabins(text: str) -> int:
+    """How many cabins this booking has, from MSC's own `Cabin N - ...`
+    lines in the booking summary.
+
+    Added 2026-08-27. Counts DISTINCT cabin numbers rather than raw line
+    matches, because the same cabin heading can legitimately appear more
+    than once on the page (summary plus itemized breakdown) and counting
+    lines would overstate it — which would wrongly refuse a normal
+    single-cabin booking.
+
+    Returns 0 when the pattern isn't found at all. Callers must treat 0 as
+    "unknown", NOT as "one cabin": refusing to guess is the point.
+    """
+    if not text:
+        return 0
+    return len({m.group(1) for m in _CABIN_LINE_RE.finditer(text)})
+
+
 def _is_group_rate(rate_name: str) -> bool:
     """'Group Rates' bookings use a separate block-allocation inventory
     that isn't offered at all in the individual dummy-booking search —
@@ -1976,6 +1998,12 @@ async def _stage_booking_for_confirm(page, booking_id: str) -> dict:
         "discount_options": discount_options,
         "club_discount_offered": club_discount_offered,
         "occupancy_fix": occupancy_fix,
+        # Cabin count, added 2026-08-27 — computed HERE because this is
+        # where the real booking text is available. test_discount_candidate
+        # needs it to refuse multi-cabin bookings (every selector in that
+        # flow targets cabin 1 only, so a multi-cabin "savings" figure
+        # would be wrong by roughly the other cabins).
+        "cabin_count": _count_cabins(booking_text),
     }
 
 
@@ -2094,7 +2122,39 @@ async def _apply_discount_candidate(page, candidate) -> dict:
                 if candidate.label in [o.strip() for o in options]:
                     await sel.select_option(label=candidate.label, force=True, timeout=10000)
                     await page.wait_for_timeout(1000)
-                    return {"success": True, "reason": f"selected {candidate.label!r}"}
+                    # READ-BACK VERIFICATION, added 2026-08-27 (Priority 3).
+                    # This used to return success immediately after the call
+                    # above. `force=True` deliberately SKIPS Playwright's
+                    # actionability checks, so a hidden/disabled/detached
+                    # <select> is "selected" as far as Playwright is
+                    # concerned while MSC's own JS may never register it —
+                    # and the caller then attributed a price delta to a
+                    # discount that was never applied. Read the element's
+                    # ACTUAL selected label back out of the DOM and require
+                    # it to match.
+                    try:
+                        selected_label = await sel.evaluate(
+                            "el => el.selectedIndex >= 0 "
+                            "? (el.options[el.selectedIndex].textContent || '').trim() : ''"
+                        )
+                    except Exception as e:
+                        return {
+                            "success": False,
+                            "reason": f"could not read back the selection to verify it "
+                                      f"(so it cannot be trusted): {e}",
+                        }
+                    if (selected_label or "").strip() != candidate.label.strip():
+                        return {
+                            "success": False,
+                            "reason": f"selection did NOT take: asked for "
+                                      f"{candidate.label!r} but the dropdown still reads "
+                                      f"{selected_label!r} — MSC did not accept it",
+                        }
+                    return {
+                        "success": True,
+                        "reason": f"selected {candidate.label!r} (verified by read-back)",
+                        "verified_selection": selected_label,
+                    }
             return {"success": False, "reason": f"no <select> found with option labeled {candidate.label!r} ({count} selects checked)"}
         except Exception as e:
             return {"success": False, "reason": f"dropdown selection failed: {e}"}
@@ -2120,8 +2180,60 @@ async def _apply_discount_candidate(page, candidate) -> dict:
             await page.fill("#club-dob", candidate.voyagers_dob, timeout=5000)
             await page.fill("#club-card", candidate.voyagers_card_number, timeout=5000)
             await page.evaluate("document.querySelector('.club-search-btn')?.click()")
-            await page.wait_for_timeout(1500)
-            return {"success": True, "reason": "Voyagers Club member details submitted"}
+
+            # OUTCOME VERIFICATION, added 2026-08-27 (Priority 3).
+            # This used to be `wait_for_timeout(1500)` followed by an
+            # UNCONDITIONAL `success: True` — so a member lookup that came
+            # back "not found" was recorded as a successfully applied
+            # discount, and the caller then reported a price delta as a
+            # confirmed Voyagers Club saving. A fixed sleep is not evidence
+            # of anything.
+            #
+            # Polls for a real outcome instead, and FAILS CLOSED: if
+            # neither a success nor a failure marker appears within the
+            # window, that is reported as a failure ("could not confirm"),
+            # never as success. Marker text is matched loosely because the
+            # exact wording is only partly confirmed from one real manual
+            # session — an unrecognized outcome therefore lands in the
+            # fail-closed branch by design, which is the safe direction.
+            _FAIL_MARKERS = (
+                "not found", "no member", "no record", "invalid",
+                "does not match", "try again", "unable to",
+            )
+            _OK_MARKERS = (
+                "club discount", "member found", "discount applied",
+                "voyagers club number",
+            )
+            deadline = time.monotonic() + 12.0
+            last_seen = ""
+            while time.monotonic() < deadline:
+                await page.wait_for_timeout(500)
+                try:
+                    body = (await page.inner_text("body")).lower()
+                except Exception:
+                    continue
+                last_seen = body
+                if any(m in body for m in _FAIL_MARKERS):
+                    matched = next(m for m in _FAIL_MARKERS if m in body)
+                    return {
+                        "success": False,
+                        "reason": f"MSC rejected the Voyagers Club member lookup "
+                                  f"(page reported {matched!r}) — the discount was NOT applied",
+                    }
+                if any(m in body for m in _OK_MARKERS):
+                    matched = next(m for m in _OK_MARKERS if m in body)
+                    return {
+                        "success": True,
+                        "reason": f"Voyagers Club member accepted (page confirmed {matched!r})",
+                        "verified_selection": matched,
+                    }
+            return {
+                "success": False,
+                "reason": "submitted the Voyagers Club member details but MSC showed "
+                          "neither a success nor a failure within 12s — failing closed "
+                          "rather than assuming it worked "
+                          f"(page text was {len(last_seen)} chars)",
+            }
         except Exception as e:
             return {"success": False, "reason": f"Voyagers Club insert failed: {e}"}
 
@@ -2191,7 +2303,7 @@ async def test_discount_candidate(state: dict, booking_id: str, candidate, page=
     price — never an assumed percentage times the current total.
 
     CONFIRMED REAL GAP this closes (forensic investigation, bookings
-    3000026/3000029): evaluate_msc_booking()'s DISCOUNT_ADD/
+    3000026/74242969): evaluate_msc_booking()'s DISCOUNT_ADD/
     DISCOUNT_TIER_UPGRADE checks only ever detect that a discount is
     ELIGIBLE — they never apply it, so a booking can show `OPPORTUNITY`
     with no dollar figure attached (DISCOUNT_ADD never sets
@@ -2311,6 +2423,122 @@ async def test_discount_candidate(state: dict, booking_id: str, candidate, page=
         if occ.get("stalled"):
             return _result(MscDiscountTestStatus.OCCUPANCY_MISMATCH, "occupancy auto-fix did not converge before staging — a price test here would not be comparable to baseline")
 
+        # OCCUPANCY, second distinct failure mode — added 2026-08-27.
+        # `_fix_occupancy` has TWO bad outcomes, not one: `stalled` (above)
+        # and `skipped_empty_passengers`, which means passenger extraction
+        # FAILED so occupancy was left at whatever MSC auto-filled (adults
+        # only). This path only checked `stalled`, so the second one sailed
+        # straight through. That is exactly the confirmed 2026-08-12
+        # booking-3000024 bug (3 kids silently dropped -> a "$1,929.61
+        # opportunity" that was really just missing passengers)
+        # reintroduced into the discount path, where the output is a dollar
+        # figure labelled CONFIRMED. `_check_booking_msc` already surfaces
+        # this as a loud warning; this path printed it nowhere.
+        if occ.get("skipped_empty_passengers"):
+            return _result(
+                MscDiscountTestStatus.OCCUPANCY_MISMATCH,
+                "passenger extraction failed so occupancy was left at MSC's auto-filled "
+                "default (adults only) — any price read here may be for the wrong number "
+                "of guests and is not comparable to baseline",
+            )
+
+        # MULTI-CABIN GUARD — added 2026-08-27 (Priority 4).
+        # Every occupancy/confirm selector in this file is hardcoded
+        # `data-cabin="1"`, `_apply_discount_candidate` takes the FIRST
+        # matching <select> (cabin 1's) and ignores candidate.cabin_number
+        # entirely, and `_extract_booking_essentials`' category regex
+        # matches only the first `Cabin N -` line. So on a 2-cabin
+        # booking the baseline value covers BOTH cabins while the discount
+        # is applied to one and the post-price is one stateroom — the
+        # reported "savings" is roughly half the booking, presented as
+        # confirmed. Nothing anywhere detected cabin count.
+        #
+        # Refuses rather than guesses, per this project's standing rule.
+        # Comes from _stage_booking_for_confirm, which computes it from the
+        # real booking text (staged has no raw summary_text key).
+        cabin_count = staged.get("cabin_count") or 0
+        _evidence["cabin_count"] = cabin_count
+        if cabin_count > 1:
+            return _result(
+                MscDiscountTestStatus.INSUFFICIENT_DATA,
+                f"this booking has {cabin_count} cabins, and every discount-test "
+                f"selector in this flow targets cabin 1 only — the baseline value "
+                f"covers all cabins while the discounted price would cover one, so "
+                f"any 'savings' figure would be wrong by roughly the other cabins. "
+                f"Check this booking by hand.",
+            )
+
+        # ELIGIBILITY GATE — added 2026-08-27 (Priority 2).
+        # THE ROOT CAUSE, fixed here rather than at the command handler so
+        # EVERY caller is covered: `generate_discount_candidates()` holds
+        # all the hard eligibility policy (military/MIL-CIV never applied,
+        # senior discount requires 2+ seniors, Group Rate capped to the
+        # flat Voyagers 5% with no dropdown tiers) but a repo-wide grep
+        # confirmed it was called ONLY from tests — never from production.
+        # The live `test_discount:<id>:<label>` command built a candidate
+        # straight from typed text, so `test_discount:3000030:SENIOR
+        # DISCOUNT` on a lone senior — the exact 2026-08-18 false positive
+        # that was fixed in the calculator — ran here completely unguarded
+        # and produced a CONFIRMED_OPTIMIZATION dollar figure, which looks
+        # MORE authoritative than the calculator note that was corrected.
+        #
+        # Validated against the SAME on-page evidence the tested path uses
+        # (staged discount_options / senior_count / is_group_rate), so the
+        # two paths cannot drift apart.
+        #
+        # Voyagers Club INSERT candidates are exempt: by design
+        # generate_discount_candidates never emits them (it has no
+        # passenger data), so they'd always fail this check. They have
+        # their own separate command handler and their own real-member
+        # requirement.
+        method_value = getattr(getattr(candidate, "method", None), "value", "")
+        if method_value != "VOYAGERS_CLUB_INSERT":
+            # Distinguish the two failure shapes — they mean different
+            # things to the operator and this file's None-vs-[] discipline
+            # exists precisely to keep them apart:
+            #   discount_options is None -> we never CAPTURED the dropdown
+            #     (a scrape problem: MSC's own offers are unknown).
+            #   discount_options is a list -> we know what's on offer and
+            #     this label isn't eligible (a policy answer).
+            # Either way we refuse — if we don't know what MSC offers we
+            # cannot confirm eligibility — but the operator needs to know
+            # which one it was.
+            if staged.get("discount_options") is None:
+                logger.warning(
+                    "msc.discount_options_not_captured",
+                    booking_id=booking_id, requested=candidate.label,
+                )
+                return _result(
+                    MscDiscountTestStatus.INSUFFICIENT_DATA,
+                    f"cannot verify {candidate.label!r} is eligible: this booking's "
+                    f"discount dropdown was never captured during staging, so MSC's "
+                    f"actual offers are unknown. Refusing to apply an unverified "
+                    f"discount rather than guessing.",
+                )
+            allowed = generate_discount_candidates(staged)
+            allowed_labels = {
+                (getattr(c, "label", "") or "").strip().upper() for c in allowed
+            }
+            requested = (getattr(candidate, "label", "") or "").strip().upper()
+            if requested not in allowed_labels:
+                logger.warning(
+                    "msc.discount_candidate_rejected_ineligible",
+                    booking_id=booking_id, requested=requested,
+                    allowed=sorted(allowed_labels),
+                    senior_count=staged.get("senior_count"),
+                    is_group_rate=staged.get("is_group_rate"),
+                )
+                return _result(
+                    MscDiscountTestStatus.INSUFFICIENT_DATA,
+                    f"{candidate.label!r} is NOT an eligible discount for this booking "
+                    f"and was refused before any price was read. Eligible options here: "
+                    f"{sorted(allowed_labels) or 'none'}. "
+                    f"(senior_count={staged.get('senior_count')}, "
+                    f"is_group_rate={staged.get('is_group_rate')} — senior discount needs "
+                    f"2+ seniors, military/MIL-CIV is never applied by CruiseIntel, and "
+                    f"Group Rate bookings are capped at the flat Voyagers 5%.)",
+                )
+
         # 3. APPLY — the one genuinely new step.
         _evidence["application_attempted"] = True
         applied = await _apply_discount_candidate(page, candidate)
@@ -2392,6 +2620,71 @@ async def test_discount_candidate(state: dict, booking_id: str, candidate, page=
         _evidence["restoration_verified"] = True
 
         # 7. COMPARE — only reached once every step above is verified.
+        #
+        # ⚠ KNOWN MEASUREMENT DEFECT — INVESTIGATED 2026-08-27, DELIBERATELY
+        # NOT YET CHANGED (a fix here alters real reported dollars, so it
+        # needs the project owner's explicit sign-off first).
+        #
+        # TRACED FACTS:
+        #   price_before  = _parse_dollars_safe(baseline_essentials["value"])
+        #                   i.e. the REAL booking's "Booking Value" — the
+        #                   locked-in, ALREADY-DISCOUNTED total from when the
+        #                   booking was made (read via _lookup_one_booking).
+        #   price_after   = _find_today_price(...) on the dummy "Book Same
+        #                   Departure" listing — TODAY's price, discount
+        #                   applied.
+        #
+        # So this subtraction conflates TWO independent quantities:
+        #   (a) market movement between the booking date and today, and
+        #   (b) the discount's actual effect.
+        # Only (b) is what a "discount saves you $X" claim means, but the
+        # whole delta is reported as (b) and labelled CONFIRMED_OPTIMIZATION.
+        #
+        # This module's own sibling, core/calculator_msc.py, states the rule
+        # being broken here in its `current_base_price` docstring:
+        # comparing a discounted current price against an undiscounted
+        # today's price is "an apples-to-oranges trap." _check_price_match
+        # respects it; this path does not.
+        #
+        # CORROBORATION from this project's own ground-truth test: booking
+        # 3000026, SENIOR DISCOUNT, $2,588.72 -> $2,565.26 = $23.46, which
+        # is 0.906%. No senior discount is 0.906% — that figure is a
+        # composition/market delta, not a discount.
+        #
+        # WHERE A VALID CONTROL COULD COME FROM (established, not guessed):
+        # _check_booking_msc already reads exactly the number needed — an
+        # UNDISCOUNTED today's price for the SAME category — at
+        # msc_commands.py's `today_price = _find_today_price(listing_text,
+        # staged["category"], ...)`, using the SAME function on the SAME
+        # kind of page. No new measurement mechanism is required.
+        #
+        # THE OBSTACLE: the discount is applied on the occupancy screen
+        # BEFORE _confirm_and_proceed_click, while prices only become
+        # readable on the listing AFTER it. So the undiscounted listing
+        # price cannot be read in the same pass — by the time a price
+        # exists, the discount is already on.
+        #
+        # OPTIONS (for the project owner to choose):
+        #   (a) TWO PASSES: pass 1 = stage+confirm with NO discount ->
+        #       control (identical to what _check_booking_msc already
+        #       produces); pass 2 = stage+confirm WITH the discount ->
+        #       treatment. actual_savings = control - treatment. Both reads
+        #       come from the same function and page type, so they are
+        #       directly comparable. Cost: two stage+confirm cycles per
+        #       candidate.
+        #   (b) REUSE a recent _check_booking_msc result for the same
+        #       booking/category/rate-tab as the control. Cheaper, but
+        #       introduces a staleness window that would need a bound.
+        #   (c) Read a pre-discount price on the occupancy screen itself.
+        #       UNVERIFIED — _wait_for_post_discount_price's known sources
+        #       (category listing, "Total Stateroom Price") both appear
+        #       post-confirm, so this may not be available at all. Would
+        #       need a live check on a real booking to establish.
+        #
+        # WHICHEVER is chosen, two conditions must hold or the comparison
+        # is invalid again: both reads must have the SAME `price_source`
+        # (the field already exists and nothing currently checks it), and
+        # the SAME rate tab must be active for both.
         actual_savings = round2(price_before - price_after)
         _evidence["actual_savings"] = actual_savings
         final_status = (

@@ -28,7 +28,9 @@ import asyncio
 from config.settings import settings
 from core.calculator import (
     calculate_ncl,
+    is_paid_in_full,
     make_error_result,
+    make_not_on_this_account_result,
     make_paid_in_full_result,
 )
 from core.models import BookingResult, CruiseLine
@@ -36,7 +38,107 @@ from utils.logging import get_logger
 
 from .base import BaseScraper, is_dead_browser_error
 
+
+# Shared JS: locate NCL's SlickGrid data model WITHOUT hard-coding a form
+# index.
+#
+# CONFIRMED REAL BUG, fixed 2026-08-27 from a live 3-booking pilot. Every
+# read here was pinned to `window.VX.get('_form_12')`, which is a
+# POSITIONAL key SilverStripe/VX assigns by form order on the page — it is
+# not stable across bookings. The four bookings verified on 2026-08-26
+# happened to render the category grid at _form_12, so it looked correct.
+# Bookings 3000059 (cat I4) and 3000058 (cat IX) both failed with
+# `Cannot read categories: VX._form_12 not available` AFTER successfully
+# searching, reading totals, reading addons and entering edit mode — the
+# grid was there, just under a different key.
+#
+# Strategy, in order:
+#   1. Try the known-good key first (fast path, no behaviour change for
+#      bookings that already worked).
+#   2. Otherwise probe _form_0.._form_80 and pick the first array whose
+#      rows are category-SHAPED (have a Category field). Shape-matching,
+#      not index guessing.
+#   3. On failure report which keys actually held something, so the next
+#      occurrence is diagnosable instead of opaque.
+_VX_FIND_JS = """
+  const VXfind = () => {
+    if (!window.VX || typeof window.VX.get !== 'function') return {err: 'window.VX missing'};
+    const isColumnDefs = row => row && ('field' in row) && ('sortable' in row);
+    const looksLikeCats = v => Array.isArray(v) && v.length > 0
+        && v[0] && typeof v[0] === 'object'
+        && !isColumnDefs(v[0])
+        && (('Category' in v[0]) || ('ResTotal' in v[0]));
+    const known = window.VX.get('_form_12');
+    if (looksLikeCats(known)) return {cats: known, key: '_form_12'};
+    const seen = [];
+    // Distinguish "grid missing" from "grid present but has no rows".
+    // Column DEFINITIONS prove the SlickGrid component initialised on this
+    // page; an empty row array alongside them means NCL is offering zero
+    // categories for this booking. Confirmed on booking 3000059
+    // (2026-08-27): _form_10 = array[19] of column defs, _form_11 =
+    // array[0], stable across 10s of polling. Treating that as a hard
+    // error put a legitimate no-op in the ERROR bucket next to real bugs.
+    let sawColumnDefs = false, sawEmptyArray = false;
+    for (let i = 0; i <= 80; i++) {
+      const k = '_form_' + i;
+      let v; try { v = window.VX.get(k); } catch (e) { continue; }
+      if (v === undefined || v === null) continue;
+      seen.push(k + ':' + (Array.isArray(v) ? 'array[' + v.length + ']'
+          + (v[0] && typeof v[0] === 'object' ? '{' + Object.keys(v[0]).join(',') + '}' : '')
+          : typeof v));
+      if (Array.isArray(v)) {
+        if (v.length === 0) sawEmptyArray = true;
+        else if (isColumnDefs(v[0])) sawColumnDefs = true;
+      }
+      if (looksLikeCats(v)) return {cats: v, key: k};
+    }
+    if (sawColumnDefs && sawEmptyArray) {
+      return {cats: [], key: 'empty-grid', empty: true, seen: seen};
+    }
+    return {err: 'no category-shaped array in VX', seen: seen};
+  };
+  const VXcurrent = () => {
+    if (!window.VX || typeof window.VX.get !== 'function') return null;
+    for (const k of ['_form_10', '_form_9', '_form_11', '_form_8']) {
+      let v; try { v = window.VX.get(k); } catch (e) { continue; }
+      const val = v && v.value && v.value[0];
+      if (val) return val;
+    }
+    return null;
+  };
+"""
+
+
 logger = get_logger(__name__)
+
+
+_WRONG_ACCOUNT_PATTERNS = (
+    "reservation is not found",
+    "reservation not found",
+)
+
+
+def _is_wrong_account_error(error_text: str | None) -> bool:
+    """Whether an NCL portal error means "this booking lives on a DIFFERENT
+    agent account" rather than "something went wrong".
+
+    Substring match on a normalized string, deliberately narrow: only the
+    not-found wording. NCL's error element is also used for genuine
+    failures, and mis-classifying one of those as a clean no-op would hide
+    a real bug.
+
+    CAVEAT, recorded honestly: a booking currently held under another
+    session's 30-minute EDIT LOCK can also surface as not-found. In the
+    2026-08-27 run, bookings 3000059 and 3000060 reported this while a
+    concurrent session had them locked, yet both were readable on their own.
+    So this status means "not visible to THIS account right now" — the
+    operator should re-run on the other market's login before concluding
+    the booking is Canadian.
+    """
+    if not error_text:
+        return False
+    text = " ".join(error_text.split()).lower()
+    return any(p in text for p in _WRONG_ACCOUNT_PATTERNS)
 
 
 def _resolve_new_total(new_data: dict, fallback: float) -> float:
@@ -93,14 +195,49 @@ class NclScraper(BaseScraper):
 
     cruise_line = CruiseLine.NCL
 
-    def __init__(self):
+    def __init__(self, market: str | None = None):
+        """`market` selects WHICH NCL agent account to use ("US"/"CA").
+
+        NCL runs a separate SeaWeb account per market (confirmed by Neon
+        2026-08-27 — Canadian bookings are invisible on the US login), so
+        each market needs its own credentials AND its own saved session.
+        Defaults to settings.ncl_default_market so every existing caller
+        keeps its current behaviour untouched."""
         super().__init__()
+        self.market = (market or settings.ncl_default_market).upper()
         self._dialog_handler_installed = False
+        # Post-click evidence from the most recent _select_category (see it).
+        self.last_selection_evidence: dict | None = None
         # Every dialog seen this session: {"type", "message", "action"}.
         # Surfaced for post-run review (and by run_ncl_live_check.py) since
         # an UNEXPECTED dialog on this portal is exactly the kind of thing
         # that silently breaks a flow — see _install_dialog_handler.
         self.dialogs_seen: list[dict] = []
+
+    @property
+    def credential_service(self) -> str:
+        """Keyring service name for this market's account.
+
+        The DEFAULT market deliberately keeps the ORIGINAL, unsuffixed
+        service name so credentials already saved via save_login.py keep
+        working with no migration."""
+        base = settings.ncl_credential_service
+        if self.market == settings.ncl_default_market.upper():
+            return base
+        return f"{base}_{self.market.lower()}"
+
+    def _storage_state_path(self):
+        """Per-MARKET session file.
+
+        Two NCL accounts sharing one storage_state_NCL.json would clobber
+        each other's session on every switch — the exact bug that made a
+        GoCCL login wipe out a working ESPRESSO session (see
+        BaseScraper._storage_state_path). The default market keeps the
+        original filename so an existing saved session is not orphaned."""
+        path = super()._storage_state_path()
+        if path is None or self.market == settings.ncl_default_market.upper():
+            return path
+        return path.replace(".json", f"_{self.market.lower()}.json")
 
     def _install_dialog_handler(self) -> None:
         """Install ONE persistent dialog handler for the whole session.
@@ -240,8 +377,9 @@ class NclScraper(BaseScraper):
         except Exception as e:  # keyring is a hard dependency, but never crash login on it
             return f"ERROR: keyring unavailable ({e})"
 
-        username = keyring.get_password(settings.ncl_credential_service, "username")
-        password = keyring.get_password(settings.ncl_credential_service, "password")
+        service = self.credential_service
+        username = keyring.get_password(service, "username")
+        password = keyring.get_password(service, "password")
         if not username or not password:
             return "NO_CREDENTIALS_SAVED"
 
@@ -404,7 +542,7 @@ class NclScraper(BaseScraper):
             })()
         """)
 
-    async def _scrape_addons(self) -> list[dict]:
+    async def _scrape_addons(self) -> list[dict] | None:
         """Scrape the Addons table from the Reservation Summary page.
 
         WIDENED 2026-08-26 (real recorded session, booking 3000007):
@@ -458,10 +596,33 @@ class NclScraper(BaseScraper):
                         if (name && name.length > 2) addons.push({ name, qty, guest });
                     }
                     return addons;
-                } catch(e) { return []; }
+                } catch(e) { return null; }
             })()
         """)
-        return result or []
+        # CONFIRMED REAL MONEY RISK, fixed 2026-08-27. This used to return
+        # `[]` for THREE different situations — an exception, no addons
+        # table on the page, and a booking that genuinely has no addons —
+        # making them indistinguishable. Combined with the before/after
+        # addon diff that prices OBC loss, that is wrong in BOTH
+        # directions:
+        #
+        #   * BEFORE list fails -> lost = before - after is empty -> a real
+        #     forfeited OBC certificate goes UNDETECTED and the booking is
+        #     reported as a clean OPTIMIZATION. This is exactly the false
+        #     positive Neon caught on 3000055 ($57 "saving" that actually
+        #     lost $100 of OBC), arriving by a different route.
+        #   * AFTER list fails -> every before-addon reads as lost -> real
+        #     optimizations are rejected.
+        #
+        # `None` now means "could not read" and `[]` means "read fine, this
+        # booking has none" — the same None-vs-zero discipline already used
+        # by _resolve_new_total and _get_total. Never calculate a lost
+        # package value from addon data we failed to read.
+        if result is None:
+            logger.warning("ncl.addon_scrape_failed")
+            self.log_action("addon_scrape_failed")
+            return None
+        return result
 
     async def _switch_to_edit_mode(self) -> bool:
         """Click Switch to Edit Mode. Returns True if edit mode activated.
@@ -618,19 +779,56 @@ class NclScraper(BaseScraper):
         await self.wait_for("#SWXMLForm_SelectCategory_category, .slick-viewport", timeout=12000)
         await asyncio.sleep(0.6)  # Let SlickGrid render
 
+
     async def _read_category_data(self) -> dict:
-        """Read all categories from VX._form_12 (SlickGrid data model)."""
+        """Read all categories from NCL's SlickGrid data model.
+
+        The form key is DISCOVERED, not hard-coded — see _VX_FIND_JS for
+        the incident that made that necessary.
+
+        POLLS rather than reading once. Confirmed 2026-08-27: booking
+        3000059 reached this point with only SlickGrid's COLUMN
+        DEFINITIONS in VX (array[19] of {field,sortable,editor,...}) — the
+        row data had not populated yet, while booking 3000058 on the very
+        same run read fine. `_open_category_tab`'s fixed 0.6s sleep is a
+        guess; a booking with more categories or a slower response needs
+        longer. Retrying is safe here because this is a pure read: no
+        clicks, nothing mutated. (The mutating confirm/cancel/submit clicks
+        elsewhere in this file must NEVER be retried.)"""
+        deadline = asyncio.get_event_loop().time() + 10.0
+        attempt = 0
+        while True:
+            attempt += 1
+            data = await self._read_category_data_once()
+            if data.get("ok"):
+                if attempt > 1:
+                    logger.info("ncl.category_grid_ready_after_poll", attempts=attempt)
+                return data
+            if asyncio.get_event_loop().time() >= deadline:
+                data["pollAttempts"] = attempt
+                return data
+            await asyncio.sleep(0.5)
+
+    async def _read_category_data_once(self) -> dict:
+        """One attempt at reading the grid — see _read_category_data."""
         return await self.page.evaluate("""
             (() => {
                 try {
-                    const categories = window.VX?.get('_form_12');
-                    if (!categories || !Array.isArray(categories))
-                        return { ok: false, error: 'VX._form_12 not available' };
-                    const currentVal = window.VX?.get('_form_10')?.value?.[0] || null;
+                    
+  __VX_FIND__
+
+
+                    const found = VXfind();
+                    if (found.err) {
+                        return { ok: false,
+                                 error: 'category grid not found in VX: ' + found.err,
+                                 vxKeys: found.seen || [] };
+                    }
                     return {
                         ok: true,
-                        currentCategory: currentVal,
-                        categories: categories.map(c => ({
+                        vxKey: found.key,
+                        currentCategory: VXcurrent(),
+                        categories: found.cats.map(c => ({
                             category: c.Category,
                             resTotal: parseFloat(c.ResTotal) || 0,
                             status: c.Status,
@@ -639,6 +837,153 @@ class NclScraper(BaseScraper):
                         }))
                     };
                 } catch(e) { return { ok: false, error: e.message }; }
+            })()
+        """.replace("__VX_FIND__", _VX_FIND_JS))
+
+    async def _read_payment_state(self) -> dict:
+        """Balance, final-payment date and commission from the summary page.
+
+        ADDED 2026-08-28. Every field here was confirmed present in REAL
+        captured pages (data/ncl_live_test/pages/*booking_summary*.json)
+        before a line of this was written - nothing is guessed:
+
+            Explanation      Payment Due Date   Amount
+            FINAL PAYMENT    01/09/2027         $2,028.10
+            Charge Total $0.00   Funds Avail. $360.00
+            Commiss.Earned $250.90
+            Gross Due $1,793.10  Com.Due $250.90  Net Due $1,542.20
+
+        WHY IT MATTERS - three separate defects Neon reported on 2026-08-28,
+        all rooted in NCL never reading any of this:
+
+        1. Paid-in-full was decided SOLELY by the boolean `d.bi.IsPaid`.
+           Booking 3000057 has $43 outstanding on $1,818 (2.4%) and was
+           reported as a $100 OPTIMIZATION. ESPRESSO has had a
+           tolerance-based rule for months (is_paid_in_full, 5%); NCL had
+           nothing to apply it to.
+        2. "we actually get 43 not 100 because the customer has paid in
+           full" - a reprice only reduces the OUTSTANDING balance, so the
+           recoverable amount is capped by Gross Due.
+        3. "we will lose 48$ comission" - a lower fare means less
+           commission. The rate is on the page per booking (Com.Due against
+           Gross Due = 13.99% on the captured example; Neon's $48 on a
+           $300 drop implies ~16%), so it is READ, never assumed.
+
+        Every value is None when it could not be read, never 0.0 - the same
+        None-vs-zero discipline as _resolve_new_total and _scrape_addons. A
+        fabricated $0 balance would look like "fully paid" and a fabricated
+        $0 commission would look like "costs nothing".
+        """
+        return await self.page.evaluate(r"""
+            (() => {
+                const money = (s) => {
+                    if (!s) return null;
+                    const m = String(s).replace(/,/g, '').match(/-?\$?\s*(-?\d+(?:\.\d+)?)/);
+                    return m ? parseFloat(m[1]) : null;
+                };
+                // Label -> value by ADJACENT TEXT, the same shape the
+                // generic structured extractor already produces for this
+                // page (labelPairs). Exact-match on the trimmed label so
+                // "Com.Due" cannot be satisfied by "Gross Due".
+                const byLabel = (wanted) => {
+                    // Any LEAF element (no element children) - a label is
+                    // always a leaf. The first version listed fixed tags
+                    // ('td, th, dt, dd, span, div, label') and missed
+                    // "Charge Total", which is present on the real page with
+                    // value "$0.00" but sits in a tag that was not listed.
+                    // Filtering by leafness is what the label actually IS,
+                    // rather than guessing which tag it happens to use.
+                    const els = Array.from(document.querySelectorAll('*'))
+                        .filter(el => el.children.length === 0);
+                    for (const el of els) {
+                        const txt = (el.textContent || '').trim();
+                        if (txt !== wanted) continue;
+                        const sib = el.nextElementSibling;
+                        if (sib) {
+                            const v = (sib.textContent || '').trim();
+                            if (v) return v;
+                        }
+                        const parentText = (el.parentElement
+                            && el.parentElement.textContent) || '';
+                        const after = parentText.split(wanted)[1];
+                        if (after) return after.trim().split(/\s{2,}|\n/)[0];
+                    }
+                    return null;
+                };
+                // The payment-schedule row whose Explanation is FINAL
+                // PAYMENT: "FINAL PAYMENT | 01/09/2027 | $2,028.10".
+                let finalDate = null, finalAmount = null;
+                for (const row of Array.from(document.querySelectorAll('tr'))) {
+                    const cells = Array.from(row.querySelectorAll('td, th'))
+                        .map(c => (c.textContent || '').trim());
+                    if (!cells.length) continue;
+                    if (!cells.some(c => /final\s*payment/i.test(c))) continue;
+                    const dateCell = cells.find(c => /\d{1,2}\/\d{1,2}\/\d{2,4}/.test(c));
+                    if (dateCell) {
+                        const m = dateCell.match(/\d{1,2}\/\d{1,2}\/\d{2,4}/);
+                        finalDate = m ? m[0] : null;
+                    }
+                    const amtCell = cells.find(c => /\$/.test(c));
+                    if (amtCell) finalAmount = amtCell;
+                    if (finalDate) break;
+                }
+                const grossDue = byLabel('Gross Due');
+                const comDue = byLabel('Com.Due');
+                const netDue = byLabel('Net Due');
+
+                // The COMPLETE payment schedule, not just the FINAL PAYMENT
+                // row: "Explanation | Payment Due Date | Amount". A deposit
+                // row and its date matter for the same reasons the final
+                // payment does.
+                const schedule = [];
+                for (const row of Array.from(document.querySelectorAll('tr'))) {
+                    const cells = Array.from(row.querySelectorAll('td, th'))
+                        .map(c => (c.textContent || '').trim()).filter(Boolean);
+                    if (cells.length < 2) continue;
+                    const hasDate = cells.some(c => /\d{1,2}\/\d{1,2}\/\d{2,4}/.test(c));
+                    const hasMoney = cells.some(c => /\$/.test(c));
+                    if (hasDate && hasMoney && cells.length <= 6) {
+                        schedule.push(cells);
+                    }
+                }
+
+                // Booking facts. All confirmed present as label/value pairs
+                // on the real captured summary page.
+                const facts = {};
+                for (const label of [
+                    'Res ID:', 'Status:', 'Initial Date', 'Effective Date',
+                    'Booking Source', 'Destination', 'Vacation Start Date',
+                    'Vacation End Date', 'Ship', 'Pricing Category',
+                    'Assigned Category', 'Stateroom:', 'Guests:', 'Name',
+                ]) {
+                    const v = byLabel(label);
+                    if (v) facts[label.replace(':', '')] = v;
+                }
+
+                return {
+                    ok: true,
+                    finalPaymentDate: finalDate,
+                    finalPaymentAmount: money(finalAmount),
+                    // The full Invoice and Payments panel. chargeTotal and
+                    // fundsAvail were missing from the first version and are
+                    // what make the arithmetic checkable:
+                    // fundsAvail + grossDue should equal the booking total
+                    // (3,795.00 + 163.00 = 3,958.00 on booking 3000049).
+                    chargeTotal: money(byLabel('Charge Total')),
+                    fundsAvail: money(byLabel('Funds Avail.')),
+                    commissEarned: money(byLabel('Commiss.Earned')),
+                    grossDue: money(grossDue),
+                    comDue: money(comDue),
+                    netDue: money(netDue),
+                    paymentSchedule: schedule,
+                    bookingFacts: facts,
+                    rawLabels: {
+                        grossDue: grossDue, comDue: comDue, netDue: netDue,
+                        chargeTotal: byLabel('Charge Total'),
+                        fundsAvail: byLabel('Funds Avail.'),
+                        commissEarned: byLabel('Commiss.Earned'),
+                    },
+                };
             })()
         """)
 
@@ -664,13 +1009,30 @@ class NclScraper(BaseScraper):
         this single action, and this portal raises dialogs at many other
         points too."""
         self._install_dialog_handler()
-        result = await self.page.evaluate(f"""
-            (async () => {{
-                try {{
-                    const categories = window.VX?.get('_form_12');
-                    if (!categories) return false;
-                    const idx = categories.findIndex(c => c.Category === '{target_cat}');
-                    if (idx < 0) return {{ ok: false, reason: 'category_not_in_grid_data' }};
+        result = await self.page.evaluate("""
+            (async () => {
+                try {
+                    __VX_FIND__
+                    const found = VXfind();
+                    if (found.err) {
+                        // CONFIRMED REAL BUG, fixed 2026-08-27. This still
+                        // hard-coded window.VX.get('_form_12') long after
+                        // _read_category_data was fixed to DISCOVER the key
+                        // — the same positional-key defect, missed here.
+                        // Consequence: on any booking whose grid is not at
+                        // _form_12, re-selection returned a BARE `false`,
+                        // the caller raised "Category re-selection failed",
+                        // and a GENUINE PRICE DROP was reported as an ERROR
+                        // instead of an optimization. 53 of the 83 NCL
+                        // errors in the 2026-08-27 run were this key defect
+                        // in its sibling function.
+                        return { ok: false, reason: 'category_grid_not_found_in_vx',
+                                  vxDetail: found.err, vxKeys: found.seen || [] };
+                    }
+                    const categories = found.cats;
+                    const vxKey = found.key;
+                    const idx = categories.findIndex(c => c.Category === '__TARGET_CAT__');
+                    if (idx < 0) return { ok: false, reason: 'category_not_in_grid_data' };
                     // NOTE: HasAvailability is deliberately NOT required here.
                     // It was a leftover from the original "switch to a
                     // DIFFERENT cheaper category" design, where you genuinely
@@ -683,14 +1045,14 @@ class NclScraper(BaseScraper):
                     // is visible instead of silently refused.
                     const avail = categories[idx].HasAvailability;
                     const viewport = document.querySelector('.slick-viewport');
-                    if (!viewport) return {{ ok: false, reason: 'slick_viewport_not_found', hasAvailability: avail }};
+                    if (!viewport) return { ok: false, reason: 'slick_viewport_not_found', hasAvailability: avail };
 
                     // Finds the target row among the CURRENTLY RENDERED rows.
                     const findRow = () => Array.from(viewport.querySelectorAll('.slick-row'))
-                        .find(row => {{
+                        .find(row => {
                             const a = row.querySelector('.slick-cell.l0 a.infolink, .slick-cell:first-child a');
-                            return a && a.textContent.trim() === '{target_cat}';
-                        }});
+                            return a && a.textContent.trim() === '__TARGET_CAT__';
+                        });
 
                     // CONFIRMED REAL BUG, fixed 2026-08-26 (live run, booking
                     // 3000003 / category IT): SlickGrid is VIRTUALIZED — it
@@ -712,34 +1074,34 @@ class NclScraper(BaseScraper):
                     // renders. Re-query after every scroll, since virtualized
                     // rows are destroyed/recreated as they move in and out.
                     let row = findRow();
-                    if (!row) {{
+                    if (!row) {
                         const sample = viewport.querySelector('.slick-row');
                         const rowH = (sample && sample.offsetHeight) || 25;
                         // Jump straight to the estimated position first.
                         viewport.scrollTop = Math.max(0, (idx * rowH) - (viewport.clientHeight / 2));
                         await new Promise(r => setTimeout(r, 250));
                         row = findRow();
-                    }}
-                    if (!row) {{
+                    }
+                    if (!row) {
                         // Fallback: sweep the whole viewport top-to-bottom.
                         const step = Math.max(100, Math.floor(viewport.clientHeight * 0.8));
-                        for (let pos = 0; pos <= viewport.scrollHeight; pos += step) {{
+                        for (let pos = 0; pos <= viewport.scrollHeight; pos += step) {
                             viewport.scrollTop = pos;
                             await new Promise(r => setTimeout(r, 150));
                             row = findRow();
                             if (row) break;
-                        }}
-                    }}
-                    if (!row) {{
-                        return {{
+                        }
+                    }
+                    if (!row) {
+                        return {
                             ok: false,
                             reason: 'row_never_rendered_after_scrolling',
                             hasAvailability: avail,
                             gridIndex: idx,
                             totalCategories: categories.length,
                             renderedRows: viewport.querySelectorAll('.slick-row').length,
-                        }};
-                    }}
+                        };
+                    }
 
                     // CONFIRMED real link text 2026-08-26 (recorded session):
                     // the row's select control is a plain <a> whose visible
@@ -747,17 +1109,49 @@ class NclScraper(BaseScraper):
                     // attribute-based guesses, which were never confirmed.
                     const selectBtn = row.querySelector('a[data-link-action="select"], a.navlink')
                         || Array.from(row.querySelectorAll('a')).find(a => a.textContent.trim() === 'Select');
-                    if (!selectBtn) {{
-                        return {{ ok: false, reason: 'select_link_not_found_in_row', hasAvailability: avail }};
-                    }}
+                    if (!selectBtn) {
+                        return { ok: false, reason: 'select_link_not_found_in_row', hasAvailability: avail };
+                    }
+                    // EVIDENCE CAPTURE, added 2026-08-27. This used to
+                    // return ok:true purely because a click was DISPATCHED
+                    // — "success returned without verification". Snapshot
+                    // the target row's own recalculated total before and
+                    // after so the caller can see whether the click had any
+                    // observable effect at all.
+                    //
+                    // Deliberately NOT failing on "no change detected":
+                    // NCL's recalculation is server-side and may legitimately
+                    // land on a later step (the Stateroom page) rather than
+                    // mutating this grid, so treating an unchanged grid as a
+                    // failure would reject real repricings. The evidence is
+                    // reported and logged; the decision stays with the
+                    // caller, which independently re-reads the total.
+                    const beforeTotal = categories[idx] ? categories[idx].ResTotal : null;
+                    const beforeRows = viewport.querySelectorAll('.slick-row').length;
                     selectBtn.click();
                     await new Promise(r => setTimeout(r, 600));
-                    return {{ ok: true, hasAvailability: avail, gridIndex: idx }};
-                }} catch(e) {{
-                    return {{ ok: false, reason: 'exception: ' + (e && e.message) }};
-                }}
-            }})()
-        """)
+                    let afterTotal = null, selectedMarker = false;
+                    try {
+                        const reread = VXfind();
+                        if (!reread.err) {
+                            const c2 = reread.cats.find(c => c.Category === '__TARGET_CAT__');
+                            afterTotal = c2 ? c2.ResTotal : null;
+                        }
+                        selectedMarker = !!document.querySelector(
+                            '.slick-row.selected, .slick-row.active, .slick-row[aria-selected="true"]'
+                        );
+                    } catch (e) { /* evidence only — never fail the selection on it */ }
+                    return {
+                        ok: true, hasAvailability: avail, gridIndex: idx, vxKey: vxKey,
+                        beforeTotal: beforeTotal, afterTotal: afterTotal,
+                        totalChanged: String(beforeTotal) !== String(afterTotal),
+                        selectedMarker: selectedMarker, renderedRows: beforeRows,
+                    };
+                } catch(e) {
+                    return { ok: false, reason: 'exception: ' + (e && e.message) };
+                }
+            })()
+        """.replace("__VX_FIND__", _VX_FIND_JS).replace("__TARGET_CAT__", target_cat))
         # Structured result (2026-08-26): the old bare `false` gave a caller
         # no way to tell "category missing from the data" from "row never
         # rendered" from "select link missing" — the IT/3000003 failure took
@@ -771,7 +1165,22 @@ class NclScraper(BaseScraper):
             logger.info(
                 "ncl.select_category_ok", target=target_cat,
                 grid_index=result.get("gridIndex"), has_availability=result.get("hasAvailability"),
+                vx_key=result.get("vxKey"),
+                # Post-click evidence (2026-08-27). `total_changed=False` with
+                # `selected_marker=False` means the click was dispatched but
+                # produced NO observable effect — the shape of a silent
+                # failure. Surfaced so the first real price-drop run shows
+                # which signal is actually trustworthy here, rather than
+                # assuming a fired click equals a completed selection.
+                total_changed=result.get("totalChanged"),
+                selected_marker=result.get("selectedMarker"),
+                rendered_rows=result.get("renderedRows"),
             )
+            self.last_selection_evidence = {
+                k: result.get(k) for k in
+                ("vxKey", "beforeTotal", "afterTotal", "totalChanged",
+                 "selectedMarker", "gridIndex", "renderedRows")
+            }
             return True
         return bool(result)
 
@@ -792,19 +1201,29 @@ class NclScraper(BaseScraper):
         couldn't be read, so the Python side can tell "read a real $0"
         apart from "couldn't read it" and fall back to the pre-selection
         grid value instead of trusting a fabricated zero."""
-        return await self.page.evaluate(f"""
-            (() => {{
-                const cats = window.VX?.get('_form_12');
-                if (!cats) return {{ resTotal: null, currentPromo: '' }};
-                const cat = cats.find(c => c.Category === '{category}');
-                if (!cat) return {{ resTotal: null, currentPromo: '' }};
+        return await self.page.evaluate("""
+            (() => {
+
+  __VX_FIND__
+
+
+                const found = VXfind();
+                // Same hard-coded-key defect as _select_category, fixed
+                // 2026-08-27. A wrong key here made the post-selection
+                // re-read return resTotal:null, so _resolve_new_total fell
+                // back to the PRE-selection grid price — reporting a total
+                // that was never confirmed after the reprice.
+                if (found.err) return { resTotal: null, currentPromo: '' };
+                const cats = found.cats;
+                const cat = cats.find(c => c.Category === '__CATEGORY__');
+                if (!cat) return { resTotal: null, currentPromo: '' };
                 const parsed = parseFloat(cat.ResTotal);
-                return {{
+                return {
                     resTotal: Number.isFinite(parsed) ? parsed : null,
                     currentPromo: cat.CurrentPromo || '',
-                }};
-            }})()
-        """)
+                };
+            })()
+        """.replace("__VX_FIND__", _VX_FIND_JS).replace("__CATEGORY__", category))
 
     async def _reapply_same_stateroom_if_prompted(self) -> None:
         """After re-selecting a category, NCL may land on a "Stateroom"
@@ -939,6 +1358,34 @@ class NclScraper(BaseScraper):
                     })()
                 """)
                 if error_text:
+                    # CONFIRMED BY NEON 2026-08-27: "Reservation is not
+                    # found" on this portal does NOT mean the booking is
+                    # gone. NCL runs SEPARATE agent accounts per market,
+                    # and these are CANADIAN (CAD) bookings — invisible
+                    # when logged into the US account. 25 of the 101
+                    # errors in that day's run were this, sitting in the
+                    # ERROR bucket next to real defects and telling the
+                    # operator nothing about what to actually do.
+                    #
+                    # Returned as a real result, not raised: nothing is
+                    # broken, so it must not be retried, must not count as
+                    # an error, and must not trip the consecutive-failure
+                    # cooldown.
+                    if _is_wrong_account_error(error_text):
+                        logger.info(
+                            "ncl.not_on_this_account",
+                            booking_id=booking_id, market=self.market,
+                        )
+                        self.log_action(
+                            "not_on_this_account",
+                            booking_id=booking_id, market=self.market,
+                        )
+                        return make_not_on_this_account_result(
+                            booking_id, CruiseLine.NCL, self.market,
+                            other_markets=[
+                                m for m in settings.ncl_markets if m != self.market
+                            ],
+                        )
                     raise RuntimeError(f"NCL portal error: {error_text}")
                 raise RuntimeError("Timeout waiting for booking summary — check login and booking ID")
 
@@ -956,7 +1403,122 @@ class NclScraper(BaseScraper):
             if invoice_total is None:
                 raise RuntimeError("NCL booking has no readable InvoiceTotal — refusing to guess $0")
 
-            if preload.get("isPaid"):
+            # Payment state: balance, final-payment date and commission.
+            # Read BEFORE any paid-in-full decision, because that decision
+            # now depends on the balance rather than a single boolean.
+            # Never fatal - a booking must still be checkable if this
+            # particular read fails; the values simply become unknown.
+            payment: dict = {}
+            try:
+                payment = await self._read_payment_state() or {}
+            except Exception as exc:
+                logger.warning("ncl.payment_state_failed",
+                               booking_id=booking_id, error=str(exc))
+            amount_due = payment.get("grossDue")
+            final_payment_date = payment.get("finalPaymentDate")
+            com_due = payment.get("comDue")
+            net_due = payment.get("netDue")
+            commiss_earned = payment.get("commissEarned")
+
+            # CONFIRMED WRONG, fixed 2026-08-28 - my own bug, caught by
+            # Neon on booking 3000049. The rate was derived as
+            # `Com.Due / Gross Due`, which is NOT a commission rate at all:
+            # it is the COMPOSITION of the outstanding balance. On that
+            # booking Gross Due and Com.Due are both $163.00, so the formula
+            # returned **100%** and a $610 drop would have been costed at
+            # $610 of commission. It only looked plausible on the earlier
+            # capture (250.90 / 1793.10 = 13.99%) by coincidence, because
+            # most of that balance was still client money.
+            #
+            # The real rate is what the agency EARNS across the whole
+            # booking: Commiss.Earned / invoice total = 521.28 / 3958.00 =
+            # 13.17% on 3000049, which puts a $610 drop at $80.34.
+            commission_rate = None
+            if commiss_earned and invoice_total and invoice_total > 0:
+                commission_rate = round(commiss_earned / invoice_total, 4)
+            logger.info(
+                "ncl.commission", booking_id=booking_id,
+                commiss_earned=commiss_earned, invoice_total=invoice_total,
+                commission_rate=commission_rate,
+                balance_is_all_commission=balance_is_all_commission,
+            )
+            cruise_line_fully_paid = net_due is not None and net_due <= 0.01
+            balance_is_all_commission = (
+                amount_due is not None and com_due is not None
+                and amount_due > 0 and abs(com_due - amount_due) < 0.01
+            )
+            logger.info(
+                "ncl.payment_state", booking_id=booking_id,
+                amount_due=amount_due, net_due=net_due,
+                com_due=com_due, commiss_earned=commiss_earned,
+                charge_total=payment.get("chargeTotal"),
+                funds_avail=payment.get("fundsAvail"),
+                final_payment_date=final_payment_date,
+            )
+
+            # PERSIST the whole snapshot. Neon 2026-08-28: "make sure that
+            # our scanner also scans the infromation and all the details o
+            # the booking from now on".
+            #
+            # This is the concrete lesson of the 2026-08-28 re-audit: the
+            # payment panel was never captured, so nothing could be
+            # re-checked after the fact and two of the three largest
+            # "clean" optimizations (3000049 $610, 3000052 $402.84) were
+            # actually paid-in-full bookings that only Neon could catch, by
+            # opening the portal by hand.
+            #
+            # Goes into the EXISTING market_data table (capture_type
+            # distinguishes it), so there is no schema change and no
+            # migration - and unlike ESPRESSO's category capture it is NOT
+            # gated behind capture_market_data, because these fields now
+            # drive real decisions (paid-in-full, the collectable cap, the
+            # final-payment gate, commission) rather than being telemetry.
+            self.last_market_data = {
+                "capture_type": "ncl_booking_details",
+                "payment": payment,
+                "derived": {
+                    "amount_due": amount_due,
+                    "net_due": net_due,
+                    "commission_rate": commission_rate,
+                    "final_payment_date": final_payment_date,
+                    "balance_is_all_commission": balance_is_all_commission,
+                    "cruise_line_fully_paid": cruise_line_fully_paid,
+                },
+            }
+            self.log_action(
+                "payment_state", booking_id=booking_id, amount_due=amount_due,
+                final_payment_date=final_payment_date,
+                commission_rate=commission_rate,
+                balance_is_all_commission=balance_is_all_commission,
+            )
+
+            # CONFIRMED MISS, fixed 2026-08-28. Neon on booking 3000057:
+            # "this booking is paid in full and the due amount is 43$ only
+            # why it did not show that it is paid in full". This gate used
+            # to be ONLY `preload["isPaid"]` - a boolean that is false while
+            # any balance remains, however small. $43 outstanding on $1,818
+            # is 2.4%, comfortably inside the project's existing 5%
+            # tolerance, so ESPRESSO would have caught it months ago.
+            # `is_paid_in_full` is the ONE canonical rule (core/calculator.py)
+            # and is now applied to NCL too, so the two lines cannot drift.
+            # A THIRD signal, from booking 3000049: `Net Due $0.00` with
+            # `Com.Due` equal to `Gross Due` means the cruise line has been
+            # paid in full and the only outstanding money is the agency's
+            # own commission. Repricing then cannot save the client
+            # anything - it can only shrink that commission.
+            if preload.get("isPaid") or cruise_line_fully_paid or (
+                amount_due is not None
+                and is_paid_in_full(amount_due, invoice_total)
+            ):
+                logger.info(
+                    "ncl.paid_in_full", booking_id=booking_id,
+                    amount_due=amount_due, net_due=net_due,
+                    invoice_total=invoice_total,
+                    balance_is_all_commission=balance_is_all_commission,
+                    via=("isPaid" if preload.get("isPaid")
+                         else "net_due_zero" if cruise_line_fully_paid
+                         else "tolerance"),
+                )
                 return make_paid_in_full_result(
                     booking_id, preload.get("category"), CruiseLine.NCL, invoice_total,
                 )
@@ -987,9 +1549,46 @@ class NclScraper(BaseScraper):
             # Step 7: Read categories
             cat_data = await self._read_category_data()
             if not cat_data.get("ok"):
-                raise RuntimeError(f"Cannot read categories: {cat_data.get('error')}")
+                # Include the VX keys that DID hold something. Without this
+                # the failure is unactionable — you cannot tell a missing
+                # grid from a differently-keyed one, which is exactly what
+                # cost a pilot run on 2026-08-27 (booking 3000059 reported
+                # only "not available" while 3000058 on the same run found
+                # its grid fine).
+                vx_keys = cat_data.get("vxKeys") or []
+                detail = f"Cannot read categories: {cat_data.get('error')}"
+                if vx_keys:
+                    detail += f" | VX keys present: {', '.join(vx_keys[:25])}"
+                logger.error(
+                    "ncl.category_grid_not_found",
+                    booking_id=booking_id, vx_keys=vx_keys[:25],
+                )
+                raise RuntimeError(detail)
 
             categories = cat_data["categories"]
+
+            # CONFIRMED 2026-08-27: booking 3000059 reached here with the
+            # grid's COLUMN definitions present (_form_10, array[19] of
+            # {field,sortable,editor,...}) and its ROW array genuinely EMPTY
+            # (_form_11, array[0]) — held for a full 10s of polling. That is
+            # NCL reporting "no categories to show for this booking", a real
+            # portal state, not a scrape failure. Reporting it as ERROR
+            # made a legitimate no-op look like a broken scraper and put it
+            # in the error bucket alongside real defects.
+            if not categories:
+                logger.info(
+                    "ncl.no_categories_offered", booking_id=booking_id,
+                    category=current_category,
+                )
+                self.log_action("no_categories_offered", booking_id=booking_id)
+                return calculate_ncl(
+                    booking_id, current_category, old_total, old_total,
+                    addons, current_promos, current_promos,
+                    amount_due=amount_due,
+                    final_payment_date=final_payment_date,
+                    commission_rate=commission_rate,
+                )
+
             current = next((c for c in categories if c["category"] == current_category), None)
             if not current:
                 raise RuntimeError(f"Category '{current_category}' not found in grid data")
@@ -1007,6 +1606,34 @@ class NclScraper(BaseScraper):
             # the booking, no dialog to handle.
             live_price = current["resTotal"]
 
+            # A price INCREASE cannot be an optimization, so there is
+            # nothing to learn from the invasive re-select below — and
+            # re-selecting mutates a live in-progress edit for no possible
+            # benefit. Confirmed on booking 3000058 (2026-08-27): live
+            # $1,178.00 vs locked-in $1,138.00, i.e. $40 MORE expensive,
+            # and the run still went on to attempt re-selection and then
+            # failed the whole booking with "Category re-selection failed
+            # for 'IX'" — turning a clean, correct NO_SAVING into an ERROR.
+            # Folded into the same early return as "no change": both mean
+            # "no saving here, don't touch the booking".
+            if live_price > old_total + 0.01:
+                logger.info(
+                    "ncl.price_increased", booking_id=booking_id,
+                    category=current_category, old_total=old_total,
+                    live_price=live_price,
+                )
+                self.log_action(
+                    "price_increased", booking_id=booking_id,
+                    old_total=old_total, live_price=live_price,
+                )
+                return calculate_ncl(
+                    booking_id, current_category, old_total, live_price,
+                    addons, current_promos, current_promos,
+                    amount_due=amount_due,
+                    final_payment_date=final_payment_date,
+                    commission_rate=commission_rate,
+                )
+
             if live_price <= 0 or abs(live_price - old_total) < 0.01:
                 # No live price change at all -- nothing to gain from the
                 # invasive re-select flow below (which mutates a live
@@ -1017,6 +1644,9 @@ class NclScraper(BaseScraper):
                 return calculate_ncl(
                     booking_id, current_category, old_total, old_total,
                     addons, current_promos, current_promos,
+                    amount_due=amount_due,
+                    final_payment_date=final_payment_date,
+                    commission_rate=commission_rate,
                 )
 
             logger.info(
@@ -1066,9 +1696,25 @@ class NclScraper(BaseScraper):
             # should ever offset net_saving is a real judgment call, not
             # yet resolved with the project owner — see
             # calculate_ncl's/lost_fobc's own docstring caveats.
+            # `new_addons` is the REAL after-reprice addon list. Passing
+            # it is what lets calculate_ncl price the OBC actually lost
+            # instead of inferring it from a promo substring — the bug that
+            # greened bookings 3000055 (lost a $100 OBC cert) and 3000054
+            # (lost a $50 one) as clean OPTIMIZATIONs on 2026-08-27. It was
+            # already being scraped here and used only for a note.
+            # A failed addon scrape must never be silently treated as "no
+            # addons" — see _scrape_addons. Either side being unreadable
+            # makes the loss calculation unsafe, so say so explicitly
+            # instead of computing a confident number from missing data.
+            addon_scrape_failed = addons is None or new_addons is None
             result = calculate_ncl(
                 booking_id, current_category, old_total, new_total,
-                addons, current_promos, new_promos,
+                addons, current_promos, new_promos, new_addons=new_addons,
+                addon_scrape_failed=addon_scrape_failed,
+                amount_due=amount_due,
+                final_payment_date=final_payment_date,
+                commission_rate=commission_rate,
+                balance_is_all_commission=balance_is_all_commission,
             )
             result.new_price_category = current_category  # same category, not a switch
 

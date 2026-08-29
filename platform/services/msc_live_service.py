@@ -81,6 +81,10 @@ class MscLiveService:
         self._state: dict = {}
         self._running = False
         self._stop_requested = False
+        # Single-instance guard (see ensure_started). Held for the
+        # lifetime of the live MSC session and released in stop().
+        self._guard = None
+        self._holds_guard = False
 
     @property
     def is_alive(self) -> bool:
@@ -97,6 +101,30 @@ class MscLiveService:
         real, visible window; never made hidden here."""
         if self.is_alive:
             return
+
+        # SESSION-SAFETY GUARD, added 2026-08-27 — deliberately the SAME
+        # lock scope ("msc_driver") that msc_session_controller.py takes.
+        # These two are alternative front-ends to the same MSC portal
+        # session and the same storage_state_MSC.json, so only ONE may run
+        # at a time. Sharing the scope name is what makes the GUI refuse to
+        # start while the console controller holds it, and vice versa.
+        #
+        # Acquired BEFORE launching the browser so a refusal costs nothing.
+        from services.resource_governor import SingleInstanceGuard
+
+        if self._guard is None:
+            self._guard = SingleInstanceGuard("msc_driver")
+        if not self._guard.acquire():
+            holder = self._guard.holder_pid() or "unknown"
+            raise RuntimeError(
+                "Another MSC driver is already running "
+                f"({holder}) — most likely msc_session_controller.py or another "
+                "GUI instance. Two MSC drivers fight over the same portal "
+                "session (MSC allows one active login per account) and can "
+                "clobber each other's saved session. Close the other one first."
+            )
+        self._holds_guard = True
+
         self._playwright = await async_playwright().start()
         self._browser = await self._playwright.chromium.launch(headless=False)
         context_args: dict = {}
@@ -130,6 +158,12 @@ class MscLiveService:
         self._browser = None
         self._context = None
         self._page = None
+        # Release the MSC driver lock LAST — only after the browser and
+        # session are actually torn down, so another driver can't start
+        # while this one is still holding the portal session open.
+        if self._guard is not None and self._holds_guard:
+            self._guard.release()
+            self._holds_guard = False
         self._state = {}
 
     async def check_login(self, timeout_minutes: float = 15.0) -> bool:

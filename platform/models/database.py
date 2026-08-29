@@ -13,6 +13,9 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 from sqlalchemy.orm import DeclarativeBase
 
 from config.settings import settings
+from utils.logging import get_logger
+
+logger = get_logger(__name__)
 
 
 # ── Base ────────────────────────────────────────────────────────
@@ -43,6 +46,42 @@ class BookingRecord(Base):
     note = Column(Text)
     error = Column(Text)
     lost_pkg_names = Column(Text)  # JSON array
+
+    # ADDED 2026-08-27 after a forensic audit found that 14 of
+    # BookingResult's 26 fields were COMPUTED AND THEN DISCARDED at
+    # persistence. That made the system unable to audit its own money
+    # decisions after the fact:
+    #
+    #   * `obc_change` is the field the whole OBC rule turns on (a $57
+    #     "saving" that forfeits $100 of OBC is a $43 LOSS — real bookings
+    #     3000055 and 3000054). It was never stored, so no query could
+    #     ever check whether the rule had been applied correctly.
+    #   * `old_promos` / `new_promos` were added specifically so a
+    #     LATRIPLE/FREESRVC TRAP verdict would be AUDITABLE. Dropping them
+    #     meant that auditability never actually existed.
+    #   * `price_drop`, `lost_pkg_value`, `lost_fares` are the components
+    #     net_saving is derived from — without them a reported net figure
+    #     cannot be reconciled or independently re-derived.
+    #   * `currency` exists precisely to avoid assuming USD; dropping it
+    #     restored the silent assumption it was created to remove.
+    #
+    # Nullable with no default so pre-existing rows read back as NULL —
+    # honestly "not recorded", never a fabricated 0.0 that would look like
+    # a real measurement of no OBC change. See _migrate_sqlite_add_columns.
+    price_drop = Column(Float, nullable=True)
+    obc_change = Column(Float, nullable=True)
+    lost_pkg_value = Column(Float, nullable=True)
+    currency = Column(String(10), nullable=True)
+    old_promos = Column(Text, nullable=True)
+    new_promos = Column(Text, nullable=True)
+    lost_fares = Column(Text, nullable=True)           # JSON array
+    re_addable_fares = Column(Text, nullable=True)     # JSON array
+    gained_fares = Column(Text, nullable=True)         # JSON array
+    lost_travel_protection = Column(Text, nullable=True)  # JSON array
+    old_cruise_fare = Column(Float, nullable=True)
+    new_cruise_fare = Column(Float, nullable=True)
+    fare_change_pct = Column(Float, nullable=True)
+
     created_at = Column(DateTime, default=datetime.utcnow)
 
 
@@ -151,7 +190,49 @@ else:
 async_session = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
 
 
+def _migrate_sqlite_add_columns(sync_conn) -> list[str]:
+    """Add any newly-declared columns to EXISTING tables.
+
+    `Base.metadata.create_all` only ever CREATES missing tables — it will
+    not alter one that already exists. So adding a column to a model was
+    silently a no-op against a live database, and every write of that field
+    failed or was dropped. This project's DB is a long-lived file with real
+    client history (4,500+ booking rows), so dropping and recreating is not
+    an option.
+
+    Idempotent: reads the live schema and only issues ALTER TABLE ADD
+    COLUMN for what is genuinely absent. SQLite's ADD COLUMN is a cheap
+    metadata-only operation. Returns what it added, for logging.
+    """
+    from sqlalchemy import inspect as sa_inspect, text
+
+    added: list[str] = []
+    inspector = sa_inspect(sync_conn)
+    existing_tables = set(inspector.get_table_names())
+
+    for table in Base.metadata.sorted_tables:
+        if table.name not in existing_tables:
+            continue  # create_all will make it, with every column
+        have = {c["name"] for c in inspector.get_columns(table.name)}
+        for column in table.columns:
+            if column.name in have:
+                continue
+            col_type = column.type.compile(dialect=sync_conn.dialect)
+            # No DEFAULT and no NOT NULL: existing rows must read back as
+            # NULL ("not recorded"), never a fabricated 0.0 that would be
+            # indistinguishable from a real measured zero.
+            sync_conn.execute(
+                text(f'ALTER TABLE "{table.name}" ADD COLUMN "{column.name}" {col_type}')
+            )
+            added.append(f"{table.name}.{column.name}")
+    return added
+
+
 async def init_db():
-    """Create all tables."""
+    """Create all tables, then add any columns missing from existing ones."""
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+        added = await conn.run_sync(_migrate_sqlite_add_columns)
+    if added:
+        logger.info("db.migrated_added_columns", columns=added, count=len(added))
+    return added

@@ -147,6 +147,44 @@ class Settings(BaseSettings):
     # real login actually takes before assuming a saved username/password
     # here is even the right shape of credential to store.
     ncl_credential_service: str = "ncl_seawebagents_login"
+    # NCL runs SEPARATE agent accounts per market — confirmed by Neon
+    # 2026-08-27 after Canadian bookings all returned "Reservation is not
+    # found" against the US login. Each market needs its own credentials
+    # AND its own saved session (sharing one storage_state file is the
+    # exact bug that made a GoCCL login wipe out a working ESPRESSO
+    # session — see BaseScraper._storage_state_path).
+    #
+    # "US" keeps the ORIGINAL service name so existing saved credentials
+    # keep working untouched; other markets get a suffixed service.
+    ncl_markets: tuple[str, ...] = ("US", "CA")
+    ncl_default_market: str = "US"
+
+    # ── Concurrent multi-cruise-line scanning (added 2026-08-27) ──
+    # How many bookings may be IN FLIGHT across ALL cruise lines at once.
+    # Deliberately conservative: the stated priority is "smoothness and
+    # reliability, not maximum concurrency." Measured on the real target
+    # machine (4 CPUs / 17 GB), Chromium wants roughly one core per busy
+    # page, so 2 leaves headroom for the OS and the GUI to stay
+    # responsive. Raise cautiously and watch the governor's CPU readings.
+    max_concurrent_bookings: int = 2
+    # Hard ceiling on simultaneously-open isolated contexts (one per
+    # cruise line in practice). Contexts are cheap (~50-100MB) compared
+    # to whole browser processes, so this is a runaway guard, not a
+    # tuning knob.
+    max_browser_contexts: int = 4
+    # Pages allowed open at once WITHIN one cruise line's context —
+    # prevents a single line from opening unlimited pages.
+    max_pages_per_context: int = 2
+    # Throttle thresholds for services/resource_governor.py.
+    # CPU at 85% still leaves the machine usable.
+    max_cpu_percent: float = 85.0
+    # MEASURED, not guessed: the real target machine sits at ~87% RAM at
+    # idle (17 GB with a lot resident), so a "sensible-looking" 85% would
+    # throttle permanently and nothing would ever run. 93% leaves real
+    # headroom before Windows starts swapping while still catching a
+    # genuine runaway. Lower it if the PC starts feeling sluggish.
+    max_ram_percent: float = 93.0
+    resource_sample_interval_s: float = 5.0
 
     # ── GoCCL ───────────────────────────────────────────────────
     # Guests count matters: GoCCL's offer-code comparison table shows

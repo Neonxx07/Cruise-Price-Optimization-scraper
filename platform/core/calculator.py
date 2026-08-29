@@ -134,8 +134,56 @@ def total_optimization_savings(results) -> float:
     independently before this helper existed — this just gives all four
     one shared, impossible-to-forget implementation instead of four
     separately-maintained copies of the same filter. Extracting this
-    does not change any of their existing results."""
-    return sum(r.net_saving for r in results if r.status.value == "OPTIMIZATION")
+    does not change any of their existing results.
+
+    CONFIRMED REAL MONEY-REPORTING BUG, fixed 2026-08-27. Querying the
+    live DB found that **$4,100.00 of the $13,053.81 all-time reported
+    savings — 31.4% — came from 5 GoCCL rows whose own note reads
+    "UNCONFIRMED, run preview_fare_code to verify gross total" at
+    confidence 1.** They were counted as realised savings anyway, because
+    the GoCCL candidate flow reuses the OPTIMIZATION status (a known open
+    item) and this sum filtered on status alone.
+
+    Two of those bookings were re-scanned the same day and came back
+    NO_SAVING — "cheapest candidate offer code isn't actually lower once
+    guest count is applied" — so at least some were demonstrably false.
+    DEMO02 was also counted TWICE ($880 and $500).
+
+    A row that says "verify this before trusting it" is not a realised
+    saving. That is not a business judgment call, it is a reporting error,
+    so unconfirmed candidates are now excluded from the headline figure.
+    They are NOT discarded — `unconfirmed_candidate_total()` reports them
+    separately, so the opportunity stays visible without inflating money
+    already banked.
+    """
+    return sum(
+        r.net_saving for r in results
+        if r.status.value == "OPTIMIZATION" and not _is_unconfirmed_candidate(r)
+    )
+
+
+def _is_unconfirmed_candidate(result) -> bool:
+    """Whether a result declares ITSELF unverified.
+
+    Matches on the note wording the producing code writes ("UNCONFIRMED")
+    rather than on cruise line or confidence, so it stays correct if GoCCL
+    gets its own status later, and cannot accidentally exclude a real
+    ESPRESSO/NCL win that merely scored low.
+    """
+    return "unconfirmed" in (getattr(result, "note", "") or "").lower()
+
+
+def unconfirmed_candidate_total(results) -> tuple[int, float]:
+    """(count, dollars) of self-declared-unconfirmed OPTIMIZATION rows.
+
+    Reported alongside the confirmed total so an unverified opportunity is
+    visible as an ACTION ("go verify these") instead of silently padding a
+    savings figure. See total_optimization_savings."""
+    rows = [
+        r for r in results
+        if r.status.value == "OPTIMIZATION" and _is_unconfirmed_candidate(r)
+    ]
+    return len(rows), sum(r.net_saving for r in rows)
 
 
 def norm_str(s: str | None) -> str:
@@ -496,6 +544,25 @@ def calculate_espresso(raw_data: dict, booking_id: str, price_category: str | No
         new_cruise = _get_cruise_fare(new_items)
         conf = calc_confidence(old_cruise, new_cruise, net, old_total, lost_pkg_value, obc_change)
 
+        # CONFIRMED REAL BUG, found 2026-08-27 by querying the live DB:
+        # 89 rows are TRAP or NO_SAVING while carrying confidence 4 or 5.
+        # Real examples — booking 3000061 TRAP net=$297 conf=5, booking
+        # 3000043 TRAP net=$588 conf=5, booking 3000042 TRAP net=$768
+        # conf=4. calc_confidence() never receives the final `status`: it
+        # scores only fare direction, net %, and package/OBC stability
+        # (see core/confidence.py), so a booking with a clean fare drop
+        # scores high EVEN WHEN the surrounding rules concluded "do not do
+        # this." Anything ranking by confidence — the GUI's sortable
+        # Conf column, the Excel report — then puts a $588 trap at the top
+        # next to genuine wins.
+        #
+        # A rejection is not a high-confidence opportunity. Capped rather
+        # than overwritten so a legitimately LOW score stays low, and
+        # matching the convention already used for NCL's protected-promo
+        # gate (scored 1) and NCL's own OBC rejections (scored 2).
+        if status in (BookingStatus.TRAP, BookingStatus.NO_SAVING):
+            conf.score = min(conf.score, 2)
+
         return BookingResult(
             cruise_line=CruiseLine.ESPRESSO,
             status=status,
@@ -616,19 +683,55 @@ def _ncl_addon_value(addon_name: str | None) -> float:
 # Kept as a named list + helper (rather than inline) so more codes can be
 # added if the project owner identifies others that must never be lost.
 #
-# ⚠ OPEN QUESTION FOR THE PROJECT OWNER, raised 2026-08-26: **FREESRVC
-# is a strong candidate to add here and is BETTER documented than
-# LATRIPLE.** A real NCL travel-agent promo flyer confirms FREESRVC =
-# "Free Pre-Paid Service Charges" for guests 1-2 on Balcony and above —
-# worth roughly $20-25 per person per night, i.e. plausibly $300-500 on
-# a real sailing. Two of the four bookings checked live on 2026-08-26
-# (3000007 and 3000006) LOST "FREE PREPAID SERVICE CHARGES" on the
-# reprice while gaining a $50 On-Board Credit Certificate, and were still
-# reported as OPTIMIZATION at $20 and $60. If that trade is bad, those
-# two are false positives of the same shape LATRIPLE was added to
-# prevent. Deliberately NOT added without the project owner's explicit
-# say-so, since it would change real recommendations on real bookings.
-NCL_NEVER_LOSE_PROMOS: frozenset[str] = frozenset({"LATRIPLE"})
+# FREESRVC ADDED 2026-08-26 on the project owner's explicit instruction
+# ("this is the same case like latriple FREESRVC add rule please"), after
+# it was flagged as a candidate and researched.
+#
+# WHAT FREESRVC IS — this one is BETTER documented than LATRIPLE, from a
+# real NCL travel-agent promo flyer rather than inference: **"Free
+# Pre-Paid Service Charges"**, guests 1-2, Balcony and above, new FIT
+# bookings only (excludes BX/MX guarantee categories and Studio/Inside/
+# Oceanview). Service charges run roughly $20-25 per person per night, so
+# on a real sailing this is plausibly $300-500 of value — an order of
+# magnitude larger than the fare drops being traded for it.
+#
+# Confirmed real behavior, both live-verified 2026-08-26: on bookings
+# 3000007 and 3000006 the reprice REPLACED "FREE PREPAID SERVICE
+# CHARGES" with a "Free $50 / $37.50 On-Board Credit Certificate" — i.e.
+# gave up the larger prepaid-service-charge benefit for a much smaller
+# OBC certificate, while the fare dropped only $20 and $60 respectively.
+# Both were reported as OPTIMIZATION before this rule; both are now TRAP.
+#
+# Same enforcement shape as LATRIPLE and for the same reason: no invoice
+# line item to net off, and irreversible once repriced — so it's a hard
+# gate, not a value subtraction.
+# Promos NCL bookings must NEVER give up on a reprice, whatever the saving
+# looks like. A booking that would lose one of these is a hard TRAP, decided
+# BEFORE any status is assigned (see calculate_ncl) and scored confidence 1
+# so it can never sort near a real opportunity.
+#
+# Each entry is here because the project owner said so - never inferred:
+#   LATRIPLE   2026-08-26  "if LATRIPLE is before only we do not optimize"
+#   FREESRVC   2026-08-27  "this is the same cse like latriple FREESRVC"
+#   FITOBC     2026-08-28  an ON-BOARD-CREDIT promo. Found by querying that
+#                          day's run: lost on 4 of 36 OPTIMIZATIONs worth
+#                          $1,532 combined (3000046 $456, 3000047 $410,
+#                          3000045 $391.20, 3000051 $275). Unlike an addon
+#                          named "Free $100 On-Board Credit Certificate", a
+#                          promo CODE carries no readable value on the page,
+#                          so the loss could never be priced - which is
+#                          exactly why it has to be gated instead.
+#   LATDBLX    2026-08-28  Latitudes DOUBLE points. Same family as the
+#                          already-documented LATRIPLE -> LATREW downgrade;
+#                          lost on booking 3000048 for a $10 "saving".
+#
+# NOT included, and deliberately so: LATREW / LATITUDE also appear in the
+# data (37 and 11 times on 2026-08-28) and are plausibly in the same
+# loyalty family, but the owner has not ruled on them - and over-gating
+# silently destroys real savings. Ask before adding.
+NCL_NEVER_LOSE_PROMOS: frozenset[str] = frozenset({
+    "LATRIPLE", "FREESRVC", "FITOBC", "LATDBLX",
+})
 
 
 def _split_promo_codes(promos: str | None) -> set[str]:
@@ -644,6 +747,34 @@ def _split_promo_codes(promos: str | None) -> set[str]:
     return {part.strip().upper() for part in text.split(",") if part.strip()}
 
 
+def ncl_lost_promos(old_promos: str | None, new_promos: str | None) -> list[str]:
+    """EVERY promo present before a reprice and gone after it.
+
+    ADDED 2026-08-28 from real run data. Only LATRIPLE and FREESRVC were
+    ever looked at (NCL_NEVER_LOSE_PROMOS), so any OTHER promo loss was
+    completely invisible to the verdict. Querying the 2026-08-28 NCL run
+    showed that is not a rare edge case: **11 of 36 OPTIMIZATIONs lost at
+    least one promo**, and the lost ones carry real money -
+
+        FITOBC   x4   (an ON-BOARD CREDIT promo - exactly the OBC case)
+        AF15OFF  x4   (15% off)
+        DISC35   x2   (swapped for DISC50, which is better)
+        DASHSALE, SHX50, 34CHO, LATDBLX (Latitudes double points)
+
+    Booking 3000046 is the concrete example Neon queried: reported
+    "$456 saved" while losing FITOBC, whose value is nowhere in that figure.
+
+    Deliberately returns the RAW list and prices nothing. NCL promo codes
+    carry no readable value on the page (unlike an addon named
+    "Free $100 On-Board Credit Certificate"), and inventing a value per
+    code is precisely the estimation mistake the free-upgrade incident
+    proved cannot be trusted. The caller warns instead.
+    """
+    before = _split_promo_codes(old_promos)
+    after = _split_promo_codes(new_promos)
+    return sorted(before - after)
+
+
 def ncl_lost_protected_promos(old_promos: str | None, new_promos: str | None) -> list[str]:
     """Protected promo codes present BEFORE but missing AFTER.
 
@@ -657,6 +788,167 @@ def ncl_lost_protected_promos(old_promos: str | None, new_promos: str | None) ->
 # ── NCL Calculator ──────────────────────────────────────────────
 
 
+_NCL_OBC_CERT_RE = re.compile(
+    r"On-Board Credit Certificate|OBC Certificate", re.IGNORECASE
+)
+
+
+def ncl_lost_addons(
+    before: list[dict] | None, after: list[dict] | None
+) -> list[dict]:
+    """Addons present BEFORE a reprice and gone AFTER it.
+
+    Keyed on (guest, name) — the same key `_summarize_addon_change` uses in
+    scraper/ncl.py — because the same perk legitimately appears once per
+    guest and a name-only key would collapse a 2-guest loss into one.
+    """
+    before = before or []
+    after = after or []
+    after_keys = {(a.get("guest", ""), a.get("name", "")) for a in after}
+    lost: list[dict] = []
+    seen: set[tuple[str, str]] = set()
+    for a in before:
+        key = (a.get("guest", ""), a.get("name", ""))
+        # DE-DUPLICATE on the full key. The portal can render the same
+        # line twice for one guest, and counting it twice would double the
+        # subtracted value ($300 for one $150 certificate) — the behaviour
+        # the pre-existing test_ncl_duplicate_addons_counted_once protects.
+        # Note this dedupes per (guest, name), so the SAME perk held by TWO
+        # DIFFERENT guests is still correctly counted twice.
+        if key in seen or key in after_keys:
+            continue
+        seen.add(key)
+        lost.append(a)
+    return lost
+
+
+def ncl_price_lost_addons(lost: list[dict]) -> dict:
+    """Split lost addons into REAL-valued and ESTIMATE-ONLY.
+
+    CRITICAL distinction, and the reason this isn't one flat sum: an addon
+    named "Free $100 On-Board Credit Certificate" carries its REAL value in
+    its own name, which `_ncl_addon_value` parses. An addon named
+    "Unlimited Open Bar Package" does not — `_ncl_addon_value` falls back to
+    the NCL_ADDON_VALUES *estimate* table for those.
+
+    Only real, name-embedded figures are allowed to drive the dollar
+    verdict. Estimated constants are surfaced by NAME as an unpriced loss
+    instead. That is the direct lesson of the free-upgrade false-positive
+    incident (see A0 in the upgrade-backlog memory): a well-calibrated
+    estimate was still wrong often enough to flip the sign on close cases,
+    and only a real figure can be trusted for a money decision.
+    """
+    obc_value = 0.0
+    obc_names: list[str] = []
+    priced_value = 0.0
+    priced_names: list[str] = []
+    unpriced_names: list[str] = []
+
+    for a in lost:
+        name = a.get("name", "") or ""
+        guest = a.get("guest", "") or ""
+        label = f"{guest}: {name}" if guest else name
+        has_real_value = bool(_DOLLAR_PATTERN.search(name.lower()))
+        value = _ncl_addon_value(name) if has_real_value else 0.0
+
+        if _NCL_OBC_CERT_RE.search(name):
+            if value > 0:
+                obc_value += value
+                obc_names.append(f"{label} (${value:g})")
+            else:
+                # An OBC certificate with no readable amount is still a
+                # real OBC loss — name it rather than silently dropping it.
+                unpriced_names.append(label)
+        elif value > 0:
+            priced_value += value
+            priced_names.append(f"{label} (${value:g})")
+        else:
+            unpriced_names.append(label)
+
+    return {
+        "obc_value": round2(obc_value),
+        "obc_names": obc_names,
+        "priced_value": round2(priced_value),
+        "priced_names": priced_names,
+        "unpriced_names": unpriced_names,
+    }
+
+
+def ncl_final_payment_passed(final_payment_date, today=None) -> bool:
+    """Whether NCL's FINAL PAYMENT date is already in the past.
+
+    HARD RULE, stated by Neon 2026-08-28: "from now on we are adding a new
+    rule if the final payment date has passed on ncl we do not optimize the
+    booking at all because it will cause a penality".
+
+    Read from the real payment-schedule table on the booking summary
+    ("Explanation | Payment Due Date | Amount" -> "FINAL PAYMENT |
+    01/09/2027 | $2,028.10"), confirmed present in captured pages.
+
+    Returns False when the date is missing or unparseable - the gate must
+    never fire on a value we could not read, because refusing a booking on
+    a guess is its own kind of wrong. The caller reports the unknown.
+    """
+    if not final_payment_date:
+        return False
+    if isinstance(final_payment_date, str):
+        parsed = None
+        try:
+            import dateparser
+
+            parsed = dateparser.parse(
+                final_payment_date, settings={"DATE_ORDER": "MDY"},
+            )
+        except Exception:
+            parsed = None
+        if parsed is None:
+            return False
+        final_payment_date = parsed
+    reference = today or datetime.utcnow()
+    try:
+        return final_payment_date.date() < reference.date()
+    except Exception:
+        return False
+
+
+def realizable_saving(price_drop: float, amount_due: float | None) -> float:
+    """How much of a price drop the agency can ACTUALLY collect.
+
+    STATED BY NEON 2026-08-28 for booking 3000057: "i did optimize with
+    the 100 but we actually get 43 not 100 because the customer has paid in
+    full" - the booking showed a $100 drop with only $43 still outstanding.
+
+    A reprice reduces what is still OWED. Once the balance reaches zero
+    there is nothing further to collect, so the benefit is capped by the
+    amount due. Reporting the full $100 overstates a real recovery by
+    $57 - more than the true figure itself.
+
+    `amount_due is None` means we could not read it, so NOTHING is capped
+    and the caller says so. Never invent a cap.
+    """
+    if amount_due is None:
+        return round2(price_drop)
+    return round2(min(price_drop, max(0.0, amount_due)))
+
+
+def ncl_commission_loss(price_drop: float, commission_rate: float | None) -> float:
+    """Commission the agency gives up by lowering the fare.
+
+    RAISED BY NEON 2026-08-28 on booking 3000054: "it is good and worth it
+    nut the problem is i do not feel like it as well as we will lose 48$
+    comission".
+
+    The rate is READ per booking, never assumed: NCL's own summary prints
+    "Com.Due $250.90" against "Gross Due $1,793.10" (13.99% on that real
+    capture), and Neon's $48 against a $300 drop implies ~16% on his -
+    i.e. it genuinely varies, so a hardcoded rate would be wrong on most
+    bookings. Returns 0.0 when the rate is unknown rather than guessing.
+    """
+    if not commission_rate or commission_rate <= 0:
+        return 0.0
+    return round2(price_drop * commission_rate)
+
+
 def calculate_ncl(
     booking_id: str,
     price_category: str | None,
@@ -665,6 +957,12 @@ def calculate_ncl(
     addons: list[dict] | None = None,
     old_promos: str = "",
     new_promos: str = "",
+    new_addons: list[dict] | None = None,
+    addon_scrape_failed: bool = False,
+    amount_due: float | None = None,
+    final_payment_date: str | None = None,
+    commission_rate: float | None = None,
+    balance_is_all_commission: bool = False,
 ) -> BookingResult:
     """
     Analyze an NCL booking and determine optimization status.
@@ -688,35 +986,77 @@ def calculate_ncl(
         new_total = round2(new_res_total)
         price_drop = round2(old_total - new_total)
 
-        lost_addon_value = 0.0
-        lost_addon_names: list[str] = []
-        old_promo_str = (old_promos or "").upper()
-        new_promo_str = (new_promos or "").upper()
-        lost_fobc = "FOBC" in old_promo_str and "FOBC" not in new_promo_str
+        # CONFIRMED REAL FALSE POSITIVES, fixed 2026-08-27 - reported by
+        # Neon on two live bookings:
+        #   3000055  $57 "saving" while LOSING a $100 OBC certificate
+        #   3000054  $60 "saving" while LOSING a $50  OBC certificate
+        # Both came back GREEN as OPTIMIZATION at confidence 5/5.
+        # 3000055 is really a $43 net LOSS.
+        #
+        # Root cause: OBC loss was inferred from a PROMO SUBSTRING -
+        #     lost_fobc = "FOBC" in old_promos and "FOBC" not in new_promos
+        # - and the certificate was priced ONLY if that fired. Neither
+        # booking's promo string contained "FOBC", so lost_addon_value
+        # stayed 0.00 and the entire price drop counted as clean net.
+        # Meanwhile the scraper's OWN before/after addon diff had already
+        # identified the lost certificate correctly and put it in the note,
+        # where it affected no decision. (This is the "lost_fobc string
+        # defect" previously logged as a known open issue - it was live.)
+        #
+        # Now driven by the REAL before/after addon diff, with OBC loss
+        # routed into obc_change so the project's single canonical OBC rule
+        # (OBC_LOSS_MIN_RATIO, shared with ESPRESSO) actually applies.
+        # `new_addons is None` means the caller has NO "after" list to
+        # compare against — the no-price-change and price-increase early
+        # returns, where the booking was never touched, so nothing CAN have
+        # been forfeited. Without this guard the diff treats "after" as
+        # empty and prices the ENTIRE before-list as lost, inventing a $100
+        # OBC loss on a booking nobody repriced (caught by
+        # test_no_after_list_means_no_loss_is_invented). An empty LIST is
+        # different from None and is a real answer: everything was lost.
+        # `addon_scrape_failed` means we TRIED to read the addon tables and
+        # could not (see NclScraper._scrape_addons). That is different from
+        # having no "after" list because the booking was never touched.
+        # Both suppress loss pricing — you cannot price a loss from data you
+        # do not have — but a FAILURE must additionally be surfaced, because
+        # a real forfeited OBC certificate could be hiding behind it and the
+        # result would otherwise look like a clean, confident win.
+        if new_addons is None or addon_scrape_failed:
+            priced = {
+                "obc_value": 0.0, "obc_names": [],
+                "priced_value": 0.0, "priced_names": [],
+                "unpriced_names": [],
+            }
+        else:
+            priced = ncl_price_lost_addons(ncl_lost_addons(addons, new_addons))
+        obc_lost = priced["obc_value"]
+        lost_addon_value = priced["priced_value"]
+        lost_addon_names = priced["obc_names"] + priced["priced_names"]
+        unpriced_lost = priced["unpriced_names"]
 
-        if addons:
-            seen: set[str] = set()
-            unique_addons = []
-            for a in addons:
-                name = a.get("name", "")
-                if name not in seen:
-                    seen.add(name)
-                    unique_addons.append(a)
+        # Negative, matching ESPRESSO's sign convention: obc_change is the
+        # CHANGE in OBC, so forfeiting OBC is a negative change.
+        obc_change = round2(-obc_lost)
 
-            for a in unique_addons:
-                name = a.get("name", "")
-                is_obc_cert = bool(
-                    re.search(r"On-Board Credit Certificate", name, re.IGNORECASE)
-                    or re.search(r"OBC Certificate", name, re.IGNORECASE)
-                )
-                if is_obc_cert and lost_fobc:
-                    val = _ncl_addon_value(name)
-                    if val > 0:
-                        lost_addon_value += val
-                        lost_addon_names.append(f"{name} (${val})")
+        net = round2(price_drop + obc_change - lost_addon_value)
 
-        lost_addon_value = round2(lost_addon_value)
-        net = round2(price_drop - lost_addon_value)
+        # Everything actually forfeited, priced. Used by the confidence
+        # arms below, which previously looked only at lost_addon_value and
+        # therefore ignored OBC entirely.
+        total_lost_value = round2(obc_lost + lost_addon_value)
+
+        # HARD GATE 2, Neon 2026-08-28: NCL charges a PENALTY for
+        # repricing after the final payment date, so such a booking is not
+        # optimizable at all regardless of how good the drop looks.
+        final_payment_passed = ncl_final_payment_passed(final_payment_date)
+
+        # Cap the win at what is still collectable, and price the
+        # commission given up. See realizable_saving / ncl_commission_loss.
+        realizable = realizable_saving(price_drop, amount_due)
+        capped_by_balance = (
+            amount_due is not None and realizable < price_drop - 0.01
+        )
+        commission_loss = ncl_commission_loss(price_drop, commission_rate)
 
         # HARD GATE, project owner's rule 2026-08-26 — checked BEFORE any
         # status is assigned, so a protected-promo loss can never come
@@ -732,30 +1072,155 @@ def calculate_ncl(
                 f"(present before, gone after) for only ${round(net)}; "
                 f"this promo must never be given up on a reprice"
             )
+        elif final_payment_passed:
+            # Not a "trap" in the perk-loss sense - an eligibility block.
+            # Reported as TRAP so it can never surface as a recommended
+            # win, with an unmistakable reason.
+            status = BookingStatus.TRAP
+            note = (
+                f"NCL do NOT reprice - the FINAL PAYMENT DATE "
+                f"({final_payment_date}) has already PASSED; repricing now "
+                f"incurs a penalty. Rule set by the project owner "
+                f"2026-08-28."
+            )
+        elif net > 0 and lost_addon_value > 0 and net < lost_addon_value:
+            # Positive on paper but smaller than the perk being given up to
+            # get it - the same package-trap rule ESPRESSO already applies.
+            status = BookingStatus.TRAP
+            note = (
+                f"NCL trap - losing ${round(lost_addon_value)} of perks for "
+                f"only ${round(net)} net: {', '.join(lost_addon_names)}"
+            )
+        elif net > 0 and obc_change < 0 and price_drop < abs(obc_change) * OBC_LOSS_MIN_RATIO:
+            # THE 3000054 case: a $60 drop that forfeits $50 of OBC is a
+            # 1.2x margin, not a safe trade. Uses the project's single
+            # canonical OBC_LOSS_MIN_RATIO so NCL and ESPRESSO cannot drift.
+            status = BookingStatus.NO_SAVING
+            note = (
+                f"NCL no saving - ${round(price_drop)} drop costs "
+                f"${round(abs(obc_change))} OBC (need "
+                f"{OBC_LOSS_MIN_RATIO:.0f}x): {', '.join(lost_addon_names)}"
+            )
         elif net > 0:
             status = BookingStatus.OPTIMIZATION
             addon_note = (
-                " — verify addons: " + ", ".join(lost_addon_names)
+                " - verify addons: " + ", ".join(lost_addon_names)
             ) if lost_addon_names else ""
-            note = f"NCL optimized ${round(net)}{addon_note}"
+            # Perks whose value is only an ESTIMATE are never priced into
+            # net (see ncl_price_lost_addons), so an optimization that loses
+            # one must say so plainly instead of presenting an unqualified
+            # dollar win.
+            unpriced_note = (
+                " - ALSO LOSES (value not readable, verify by hand): "
+                + ", ".join(unpriced_lost)
+            ) if unpriced_lost else ""
+            note = f"NCL optimized ${round(net)}{addon_note}{unpriced_note}"
         elif price_drop > 0 and net <= 0:
             status = BookingStatus.TRAP
-            note = f"NCL trap — price drop offset by addon loss: {', '.join(lost_addon_names)}"
+            lost_desc = (
+                ", ".join(lost_addon_names)
+                or ", ".join(unpriced_lost)
+                or "addon loss"
+            )
+            note = (
+                f"NCL trap - ${round(price_drop)} price drop wiped out by "
+                f"${round(obc_lost + lost_addon_value)} lost: {lost_desc}"
+            )
         else:
             status = BookingStatus.NO_SAVING
             note = "NCL no saving"
 
+        if status == BookingStatus.OPTIMIZATION and capped_by_balance:
+            note += (
+                f" - COLLECTABLE ONLY ${round(realizable)}: the client still "
+                f"owes ${round(amount_due or 0)}, and a reprice can only "
+                f"reduce the outstanding balance. The ${round(net)} above is "
+                f"the price movement, not what is recoverable."
+            )
+        if status == BookingStatus.OPTIMIZATION and balance_is_all_commission:
+            # Booking 3000049: Gross Due $163.00, Com.Due $163.00,
+            # Net Due $0.00. The client owes nothing to the cruise line -
+            # the whole remaining balance is the agency's own commission, so
+            # a reprice cannot save them anything and only shrinks that.
+            note += (
+                " - WARNING: the entire outstanding balance is COMMISSION "
+                "(Com.Due equals Gross Due, Net Due is zero). Repricing "
+                "cannot save the client anything here; it only reduces what "
+                "the agency collects."
+            )
+
+        if status == BookingStatus.OPTIMIZATION and commission_loss > 0:
+            note += (
+                f" - COSTS ${round(commission_loss)} OF COMMISSION "
+                f"(at the booking's own {round((commission_rate or 0) * 100)}% "
+                f"rate), so the net gain to the agency is "
+                f"${round(realizable - commission_loss)}."
+            )
+
+        # ANY lost promo must be visible on an OPTIMIZATION, not just the
+        # two hard-gated ones. See ncl_lost_promos for the real numbers.
+        lost_promos = [
+            p for p in ncl_lost_promos(old_promos, new_promos)
+            if p not in NCL_NEVER_LOSE_PROMOS
+        ]
+        if lost_promos and status == BookingStatus.OPTIMIZATION:
+            gained_promos = sorted(
+                _split_promo_codes(new_promos) - _split_promo_codes(old_promos)
+            )
+            note += (
+                " - LOSES PROMO(S): " + ", ".join(lost_promos)
+                + (" (gains " + ", ".join(gained_promos) + ")" if gained_promos else "")
+                + ". Promo codes carry no readable value on the page, so this is"
+                + " NOT reflected in the figure above - check what they are worth"
+                + " before repricing."
+            )
+
+        if addon_scrape_failed and status == BookingStatus.OPTIMIZATION:
+            note += (
+                " - WARNING: the addon list could not be read, so any OBC or "
+                "package loss is UNKNOWN and is NOT reflected in this figure. "
+                "Verify by hand before repricing."
+            )
+
         # Confidence scoring (simplified for NCL)
-        if lost_protected:
+        if final_payment_passed:
+            # Not a confidence question - a flat "not eligible".
+            confidence = 1
+        elif lost_protected:
             # Not a confidence question — this is a hard "don't do it."
             # Scored lowest so it can never sort near a real opportunity
             # in any report that ranks by confidence.
             confidence = 1
-        elif price_drop > 0 and lost_addon_value == 0:
+        elif addon_scrape_failed:
+            # An unverifiable loss cannot be a high-confidence win.
+            confidence = 2
+        elif lost_promos and status == BookingStatus.OPTIMIZATION:
+            # Same reasoning: a win with an unquantified promo loss behind it
+            # must not outrank a clean one in a confidence-sorted report.
+            # A flat 3 rather than min(confidence, 3) because this arm is
+            # part of the chain that ASSIGNS confidence - reading it here
+            # raised UnboundLocalError, which calculate_ncl's own
+            # except-block then turned into a silent ERROR result (caught
+            # immediately by driving the real 3000046 numbers through it).
+            confidence = 3
+        elif status in (BookingStatus.TRAP, BookingStatus.NO_SAVING) and (
+            obc_lost > 0 or lost_addon_value > 0
+        ):
+            # FIXED 2026-08-27 alongside the OBC false positives. OBC loss
+            # is now carried in `obc_change`, not `lost_addon_value`, so the
+            # ratio arms below saw "no perk lost" and scored these 5/5 —
+            # bookings 3000055 (a $43 net LOSS) and 3000054 (a 1.2x OBC
+            # margin) both came out TRAP/NO_SAVING at confidence 5, which
+            # would sort them right next to genuine opportunities in any
+            # report ranked by confidence. A "don't do this" verdict is not
+            # a high-confidence win; scored low for the same reason
+            # lost_protected is scored 1.
+            confidence = 2
+        elif price_drop > 0 and total_lost_value == 0:
             confidence = 5
-        elif price_drop > 0 and lost_addon_value < price_drop:
+        elif price_drop > 0 and total_lost_value < price_drop:
             confidence = 4
-        elif price_drop > 0 and lost_addon_value >= price_drop:
+        elif price_drop > 0 and total_lost_value >= price_drop:
             confidence = 2
         else:
             confidence = 2
@@ -769,7 +1234,7 @@ def calculate_ncl(
             old_total=old_total,
             new_total=new_total,
             price_drop=price_drop,
-            obc_change=0.0,
+            obc_change=obc_change,
             net_saving=net,
             lost_pkg_value=lost_addon_value,
             lost_pkg_names=lost_addon_names,
@@ -779,7 +1244,12 @@ def calculate_ncl(
             # the project owner's own report — see BookingResult's fields.
             old_promos=old_promos or "",
             new_promos=new_promos or "",
+            # Protected losses stay in lost_fares (the hard-gate audit
+            # trail); every OTHER lost promo goes in re_addable_fares so the
+            # export and the DB show what a reprice would give up. Both
+            # columns are persisted as of 2026-08-27.
             lost_fares=lost_protected,
+            re_addable_fares=lost_promos,
         )
 
     except Exception as e:
@@ -1114,6 +1584,44 @@ def make_paid_in_full_result(
         cruise_line=cruise_line, status=BookingStatus.PAID_IN_FULL,
         note="💳 Fully paid — repricing unavailable",
         booking_id=booking_id, price_category=price_category, old_total=old_total,
+    )
+
+
+def make_not_on_this_account_result(
+    booking_id: str,
+    cruise_line: CruiseLine,
+    market: str,
+    other_markets: list[str] | None = None,
+) -> BookingResult:
+    """The booking is not visible to the agent account we are logged into.
+
+    CONFIRMED BY NEON 2026-08-27: NCL runs a SEPARATE SeaWeb account per
+    market, and Canadian (CAD) bookings return "Reservation is not found"
+    when checked against the US login. That is not an error — nothing is
+    broken and nothing needs debugging; the booking simply needs the other
+    account. 25 of the 101 errors in that day's NCL run were this, buried
+    in the ERROR bucket alongside real defects.
+
+    `confidence` is deliberately 0: this result asserts nothing about
+    price. `net_saving` stays 0.0 so it can never contribute to a savings
+    total (which filters on OPTIMIZATION anyway).
+    """
+    others = [m for m in (other_markets or []) if m and m.upper() != market.upper()]
+    hint = (
+        f" Re-run it on the {'/'.join(others)} account."
+        if others else " Re-run it on the other market's account."
+    )
+    return BookingResult(
+        cruise_line=cruise_line,
+        status=BookingStatus.NOT_ON_THIS_ACCOUNT,
+        note=(
+            f"Not on the {market.upper()} account — the portal reports the "
+            f"reservation as not found.{hint} (A booking held under another "
+            f"session's edit lock can also look not-found, so confirm before "
+            f"treating this as a market mismatch.)"
+        ),
+        booking_id=booking_id,
+        confidence=0,
     )
 
 

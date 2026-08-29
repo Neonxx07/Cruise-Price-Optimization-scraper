@@ -31,6 +31,17 @@ class BookingStatus(str, Enum):
     WLT = "WLT"
     PAID_IN_FULL = "PAID_IN_FULL"
     SKIPPED_TODAY = "SKIPPED_TODAY"
+    # ADDED 2026-08-27. Neon: NCL's "Reservation is not found" on these
+    # bookings does NOT mean the booking is gone — they are CANADIAN
+    # bookings, and Canada is a SEPARATE SeaWeb account (CAD). Logged into
+    # the US account, a CAD booking is simply invisible.
+    #
+    # This must not be ERROR. It is not a defect, nothing is broken, and
+    # nothing needs debugging — the booking just needs the other account.
+    # Leaving it as ERROR both inflated the error rate (25 of 101 errors in
+    # the 2026-08-27 run) and buried a clear, actionable instruction
+    # ("re-run these on the CAD login") inside a bucket full of real bugs.
+    NOT_ON_THIS_ACCOUNT = "NOT_ON_THIS_ACCOUNT"
     # A strictly-higher-tier category is available at or below the current
     # price (e.g. Interior -> Outside for the same or less money) — a pure
     # upgrade, never a downgrade or sideways move. Always human-reviewed
@@ -235,7 +246,7 @@ class MscBookingResult(BaseModel):
 
 # ── MSC Discount Price-Test ─────────────────────────────────────
 #
-# ADDED 2026-08-13, forensic investigation of bookings 3000026/3000029:
+# ADDED 2026-08-13, forensic investigation of bookings 3000026/74242969:
 # confirmed that evaluate_msc_booking()'s DISCOUNT_ADD/DISCOUNT_TIER_UPGRADE
 # checks can detect a discount is ELIGIBLE (Senior, Voyagers Club, a named
 # promo) but never determine what it's actually WORTH in dollars — MSC's
@@ -404,5 +415,12 @@ class ScanJob(BaseModel):
 
     started_at: Optional[datetime] = None
     completed_at: Optional[datetime] = None
+
+    # ADDED 2026-08-27: a FAILED job carried its status but not its REASON,
+    # so the GUI could only say "SCAN FAILED" and the operator had to go
+    # read the log to learn whether the browser died, the session logged
+    # out, or a restart failed. _run_batch's pre-flight session check sets
+    # this to an actionable sentence; the GUI renders it verbatim.
+    error: Optional[str] = None
 
     model_config = {"from_attributes": True}

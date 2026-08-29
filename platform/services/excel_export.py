@@ -34,11 +34,14 @@ _FILLS = {
     "ERROR": PatternFill("solid", fgColor="FFC7CE"),          # red
     "WLT": PatternFill("solid", fgColor="DDEBF7"),            # light blue
     "PAID_IN_FULL": PatternFill("solid", fgColor="DDEBF7"),   # light blue
+    # Distinct from ERROR (nothing is broken) and from NO_SAVING
+    # (we learned nothing about price): needs the other account.
+    "NOT_ON_THIS_ACCOUNT": PatternFill("solid", fgColor="FFF2CC"),  # light amber
     "SKIPPED_TODAY": PatternFill("solid", fgColor="DDEBF7"),  # light blue
 }
 _SORT_ORDER = {
     "OPTIMIZATION": 0, "UPGRADE_AVAILABLE": 1, "TRAP": 2, "WLT": 3,
-    "PAID_IN_FULL": 4, "NO_SAVING": 5, "SKIPPED_TODAY": 6, "ERROR": 7,
+    "PAID_IN_FULL": 4, "NO_SAVING": 5, "SKIPPED_TODAY": 6, "NOT_ON_THIS_ACCOUNT": 7, "ERROR": 8,
 }
 _HDR_FILL = PatternFill("solid", fgColor="1F3864")
 _HDR_FONT = Font(bold=True, color="FFFFFF", name="Calibri", size=10)
@@ -129,6 +132,7 @@ def export_results_excel(results: list[BookingResult], path: str | Path) -> None
         ("Traps", count("TRAP")),
         ("WLT", count("WLT")),
         ("Paid In Full", count("PAID_IN_FULL")),
+        ("Wrong account (re-run on other market)", count("NOT_ON_THIS_ACCOUNT")),
         ("No Saving", count("NO_SAVING")),
         ("Skipped Today", count("SKIPPED_TODAY")),
         ("Errors", count("ERROR")),

@@ -52,7 +52,7 @@ class BookingService:
         # exception that escapes it.
         self._background_tasks: set = set()
 
-    def _get_scraper(self, cruise_line: CruiseLine) -> BaseScraper:
+    def _get_scraper(self, cruise_line: CruiseLine, market: str | None = None) -> BaseScraper:
         """Factory: get the right scraper for the cruise line.
 
         CONFIRMED REAL BUG 2026-08-12: this used to fall through to
@@ -67,7 +67,10 @@ class BookingService:
         the previous silent misroute — this does not change behavior for
         any cruise line that ever worked correctly through this factory."""
         if cruise_line == CruiseLine.NCL:
-            return NclScraper()
+            # `market` selects the NCL agent account (US/CA). NCL runs a
+            # separate SeaWeb account per market, so a Canadian booking is
+            # invisible on the US login — see NclScraper.__init__.
+            return NclScraper(market=market)
         if cruise_line == CruiseLine.GOCCL:
             return GoCCLScraper()
         if cruise_line == CruiseLine.MSC:
@@ -119,16 +122,29 @@ class BookingService:
             )
         return settings.espresso_home_url
 
-    async def get_or_create_scraper(self, cruise_line: CruiseLine, headless: bool | None = None) -> BaseScraper:
+    async def get_or_create_scraper(
+        self, cruise_line: CruiseLine, headless: bool | None = None,
+        market: str | None = None,
+    ) -> BaseScraper:
         """Get the live, already-open scraper for this cruise line, or start
-        a new one if none is open yet (or the cruise line changed)."""
+        a new one if none is open yet (or the cruise line changed).
+
+        A MARKET change counts as a change too (added 2026-08-27): NCL's
+        US and CA logins are different accounts with different sessions, so
+        reusing a live US scraper for a CA scan would silently check every
+        Canadian booking against the wrong account and report them all as
+        not-found."""
         if self._live_scraper is not None:
-            if self._live_scraper.cruise_line == cruise_line and self._live_scraper.is_alive:
+            same_line = self._live_scraper.cruise_line == cruise_line
+            wanted = (market or "").upper()
+            current = (getattr(self._live_scraper, "market", "") or "").upper()
+            same_market = (not wanted) or wanted == current
+            if same_line and same_market and self._live_scraper.is_alive:
                 return self._live_scraper
             await self._live_scraper.stop()
             self._live_scraper = None
 
-        scraper = self._get_scraper(cruise_line)
+        scraper = self._get_scraper(cruise_line, market=market)
         await scraper.start(headless=headless)
         self._live_scraper = scraper
         return scraper
@@ -142,6 +158,7 @@ class BookingService:
 
     async def check_login(
         self, cruise_line: CruiseLine, timeout_minutes: float = 15.0,
+        market: str | None = None,
     ) -> bool:
         """
         Open (or reuse) the live browser, visibly, and wait for the user to
@@ -149,9 +166,39 @@ class BookingService:
         start_scan to reuse — never closed and reopened, since that's what
         triggers the bot-detection replay flag.
         """
-        scraper = await self.get_or_create_scraper(cruise_line, headless=False)
+        scraper = await self.get_or_create_scraper(
+            cruise_line, headless=False, market=market,
+        )
         base_url = self._login_base_url(cruise_line)
         await scraper.navigate(base_url)
+
+        # AUTO-LOGIN FIRST. CONFIRMED GAP, fixed 2026-08-28. Neon: "ncl did
+        # not autologin at all". `auto_login()` was wired into _run_batch's
+        # fresh-browser path on 2026-08-27, but the GUI uses
+        # keep_browser_open=True and reaches the portal through THIS method,
+        # which never called it - so the desktop app sat waiting for a
+        # manual NCL login even with credentials saved in Windows
+        # Credential Manager.
+        #
+        # Best-effort by contract: auto_login never raises (see
+        # NclScraper.auto_login) and returns a status string. On anything
+        # other than OK we simply fall through to the manual poll below,
+        # which is the pre-existing behaviour - ESPRESSO has no auto-login
+        # at all (MFA) and must always be done by hand.
+        if hasattr(scraper, "auto_login"):
+            try:
+                status = await scraper.auto_login()
+                logger.info(
+                    "login_check.auto_login", cruise_line=cruise_line.value,
+                    status=status,
+                )
+                if status == "OK" and await self._verify_login(scraper, cruise_line):
+                    logger.info("login_check.success", cruise_line=cruise_line.value,
+                                via="auto_login")
+                    return True
+            except Exception as exc:
+                logger.warning("login_check.auto_login_failed",
+                               cruise_line=cruise_line.value, error=str(exc))
 
         # Require the same non-login URL on two consecutive polls before
         # declaring success — see the matching comment in main.py's
@@ -162,10 +209,22 @@ class BookingService:
         stable_url: str | None = None
         while time.monotonic() < deadline:
             await asyncio.sleep(poll_s)
-            if cruise_line in (CruiseLine.NCL, CruiseLine.GOCCL):
-                logged_in = "login" not in scraper.page.url.lower() and "signin" not in scraper.page.url.lower()
-            else:
-                logged_in = await scraper._check_login()
+            # WEAKNESS FIXED 2026-08-27: this branch tested login by
+            # looking for the substring "login"/"signin" in the URL, while
+            # ESPRESSO got a real `_check_login()`. NclScraper HAS a real
+            # `_check_login()` (it checks the page, not the address bar) and
+            # it simply wasn't being used, so an NCL "login OK" was only
+            # ever as trustworthy as the portal's URL naming — and any
+            # redirect to an auth host whose path doesn't literally say
+            # "login" would have reported success while logged out, which
+            # is the same class of bug as the has_live_session-vs-login
+            # confusion fixed on 2026-08-26.
+            #
+            # GoCCLScraper genuinely has no `_check_login()` override
+            # (verified), so it keeps the URL heuristic — but explicitly and
+            # with the reason stated, rather than being lumped in with NCL
+            # as if both were equally unverifiable.
+            logged_in = await self._verify_login(scraper, cruise_line)
             current_url = scraper.page.url
             if logged_in and current_url == stable_url:
                 logger.info("login_check.success", cruise_line=cruise_line.value)
@@ -175,6 +234,26 @@ class BookingService:
 
         logger.warning("login_check.timeout", cruise_line=cruise_line.value)
         return False
+
+    @staticmethod
+    async def _verify_login(scraper, cruise_line: CruiseLine) -> bool:
+        """One definition of "logged in", shared by the auto-login path and
+        the manual poll so they can never disagree.
+
+        Prefers the scraper's OWN `_check_login()` when it defines one
+        (ESPRESSO and NCL both do). GoCCLScraper genuinely does not, so it
+        keeps the URL heuristic - stated explicitly with the reason rather
+        than lumping it in with lines that can be checked properly.
+        """
+        if "_check_login" in type(scraper).__dict__:
+            try:
+                return await scraper._check_login()
+            except Exception as exc:
+                logger.warning("login_check.probe_failed",
+                               cruise_line=cruise_line.value, error=str(exc))
+                return False
+        url = (scraper.page.url or "").lower()
+        return "login" not in url and "signin" not in url
 
     async def start_scan(
         self,
@@ -188,6 +267,7 @@ class BookingService:
         on_action: Callable[[dict], None] | None = None,
         keep_browser_open: bool = False,
         headless: bool | None = None,
+        market: str | None = None,
     ) -> ScanJob:
         """
         Start a batch scan of booking IDs.
@@ -244,7 +324,7 @@ class BookingService:
         # that somehow gets past that).
         task = asyncio.create_task(self._run_batch(
             job, on_progress, bypass_cache, raw_dump_dir, capture_market_data,
-            capture_everything, on_action, keep_browser_open, headless,
+            capture_everything, on_action, keep_browser_open, headless, market,
         ))
         track_background_task(self._background_tasks, task)
 
@@ -260,6 +340,7 @@ class BookingService:
         capture_everything: bool = False,
         on_action: Callable[[dict], None] | None = None,
         keep_browser_open: bool = False,
+        market: str | None = None,
         headless: bool | None = None,
     ) -> None:
         """Execute the batch scan."""
@@ -290,16 +371,114 @@ class BookingService:
             logger.warning("batch.cache_cleanup_failed", error=str(e))
 
         try:
+            reconciled = await self.reconcile_stale_jobs()
+            if reconciled:
+                logger.warning("batch.reconciled_stale_jobs", count=reconciled)
+        except Exception as e:
+            logger.warning("batch.reconcile_stale_jobs_failed", error=str(e))
+
+        try:
+            # CONFIRMED BUG, fixed 2026-08-27: `market` was not threaded
+            # into this method at all, so `main.py scan --cruise-line NCL
+            # --market CA` built its LOGIN scraper with the CA account and
+            # then scanned with a freshly-built US one. The flag silently
+            # did nothing for the actual scan, and every Canadian booking
+            # would have come back "Reservation is not found" — looking
+            # like a portal problem rather than the wrong account.
             if keep_browser_open:
-                scraper = await self.get_or_create_scraper(job.cruise_line)
+                scraper = await self.get_or_create_scraper(job.cruise_line, market=market)
             else:
-                scraper = self._get_scraper(job.cruise_line)
+                scraper = self._get_scraper(job.cruise_line, market=market)
             scraper.raw_dump_dir = raw_dump_dir
             scraper.capture_everything = capture_everything
             scraper.on_action = on_action
 
             if not keep_browser_open:
                 await scraper.start(headless=headless)
+
+            # PRE-FLIGHT SESSION CHECK, added 2026-08-27 after a real
+            # failure: in the 506-booking ESPRESSO run of 2026-08-27,
+            # bookings #400-403 (3000041, 3000063, 3000062, 3000044) all
+            # died with "Session logged out while searching" between
+            # 14:19 and 14:31 UTC. Nothing checked the session was usable
+            # before the batch started — the batch simply drove into the
+            # portal and found out one booking at a time.
+            #
+            # This only runs on the keep_browser_open (GUI) path, where a
+            # login was explicitly confirmed moments earlier, so a failure
+            # here means the session died IN BETWEEN — precisely the
+            # "pressed Start and it made me log in again" symptom.
+            #
+            # Deliberately FAIL-CLOSED. Scanning a whole watchlist against
+            # a logged-out portal produces a burst of failures on a
+            # bot-detection-sensitive account (see the Akamai notes in
+            # check_login and DOCUMENTATION.md section L) and reports every
+            # client as ERROR. Refusing up-front with an actionable message
+            # is strictly better than discovering it 400 bookings in.
+            if "_check_login" in type(scraper).__dict__:
+                try:
+                    session_ok = await scraper._check_login()
+                except Exception as e:
+                    # A failing CHECK is not a failing session — do not
+                    # block the batch on a broken probe.
+                    logger.warning(
+                        "batch.preflight_login_check_errored",
+                        job_id=job.job_id, error=str(e),
+                    )
+                    session_ok = True
+
+                # CONFIRMED REAL BUG, fixed 2026-08-27. On the CLI path
+                # (keep_browser_open=False) NOTHING ever authenticated —
+                # scraper.start() restores storage_state and the batch
+                # simply hoped the replayed cookies were still valid.
+                # Proven live: `main.py scan --cruise-line NCL` logged
+                # `restored_session=True` and then failed all 3 pilot
+                # bookings with a bare
+                # `Timeout ... waiting for #SWXMLForm_SearchReservation_ResID`
+                # — the search field does not exist because the page was
+                # the login screen. `run_ncl_live_check.py`, the script that
+                # DID work, calls `auto_login()` explicitly; the batch path
+                # never did.
+                #
+                # Only on the fresh-browser path: when keep_browser_open is
+                # set, a human just logged in through check_login and
+                # re-authenticating underneath them is wrong (and on
+                # ESPRESSO a second login can knock out the live session —
+                # see DOCUMENTATION.md section L).
+                if not session_ok and not keep_browser_open and hasattr(scraper, "auto_login"):
+                    logger.info("batch.attempting_auto_login", job_id=job.job_id,
+                                cruise_line=job.cruise_line.value)
+                    try:
+                        # auto_login never raises by contract (see
+                        # NclScraper.auto_login) but do not depend on that.
+                        status = await scraper.auto_login()
+                        logger.info("batch.auto_login_result", job_id=job.job_id, status=status)
+                        session_ok = await scraper._check_login()
+                    except Exception as e:
+                        logger.error("batch.auto_login_failed", job_id=job.job_id, error=str(e))
+
+                if not session_ok:
+                    job.status = ScanJobStatus.FAILED
+                    if keep_browser_open:
+                        job.error = (
+                            f"{job.cruise_line.value} session is not logged in any more — "
+                            f"0 of {len(job.booking_ids)} bookings were checked. "
+                            f"Click \"Check login\", complete the login, then Start again."
+                        )
+                    else:
+                        job.error = (
+                            f"Could not log in to {job.cruise_line.value} — 0 of "
+                            f"{len(job.booking_ids)} bookings were checked. The saved "
+                            f"session is stale and auto-login did not succeed. Save "
+                            f"credentials with save_login.py, or run the scan from the "
+                            f"GUI where you can log in by hand."
+                        )
+                    logger.error(
+                        "batch.preflight_login_failed",
+                        job_id=job.job_id, cruise_line=job.cruise_line.value,
+                        booking_count=len(job.booking_ids),
+                    )
+                    return
 
             for i, booking_id in enumerate(job.booking_ids):
                 if self._stop_flags.get(job.job_id):
@@ -355,7 +534,10 @@ class BookingService:
                             await scraper.stop()
                         except Exception:
                             pass
-                        scraper = self._get_scraper(job.cruise_line)
+                        # `market=` is REQUIRED here too: a browser crash
+                        # part-way through a Canada scan must not silently
+                        # resume on the US account.
+                        scraper = self._get_scraper(job.cruise_line, market=market)
                         scraper.raw_dump_dir = raw_dump_dir
                         scraper.capture_everything = capture_everything
                         scraper.on_action = on_action
@@ -408,7 +590,21 @@ class BookingService:
                 # design intent (already honored for the scrape itself via
                 # the try/except a few lines up). Each step below now fails
                 # on its own without taking the batch down with it.
-                if capture_market_data and scraper.last_market_data:
+                # `capture_market_data` is a TELEMETRY switch - it gates
+                # ESPRESSO's category-table snapshot, which is for later
+                # analysis. NCL's booking-detail snapshot is different in
+                # kind: those fields (Gross Due, Net Due, Commiss.Earned,
+                # FINAL PAYMENT date) now DRIVE decisions - paid-in-full,
+                # the collectable cap, the final-payment gate, commission -
+                # so they must be recorded on every scan regardless of the
+                # checkbox. Neon 2026-08-28: "make sure that our scanner
+                # also scans the infromation and all the details o the
+                # booking from now on". Not persisting them is exactly why
+                # the re-audit could not tell that 3000049 and 3000052
+                # were paid in full.
+                _md = scraper.last_market_data
+                _always = bool(_md) and _md.get("capture_type") == "ncl_booking_details"
+                if (capture_market_data or _always) and _md:
                     try:
                         await self._save_market_data_to_db(result, scraper.last_market_data)
                     except Exception as e:
@@ -657,6 +853,25 @@ class BookingService:
                 note=result.note,
                 error=result.error,
                 lost_pkg_names=json.dumps(result.lost_pkg_names),
+                # ADDED 2026-08-27: these 14 fields were computed on every
+                # single check and thrown away here, leaving the system
+                # unable to audit its own money decisions. `obc_change` in
+                # particular is what the OBC rule turns on, and
+                # old_promos/new_promos exist specifically to make a
+                # LATRIPLE TRAP verdict auditable. See BookingRecord.
+                price_drop=result.price_drop,
+                obc_change=result.obc_change,
+                lost_pkg_value=result.lost_pkg_value,
+                currency=result.currency,
+                old_promos=result.old_promos,
+                new_promos=result.new_promos,
+                lost_fares=json.dumps(result.lost_fares),
+                re_addable_fares=json.dumps(result.re_addable_fares),
+                gained_fares=json.dumps(result.gained_fares),
+                lost_travel_protection=json.dumps(result.lost_travel_protection),
+                old_cruise_fare=result.old_cruise_fare,
+                new_cruise_fare=result.new_cruise_fare,
+                fare_change_pct=result.fare_change_pct,
             )
             session.add(record)
             await session.commit()
@@ -710,6 +925,48 @@ class BookingService:
             )
             session.add(record)
             await session.commit()
+
+    async def reconcile_stale_jobs(self, max_age_hours: float = 12.0) -> int:
+        """Mark abandoned scan_jobs rows FAILED instead of RUNNING forever.
+
+        CONFIRMED REAL CORRUPTION, quantified 2026-08-27: the live DB holds
+        **24 rows stuck at status='RUNNING'** with progress_done=0 and
+        completed_at=NULL, the oldest from 2026-07-19 and one with
+        progress_total=623. `_update_job_in_db` itself is correct — the rows
+        are stuck because the OWNING PROCESS DIED (window closed mid-scan,
+        Ctrl+C, a `timeout` kill), so the `finally` that would have written
+        the terminal status never ran. Nothing ever reconciled them
+        afterwards.
+
+        Why it matters beyond tidiness: a RUNNING row that no process owns
+        is a lie about the system's state, `run_persistent_watchlist_scan.py`
+        reasons about scan_jobs when deciding what to resume, and the GUI
+        polls while a job reads PENDING/RUNNING.
+
+        Deliberately AGE-BASED, not "anything RUNNING at startup". Multiple
+        processes legitimately coexist here — right now there are two live
+        `gui.main` processes — so blanket-failing every RUNNING row on
+        startup would kill a healthy concurrent scan. 12h is far beyond any
+        real run (today's 506-booking ESPRESSO scan took 2h49m) while still
+        catching every one of the 24.
+        """
+        from datetime import timedelta
+
+        cutoff = datetime.utcnow() - timedelta(hours=max_age_hours)
+        async with async_session() as session:
+            result = await session.execute(
+                select(ScanJobRecord).where(
+                    ScanJobRecord.status.in_(("RUNNING", "PENDING")),
+                    ScanJobRecord.started_at < cutoff,
+                )
+            )
+            stale = result.scalars().all()
+            for record in stale:
+                record.status = ScanJobStatus.FAILED.value
+                record.completed_at = datetime.utcnow()
+            if stale:
+                await session.commit()
+            return len(stale)
 
     async def _update_job_in_db(self, job: ScanJob) -> None:
         """Update a scan job status."""

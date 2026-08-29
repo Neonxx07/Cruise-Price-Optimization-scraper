@@ -1,5 +1,5 @@
 """Tests for the live discount price-testing pipeline (2026-08-13,
-forensic investigation of bookings 3000026/3000029).
+forensic investigation of bookings 3000026/74242969).
 
 These validate the LOGIC of test_discount_candidate/_apply_discount_candidate/
 _wait_for_post_discount_price/generate_discount_candidates using fake
@@ -36,10 +36,24 @@ class _FakeOptionsLocator:
 
 
 class _FakeSelectLocator:
-    def __init__(self, option_texts, select_calls, index):
+    """Models a real <select> closely enough to exercise the 2026-08-27
+    read-back verification in _apply_discount_candidate.
+
+    `selection_sticks=False` simulates the REAL failure mode that
+    verification exists to catch: `select_option(force=True)` skips
+    Playwright's actionability checks, so a hidden/disabled/detached
+    select accepts the call while MSC's own JS never registers it — and
+    the element's selected option is therefore unchanged afterward.
+    """
+
+    def __init__(self, option_texts, select_calls, index, selection_sticks=True,
+                 readback_raises=False):
         self._option_texts = option_texts
         self._calls = select_calls
         self._index = index
+        self._selection_sticks = selection_sticks
+        self._readback_raises = readback_raises
+        self._selected = option_texts[0] if option_texts else ""
 
     def locator(self, sel):
         assert sel == "option"
@@ -47,18 +61,33 @@ class _FakeSelectLocator:
 
     async def select_option(self, label=None, force=None, timeout=None):
         self._calls.append({"index": self._index, "label": label})
+        if self._selection_sticks:
+            self._selected = label
+
+    async def evaluate(self, js):
+        """Stands in for reading el.options[el.selectedIndex].textContent."""
+        if self._readback_raises:
+            raise RuntimeError("element detached from DOM")
+        return self._selected
 
 
 class _FakeSelectsLocator:
-    def __init__(self, selects_option_texts, select_calls):
+    def __init__(self, selects_option_texts, select_calls,
+                 selection_sticks=True, readback_raises=False):
         self._selects = selects_option_texts
         self._calls = select_calls
+        self._selection_sticks = selection_sticks
+        self._readback_raises = readback_raises
 
     async def count(self):
         return len(self._selects)
 
     def nth(self, i):
-        return _FakeSelectLocator(self._selects[i], self._calls, i)
+        return _FakeSelectLocator(
+            self._selects[i], self._calls, i,
+            selection_sticks=self._selection_sticks,
+            readback_raises=self._readback_raises,
+        )
 
 
 class FakePage:
@@ -68,8 +97,13 @@ class FakePage:
     simulate the page's text changing over the course of a poll loop."""
 
     def __init__(self, selects_option_texts=None, evaluate_results=None,
-                 inner_text_sequence=None, url="https://www.mscbook.com/x?partNumber=VI20260905SOUSOU"):
+                 inner_text_sequence=None, url="https://www.mscbook.com/x?partNumber=VI20260905SOUSOU",
+                 selection_sticks=True, readback_raises=False):
         self._selects_option_texts = selects_option_texts or []
+        # See _FakeSelectLocator: lets a test simulate a selection that
+        # Playwright "accepts" but the page never actually applies.
+        self._selection_sticks = selection_sticks
+        self._readback_raises = readback_raises
         self.select_calls = []
         self.fill_calls = []
         self.evaluate_calls = []
@@ -80,7 +114,11 @@ class FakePage:
 
     def locator(self, sel):
         assert sel == "select"
-        return _FakeSelectsLocator(self._selects_option_texts, self.select_calls)
+        return _FakeSelectsLocator(
+            self._selects_option_texts, self.select_calls,
+            selection_sticks=self._selection_sticks,
+            readback_raises=self._readback_raises,
+        )
 
     async def wait_for_timeout(self, ms):
         self.wait_calls += 1
@@ -146,7 +184,15 @@ async def test_apply_discount_voyagers_missing_fields_never_touches_page():
 
 @pytest.mark.asyncio
 async def test_apply_discount_voyagers_success_fills_real_fields():
-    page = FakePage(evaluate_results=[True, None])
+    # inner_text_sequence supplies MSC's own confirmation text. Required
+    # since 2026-08-27: this path no longer returns success after a fixed
+    # sleep -- it polls for a real success/failure marker and FAILS CLOSED
+    # if neither appears, because a "member not found" lookup used to be
+    # recorded as a successfully applied discount.
+    page = FakePage(
+        evaluate_results=[True, None],
+        inner_text_sequence=["Club discount available for this member"],
+    )
     candidate = MscDiscountCandidate(
         label="Voyagers Club", method=MscDiscountApplicationMethod.VOYAGERS_CLUB_INSERT,
         voyagers_first_name="DANY", voyagers_last_name="AZZI",
@@ -159,6 +205,90 @@ async def test_apply_discount_voyagers_success_fills_real_fields():
     assert ("#club-firstname", "DANY") in page.fill_calls
     assert ("#club-card", "4813462") in page.fill_calls
 
+
+
+# ── Priority-3 verification: failure paths (added 2026-08-27) ──────────
+#
+# The user's explicit instruction: "Test failure paths, not only
+# successful paths." Each test below fails if its verification is removed.
+
+
+@pytest.mark.asyncio
+async def test_apply_discount_dropdown_fails_when_selection_does_not_stick():
+    """THE bug read-back verification exists to catch: select_option(
+    force=True) skips actionability checks, so a hidden/disabled select
+    "accepts" the call while MSC never registers it. Before verification
+    this returned success and the caller attributed a price delta to a
+    discount that was never applied."""
+    page = FakePage(
+        selects_option_texts=[["Select Special Discounts", "SENIOR DISCOUNT"]],
+        selection_sticks=False,
+    )
+    candidate = MscDiscountCandidate(
+        label="SENIOR DISCOUNT", method=MscDiscountApplicationMethod.DROPDOWN_OPTION,
+    )
+
+    result = await msc_commands._apply_discount_candidate(page, candidate)
+
+    assert result["success"] is False
+    assert "did NOT take" in result["reason"]
+
+
+@pytest.mark.asyncio
+async def test_apply_discount_dropdown_fails_when_readback_itself_errors():
+    """If we cannot READ the selection back, we cannot trust it — fail
+    closed rather than assuming it worked."""
+    page = FakePage(
+        selects_option_texts=[["Select Special Discounts", "SENIOR DISCOUNT"]],
+        readback_raises=True,
+    )
+    candidate = MscDiscountCandidate(
+        label="SENIOR DISCOUNT", method=MscDiscountApplicationMethod.DROPDOWN_OPTION,
+    )
+
+    result = await msc_commands._apply_discount_candidate(page, candidate)
+
+    assert result["success"] is False
+    assert "read back" in result["reason"]
+
+
+@pytest.mark.asyncio
+async def test_apply_discount_voyagers_fails_when_member_not_found():
+    """A rejected member lookup used to be recorded as success."""
+    page = FakePage(
+        evaluate_results=[True, None],
+        inner_text_sequence=["Member not found for the details provided"],
+    )
+    candidate = MscDiscountCandidate(
+        label="Voyagers Club", method=MscDiscountApplicationMethod.VOYAGERS_CLUB_INSERT,
+        voyagers_first_name="DANY", voyagers_last_name="AZZI",
+        voyagers_dob="06/15/1965", voyagers_card_number="4813462",
+    )
+
+    result = await msc_commands._apply_discount_candidate(page, candidate)
+
+    assert result["success"] is False
+    assert "rejected" in result["reason"].lower()
+
+
+@pytest.mark.asyncio
+async def test_apply_discount_voyagers_fails_closed_when_outcome_ambiguous():
+    """Neither a success nor a failure marker appears — must FAIL, not
+    assume success. This is the fixed-sleep bug in its purest form."""
+    page = FakePage(
+        evaluate_results=[True, None],
+        inner_text_sequence=["some unrelated page content"],
+    )
+    candidate = MscDiscountCandidate(
+        label="Voyagers Club", method=MscDiscountApplicationMethod.VOYAGERS_CLUB_INSERT,
+        voyagers_first_name="DANY", voyagers_last_name="AZZI",
+        voyagers_dob="06/15/1965", voyagers_card_number="4813462",
+    )
+
+    result = await msc_commands._apply_discount_candidate(page, candidate)
+
+    assert result["success"] is False
+    assert "failing closed" in result["reason"]
 
 # ── _wait_for_post_discount_price ───────────────────────────────────────
 
@@ -286,6 +416,15 @@ def _patch_pipeline(monkeypatch, *, baseline_value="1,000.00", verification_valu
             "current_value": baseline_value, "rate_name": rate_name,
             "is_guaranteed": False,
             "occupancy_fix": {"stalled": occupancy_stalled, "before": {}, "required": {}, "after": {}},
+                # Fields below added 2026-08-27: test_discount_candidate now
+                # validates the requested label against
+                # generate_discount_candidates(staged), so a fake staged dict
+                # must carry the same evidence a REAL staging returns or the
+                # eligibility gate (correctly) refuses everything.
+                "discount_options": ["SENIOR DISCOUNT", "TODAY10"],
+            "senior_count": 2,
+            "is_group_rate": False,
+            "cabin_count": 1,
         }
 
     async def fake_apply(page, candidate):
@@ -433,7 +572,10 @@ async def test_discount_candidate_identity_validation_failed_on_partnumber_chang
     async def fake_stage(page, booking_id):
         return {"found": True, "status": None, "category": "BR1", "current_value": "1,000.00",
                 "rate_name": "CRUISE ONLY OBC INCLUDED", "is_guaranteed": False,
-                "occupancy_fix": {"stalled": False}}
+                "occupancy_fix": {"stalled": False},
+                # See the note on the other fake_stage above.
+                "discount_options": ["SENIOR DISCOUNT", "TODAY10"],
+                "senior_count": 2, "is_group_rate": False, "cabin_count": 1}
 
     async def fake_apply(page, candidate):
         return {"success": True, "reason": "ok"}
