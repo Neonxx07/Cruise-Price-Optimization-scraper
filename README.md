@@ -62,6 +62,8 @@ Both share the **same core business logic** — detecting price drops, tracking 
 - ⭐ **Confidence scoring** — 1-5 star reliability rating per optimization
 - 💳 **Paid-in-full detection** — skips bookings that can't be repriced
 - 🔄 **Smart caching** — avoids rechecking recently-checked bookings
+- ⚡ **Concurrent multi-line scanning** — ESPRESSO + MSC + NCL together on one shared browser,
+  CPU/RAM-throttled so the machine stays usable
 - 🖥️ **Desktop GUI** — queue bookings, watch a scan live, export results
 - 🔐 **OS-keychain credential storage** — no passwords in files or env vars
 - 📋 **CSV / Excel export** — download results for reporting
@@ -207,6 +209,60 @@ Commands that genuinely would commit a change (`CruiseCabinLockCmd` /
 
 ## What's New
 
+### Concurrent multi-line scanning
+
+ESPRESSO, MSC and NCL now run **at the same time, over one shared browser**. Previously this
+wasn't merely slow, it was impossible: `BookingService` held a single scraper slot and stopped
+the running scraper whenever a different cruise line was requested, killing the previous line's
+logged-in session.
+
+- [`scraper/browser_pool.py`](platform/scraper/browser_pool.py) — one Chromium process with an
+  isolated `BrowserContext` per cruise line. Contexts are Playwright's isolation primitive
+  (cookies/localStorage/cache are per-context), so three agent accounts never see each other's
+  session. Replaces one full Chromium *per line* — on a 4-core machine, the difference between
+  a usable PC and an unusable one.
+- [`services/resource_governor.py`](platform/services/resource_governor.py) — a CPU/RAM-aware
+  gate every worker awaits before starting a booking (`max_cpu_percent` 85, `max_ram_percent`
+  93), plus a single-instance guard so two coordinators can't fight over the same portal
+  sessions. The goal is smoothness and reliability, not maximum concurrency.
+- [`services/multi_line_coordinator.py`](platform/services/multi_line_coordinator.py) — a global
+  in-flight semaphore (`max_concurrent_bookings`) plus a per-line semaphore so no single line
+  hogs every slot, per-line queues, and per-line failure isolation: a stuck line has *its*
+  context recycled while the others keep going.
+
+> Deliberately **no** calculator, scraper, or export logic was touched. Every booking still runs
+> through the same `check_booking(...)` and the same calculators — this only decides *when* and
+> *with which browser* a booking runs, so results cannot change because of it.
+
+### NCL: multi-market accounts and payment rules
+
+- **US / Canada (CAD) markets.** NCL runs a *separate* SeaWeb agent account per market, so a
+  Canadian booking checked against the US login returns "Reservation is not found" — it isn't
+  missing, it's on the other account (25 of 101 errors in one real run). `NclScraper(market=...)`
+  selects the account; `ncl_default_market` keeps existing callers working.
+- [`split_ncl_watchlist_by_account.py`](platform/split_ncl_watchlist_by_account.py) — derives
+  per-market watchlists from results already recorded in the database, instead of hand-sorting
+  booking IDs.
+- **Collectable-savings rule.** A price drop is now capped by what's actually still owed: only
+  the outstanding balance is collectable, and the optimization note says so explicitly rather
+  than advertising a saving the client can't realise. Paid-in-full tolerance and two confirmed
+  OBC false positives were fixed alongside it.
+
+### Housekeeping
+
+- [`cleanup_test_pollution.py`](platform/cleanup_test_pollution.py) — removes junk rows a test
+  suite wrote into the production database. A `monkeypatch.setattr(..., raising=False)` targeted
+  a method that doesn't exist, so the typo was silently ignored and 78 fake ERROR rows were
+  written for booking IDs "A", "B" and "C".
+- **Repo hygiene** — `.gitattributes` normalises line endings (a Windows round-trip was
+  reporting unchanged files as fully rewritten), and `.gitignore` now *allowlists* booking-ID
+  input lists rather than naming them one at a time.
+- **10 new test modules** — NCL markets, OBC, payment rules, multi-line concurrency, GUI results
+  table, preflight/file-load, MSC eligibility, and JS syntax.
+
+<details>
+<summary><strong>Earlier releases</strong></summary>
+
 - **NCL brought online** — same-category reprice redesign, dialog-handling safety fixes, and
   corrected search/add-on selectors, plus
   [`run_ncl_live_check.py`](platform/run_ncl_live_check.py): a single *watched*, non-headless,
@@ -223,6 +279,8 @@ Commands that genuinely would commit a change (`CruiseCabinLockCmd` /
 - **`analyze_history.py`** — read-only report over already-collected scan data, so scanning
   effort can be aimed at what actually pays off.
 - **New tests** — NCL scraper, GoCCL, smart locator, and a production-hardening suite.
+
+</details>
 
 ---
 
@@ -246,9 +304,13 @@ Commands that genuinely would commit a change (`CruiseCabinLockCmd` /
 |-------------|--------|-----------|----------|-----|
 | Royal Caribbean | ESPRESSO (CruisingPower) | ✅ | ✅ | ✅ |
 | Celebrity Cruises | ESPRESSO (CruisingPower) | ✅ | ✅ | ✅ |
-| Norwegian (NCL) | SeaWeb Agents | ✅ | ✅ | ✅ |
+| Norwegian (NCL) | SeaWeb Agents (US + Canada/CAD) | ✅ | ✅ | ✅ |
 | Carnival (GoCCL) | GoCCL | ✅ | ✅ | ✅ |
 | MSC Cruises | MSC Book | — | ✅ | ✅ |
+
+> **NCL uses a separate agent account per market.** A Canadian booking checked against the US
+> login reports "Reservation is not found" — it's on the other account, not missing. Set the
+> market with `NclScraper(market="CA")` or `ncl_default_market`.
 
 > **MSC never allows a direct in-portal reprice** — opportunities are surfaced for an agent
 > to apply by phone. See [MSC: `confirm_and_proceed`](#-msc-confirm_and_proceed-and-the-read-only-check-flow)
