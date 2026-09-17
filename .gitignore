@@ -96,3 +96,11 @@ htmlcov/
 
 # Claude Code local runtime state (session locks, not project source)
 .claude/scheduled_tasks.lock
+
+# Stray local notes that keep reappearing in the working copy. Both are raw
+# session transcripts containing real booking numbers, the owner's real name
+# and absolute local paths. They have been excluded by hand every session
+# since 2026-08-15; on 2026-09-17 a `git add -A` without the usual manual
+# reset committed them for real. Named here so that can never happen again.
+/New Text Document.txt
+/SESSION_CHANGES_*.txt
