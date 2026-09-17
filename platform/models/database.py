@@ -32,6 +32,15 @@ class BookingRecord(Base):
     """Stores the result of each booking check."""
 
     __tablename__ = "bookings"
+    __table_args__ = (
+        # The GUI's hottest query, added 2026-09-15 after measuring it:
+        # "today's results for this cruise line" was a full table SCAN at
+        # 48 ms, and it runs once per panel on every startup and reload -
+        # four times over, before a single booking is scanned. Indexed it
+        # drops to roughly a millisecond. Mirrors the composite already on
+        # market_data, which was added for the same reason.
+        Index("ix_bookings_line_created_at", "cruise_line", "created_at"),
+    )
 
     id = Column(Integer, primary_key=True, autoincrement=True)
     booking_id = Column(String(20), nullable=False, index=True)
@@ -145,6 +154,19 @@ class MarketDataRecord(Base):
     booking_id = Column(String(20), nullable=False, index=True)
     cruise_line = Column(String(10), nullable=False)
     capture_type = Column(String(50), nullable=False, default="espresso_category_table")
+    # The WHOLE capture, added 2026-09-16. This table was built around
+    # ESPRESSO's shape - a category table under "rows" - and every other
+    # payload was silently reduced to it. NCL's capture carries no "rows"
+    # at all: it holds the payment state (amount due, final payment date,
+    # commission rate), so all 135 of its rows in the 2026-09-16 run were
+    # written EMPTY and mislabelled "ncl_category_table".
+    #
+    # Worse, those discarded fields are exactly the ones needed to rank a
+    # booking by urgency and to warn that a finding is about to expire -
+    # the gap that let $3,945 of found savings lapse during an 18-day scan
+    # gap. Keeping the raw payload means a future question can be answered
+    # from history instead of needing another live run.
+    payload_json = Column(Text)
     current_category = Column(String(20))
     execution_token = Column(String(100))
     selection_json = Column(Text)
@@ -190,6 +212,33 @@ else:
 async_session = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
 
 
+def _ensure_sqlite_indexes(sync_conn) -> list[str]:
+    """Create indexes that `Base.metadata.create_all` will not.
+
+    create_all only ever CREATES tables - it never alters an existing one,
+    which is the same reason _migrate_sqlite_add_columns exists for
+    columns. An index declared in __table_args__ therefore never appears
+    on a database that already had the table, so it has to be issued
+    explicitly. IF NOT EXISTS makes this idempotent and safe to run on
+    every startup.
+    """
+    from sqlalchemy import text
+
+    wanted = {
+        "ix_bookings_line_created_at":
+            "CREATE INDEX IF NOT EXISTS ix_bookings_line_created_at "
+            "ON bookings (cruise_line, created_at)",
+    }
+    created = []
+    existing = {row[0] for row in sync_conn.execute(
+        text("SELECT name FROM sqlite_master WHERE type='index'"))}
+    for name, ddl in wanted.items():
+        if name not in existing:
+            sync_conn.execute(text(ddl))
+            created.append(name)
+    return created
+
+
 def _migrate_sqlite_add_columns(sync_conn) -> list[str]:
     """Add any newly-declared columns to EXISTING tables.
 
@@ -233,6 +282,9 @@ async def init_db():
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
         added = await conn.run_sync(_migrate_sqlite_add_columns)
+        indexes = await conn.run_sync(_ensure_sqlite_indexes)
+        if indexes:
+            logger.info("database.indexes_created", indexes=indexes)
     if added:
         logger.info("db.migrated_added_columns", columns=added, count=len(added))
     return added

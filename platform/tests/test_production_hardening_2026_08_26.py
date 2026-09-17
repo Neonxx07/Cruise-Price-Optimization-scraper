@@ -7,7 +7,6 @@ would have failed before its fix. Grouped by the file that was fixed.
 import os
 import tempfile
 
-import pytest
 
 from core.models import BookingResult, BookingStatus, CruiseLine
 

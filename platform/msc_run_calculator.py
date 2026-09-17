@@ -16,18 +16,24 @@ import csv
 import json
 import os
 import sys
+from datetime import datetime
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from msc_commands import (
+    _count_cabins,
+    msc_invoice_components,
+    msc_invoice_guest_count,
     _extract_booking_essentials,
     _extract_discounts_with_implied,
     _extract_passengers,
     _find_today_price,
     _is_paid_in_full,
     _srn_reference_available,
+    msc_occupancy_is_trustworthy,
 )
 from core.calculator_msc import evaluate_msc_booking
+from core.price_scope import PriceScope
 from core.models import MSC_PAID_IN_FULL_DUE_THRESHOLD
 
 BOOKING_DATA_PATH = "data/msc_control/booking_data.jsonl"
@@ -48,7 +54,32 @@ def _load_last_by_id(path: str) -> dict:
             if not line:
                 continue
             entry = json.loads(line)
-            seen[entry["booking_id"]] = entry
+            bid = entry.get("booking_id")
+            if not bid:
+                continue
+            # NEWEST BY TIMESTAMP, not by read position. Added 2026-09-03.
+            #
+            # This used to keep whichever record it read LAST, which is only
+            # the newest while the file's append order matches real
+            # chronological order. It does not always: booking_data.jsonl
+            # and rate_check_data.jsonl each contain 4 timestamp inversions.
+            # Today those inversions fall BETWEEN bookings rather than
+            # within one, so last-wins happened to be right on all 118/89
+            # bookings — correct by luck, not construction. Concurrent
+            # scanning (two cruise lines at once, now supported) interleaves
+            # writes and would break it silently, picking a stale capture
+            # and reporting an old price as today's.
+            previous = seen.get(bid)
+            if previous is None:
+                seen[bid] = entry
+                continue
+            new_ts = entry.get("captured_at") or ""
+            old_ts = previous.get("captured_at") or ""
+            # An unstamped record loses to a stamped one; between two
+            # unstamped records the later line still wins, preserving the
+            # old behaviour for pre-timestamp captures.
+            if new_ts >= old_ts:
+                seen[bid] = entry
     return seen
 
 
@@ -109,6 +140,29 @@ def main():
         # rather than erroring, so VOYAGERS_SELECTION reports
         # INSUFFICIENT_DATA on old captures instead of a false NO_OPPORTUNITY.
         due_amount = _parse_dollars(essentials.get("due_amount"))
+
+        # THE OCCUPANCY CROSS-CHECK, added here 2026-09-03 by the call-site
+        # parity test, which found this path applied every other guard and
+        # not this one. Replaying booking 3000081's 2026-08-24 capture
+        # through this script would therefore still have produced the fake
+        # $267.01 that the live path refuses — the report contradicting the
+        # scanner on the very case the guard was written for.
+        _occ = rate.get("occupancy_fix") or {}
+        _cabins = _count_cabins((booking.get("summary_text") or "")
+                                + chr(10) + (booking.get("breakdown_text") or ""))
+        occupancy_verified, occupancy_note = msc_occupancy_is_trustworthy(
+            {
+                "counts": _occ.get("required") or {},
+                "total_guests": _occ.get("intended_guests"),
+                "dropped": _occ.get("dropped_passengers") or 0,
+                "passengers_seen": _occ.get("passengers_seen"),
+            },
+            msc_invoice_guest_count(booking.get("summary_text"),
+                                    booking.get("breakdown_text")),
+            _occ or None,
+            _cabins,
+        )
+
         result = evaluate_msc_booking(
             booking_id=bid,
             category=category,
@@ -116,6 +170,7 @@ def main():
             is_paid_in_full=_is_paid_in_full(
                 due_amount, essentials.get("is_overpayment", False), MSC_PAID_IN_FULL_DUE_THRESHOLD
             ),
+            is_overpayment=bool(essentials.get("is_overpayment", False)),
             due_amount=due_amount,
             current_total_price=_parse_dollars(essentials.get("value")),
             today_base_price=_parse_dollars(today_price),
@@ -129,6 +184,43 @@ def main():
             is_group_rate=rate.get("is_group_rate", False),
             club_discount_offered=rate.get("club_discount_offered"),
             final_payment_date_passed=bool(essentials.get("final_payment_date_passed")),
+            # PARITY WITH THE LIVE PATH, added 2026-09-03. These guards were
+            # added to _check_booking_msc but not here, so replaying a stored
+            # capture through this script produced a DIFFERENT verdict than
+            # the run that captured it — a report disagreeing with the scan
+            # that produced it is worse than either being wrong alone.
+            #
+            # Every one of them is derived from the stored record, so an old
+            # capture that predates the field degrades to "unknown" and the
+            # guard reports INSUFFICIENT_DATA rather than a false verdict.
+            occupancy_verified=occupancy_verified,
+            occupancy_note=occupancy_note,
+            customer_has_club_membership=bool(next(
+                (p for p in (_extract_passengers(booking["summary_text"])
+                             .get("passengers") or [])
+                 if p.get("voyagers_number")), None)),
+            today_price_includes_club_discount=bool(
+                rate.get("today_price_includes_club_discount")),
+            club_entry_note=str(
+                (rate.get("voyagers_fix") or {}).get("reason") or ""),
+            non_cruise_charges=msc_invoice_components(
+                booking.get("breakdown_text")).get("non_cruise_total") or 0.0,
+            current_scope=PriceScope(
+                guests=msc_invoice_guest_count(
+                    booking.get("summary_text"), booking.get("breakdown_text")),
+                cabins=_cabins,
+                includes_club_discount=True,
+                non_cruise_charges=0.0,
+                label="the booking's own total",
+            ),
+            today_scope=PriceScope(
+                guests=(rate.get("occupancy_fix") or {}).get("applied_guests"),
+                cabins=1,
+                includes_club_discount=bool(
+                    rate.get("today_price_includes_club_discount")),
+                non_cruise_charges=0.0,
+                label="today's listing card",
+            ),
         )
         # current_discounts is None (not []) when _extract_discounts
         # couldn't confirm the Price Breakdown modal actually rendered —
@@ -159,9 +251,16 @@ def main():
             )
 
     os.makedirs(os.path.dirname(RESULTS_PATH), exist_ok=True)
+    # Stamped so a saved report can be told apart from a later one. This
+    # file is rewritten whole on each run and previously carried no date at
+    # all, which made a stale report on disk indistinguishable from a fresh
+    # one — and it is the file the CSV is built from.
+    generated_at = datetime.now().isoformat()
     with open(RESULTS_PATH, "w", encoding="utf-8") as f:
         for result, _, _ in results:
-            f.write(result.model_dump_json() + "\n")
+            record = json.loads(result.model_dump_json())
+            record["generated_at"] = generated_at
+            f.write(json.dumps(record) + "\n")
     print(f"\nSaved {len(results)} result(s) to {RESULTS_PATH}")
 
     with open(RESULTS_CSV_PATH, "w", encoding="utf-8", newline="") as f:

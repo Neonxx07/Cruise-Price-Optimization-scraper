@@ -26,7 +26,6 @@ of live ESPRESSO/NCL/GoCCL history), not by reading code.
 5. **SharedBrowserPool keys sessions by cruise line only**, while NCL now
    has per-market (US/CA) accounts — a latent cross-account session leak.
 """
-import asyncio
 import json
 import os
 

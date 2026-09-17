@@ -276,7 +276,6 @@ async def test_market_reaches_the_scraper_the_scan_actually_uses(monkeypatch):
     service = BookingService()
     seen: list = []
 
-    real_get = service._get_scraper
 
     def spy(cruise_line, market=None):
         seen.append(market)

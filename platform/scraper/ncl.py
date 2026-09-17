@@ -830,7 +830,15 @@ class NclScraper(BaseScraper):
                         currentCategory: VXcurrent(),
                         categories: found.cats.map(c => ({
                             category: c.Category,
-                            resTotal: parseFloat(c.ResTotal) || 0,
+                            // NOT `|| 0`. A price that could not be parsed became
+                            // 0, and 0 was then read downstream as "no price
+                            // change" - so an unreadable price was reported as a
+                            // confident NO_SAVING, indistinguishable from a price
+                            // that genuinely did not move. null keeps the two apart.
+                            resTotal: (c.ResTotal === null || c.ResTotal === undefined
+                                       || c.ResTotal === '' ||
+                                       !isFinite(parseFloat(c.ResTotal)))
+                                      ? null : parseFloat(c.ResTotal),
                             status: c.Status,
                             hasAvailability: c.HasAvailability,
                             currentPromo: c.CurrentPromo || '',
@@ -1436,16 +1444,27 @@ class NclScraper(BaseScraper):
             commission_rate = None
             if commiss_earned and invoice_total and invoice_total > 0:
                 commission_rate = round(commiss_earned / invoice_total, 4)
+
+            # ORDER MATTERS, fixed 2026-09-15. These two were assigned AFTER
+            # the log line below that reads balance_is_all_commission, so
+            # every NCL booking raised
+            #   UnboundLocalError: cannot access local variable
+            #   'balance_is_all_commission' where it is not associated with
+            #   a value
+            # and failed. Nothing but a logging argument was wrong - the
+            # calculation itself was fine - but it aborted the whole scrape
+            # before any result could be produced.
+            cruise_line_fully_paid = net_due is not None and net_due <= 0.01
+            balance_is_all_commission = (
+                amount_due is not None and com_due is not None
+                and amount_due > 0 and abs(com_due - amount_due) < 0.01
+            )
+
             logger.info(
                 "ncl.commission", booking_id=booking_id,
                 commiss_earned=commiss_earned, invoice_total=invoice_total,
                 commission_rate=commission_rate,
                 balance_is_all_commission=balance_is_all_commission,
-            )
-            cruise_line_fully_paid = net_due is not None and net_due <= 0.01
-            balance_is_all_commission = (
-                amount_due is not None and com_due is not None
-                and amount_due > 0 and abs(com_due - amount_due) < 0.01
             )
             logger.info(
                 "ncl.payment_state", booking_id=booking_id,
@@ -1606,6 +1625,37 @@ class NclScraper(BaseScraper):
             # the booking, no dialog to handle.
             live_price = current["resTotal"]
 
+            # AN UNREADABLE PRICE IS NOT "NO CHANGE", split 2026-09-16.
+            # Neon, mid-run: "it is results is only paid in full and no
+            # savings the price does not chang at atll".
+            #
+            # `live_price <= 0` used to fall into the branch below and be
+            # reported as a clean NO_SAVING with new_total == old_total -
+            # the literal statement "today's price is identical". But the
+            # grid read coerced any unparseable ResTotal to 0 (`|| 0`, now
+            # fixed above), so a FAILED read and an UNCHANGED price were
+            # the same value. Every failure became a confident "no saving",
+            # which is why a whole run can show prices that never move.
+            #
+            # Same class as the MSC club-discount bug: a failure presented
+            # as a negative result. It must be visible instead.
+            if live_price is None or live_price <= 0:
+                logger.warning(
+                    "ncl.live_price_unreadable", booking_id=booking_id,
+                    category=current_category, live_price=live_price,
+                    old_total=old_total,
+                )
+                self.log_action(
+                    "live_price_unreadable", booking_id=booking_id,
+                    category=current_category, live_price=live_price,
+                )
+                raise RuntimeError(
+                    f"Could not read today's live price for category "
+                    f"'{current_category}' (grid gave {live_price!r}) - refusing "
+                    f"to report 'no saving' from a price that was never read"
+                )
+
+
             # A price INCREASE cannot be an optimization, so there is
             # nothing to learn from the invasive re-select below — and
             # re-selecting mutates a live in-progress edit for no possible
@@ -1634,7 +1684,7 @@ class NclScraper(BaseScraper):
                     commission_rate=commission_rate,
                 )
 
-            if live_price <= 0 or abs(live_price - old_total) < 0.01:
+            if abs(live_price - old_total) < 0.01:
                 # No live price change at all -- nothing to gain from the
                 # invasive re-select flow below (which mutates a live
                 # in-progress edit, even though it's ultimately
