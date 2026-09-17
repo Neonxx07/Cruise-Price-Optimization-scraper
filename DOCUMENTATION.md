@@ -42,7 +42,8 @@ CruiseIntel Optimization is an internal repricing-intelligence system built for 
 9. [Setup & Operation](#setup--operation)
 10. [MSC Cruises Reference](#msc-cruises-reference)
 11. [Norwegian Cruise Line (NCL) Reference](#norwegian-cruise-line-ncl-reference)
-12. [Roadmap](#roadmap)
+12. [Sensitive-Data Controls](#sensitive-data-controls)
+13. [Roadmap](#roadmap)
 
 ---
 
@@ -1631,6 +1632,71 @@ The real Addons table is three columns — **Guest Name | Addon Name | Quantity*
 ### Operational tooling
 
 `run_ncl_live_check.py` (root of `platform/`) — the guided single/multi-booking live checker. Always non-headless with no override; accepts space- and/or comma-separated booking IDs; paces 4s between bookings; captures a full Playwright trace plus the standard raw capture; prints every dialog seen and a final summary table in the same column shape as the project owner's own report for direct row-for-row comparison. **`--dry-run` mode** logs in, searches, reads `__preloaded_data`, and parses the addon table, then stops **before** entering edit mode — so it validates everything most likely to be wrong at zero risk of locking a booking. Note that `--dry-run` **cannot** produce the "Current Price" column: reading the live category price requires the Category tab, which is only reachable after entering edit mode, so producing the price comparison inherently requires taking the lock.
+
+---
+
+## Sensitive-Data Controls
+
+This repository is public; the environment around it is not. The controls below are
+mechanical because the manual versions of them demonstrably failed — see
+[`SECURITY.md`](SECURITY.md) for the policy and the full incident record.
+
+### Placeholder conventions
+
+Real references are replaced with placeholders that are obviously not real, and kept stable
+across commits so diffs stay readable:
+
+| Portal family | Real shape | Placeholder |
+|---|---|---|
+| ESPRESSO / NCL / MSC | 5–9 digit number | `3000001`–`3000999` |
+| GoCCL / Princess (POLAR) | 6-char PNR-style code | `DEMO01`–`DEMO99` |
+| README CLI examples | — | `1234567`, `7654321` |
+
+The alphanumeric row is the one that caused trouble: GoCCL and Princess booking references
+are not numeric — they are 6-character PNR-style codes — so every scan built around a 5–9 digit pattern reported
+clean while real references sat in published code. **Any new cruise line must have its
+reference *shape* checked before its first commit**, not just its data.
+
+### `.gitignore` — allowlist under `platform/`
+
+`/platform/*.txt`, `/platform/*.txt.*` and `/platform/*.bak*` are ignored, with
+`requirements.txt` / `requirements-dev.txt` re-admitted via `!` rules. Blocklisting by
+filename lost the race repeatedly: `watchlist.txt` was named, then `Watchlistncl_us.txt`
+appeared; `*.db` was named, then `cruise_intel.db.backup_<timestamp>` appeared. Trailing
+wildcards matter — `watchlist.txt.bak_2026-08-17` ends in neither `.txt` nor `.bak`.
+
+### `.githooks/pre-commit`
+
+Runs against the **staged index** (`git grep --cached`), so it sees exactly what would be
+committed. Six checks:
+
+1. **Filenames** — `.env`, `*.db*`, `*.jsonl`, `storage_state*`, key material, watchlists,
+   session transcripts. `.gitignore` already covers these; the hook catches `git add -f`.
+2. **Local denylist** — exact strings from `.git/sensitive-terms.txt`, which lives inside
+   `.git/` and is therefore never committed. Real names and the agent login go there; the
+   hook itself is public and holds only patterns.
+3. **Booking references** — numeric and PNR-style, anchored to the word "booking" to limit
+   false positives, with the placeholder ranges allowlisted.
+4. **Personal paths** — Windows `Users` paths, `/Users/<name>/`, `/home/<name>/`. Also a
+   correctness check: such a path makes a test silently skip on every other machine.
+5. **Credentials** — private keys, AWS/GitHub/Slack/OpenAI/Google token shapes, and
+   assigned literals (`password = "..."`, matched case-insensitively).
+6. **Result** — reports file and line for each hit; `git commit --no-verify` bypasses.
+
+Installed per clone via `./.githooks/install.sh`, which sets `core.hooksPath` and seeds the
+local denylist. Git never installs hooks on clone, so this is required after every fresh
+clone — including the ones forced by a history rewrite.
+
+Verified both directions: it blocks a corpus reproducing all six real incident categories,
+and produces zero false positives with the entire clean repository staged.
+
+### `.gitattributes`
+
+`* text=auto eol=lf`, with `eol=crlf` retained for `.bat`/`.cmd`/`.ps1` (cmd.exe can
+mis-parse LF-only batch files). This is a review control as much as a hygiene one: before
+it, a Windows round-trip rewrote whole files as CRLF and git reported them as fully
+rewritten — `msc_commands.py` showed 6,226 changed lines when 82 were real. Sensitive-data
+mistakes hide inside diff noise like that.
 
 ---
 

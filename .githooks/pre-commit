@@ -1,0 +1,122 @@
+#!/usr/bin/env bash
+#
+# Blocks real customer/operator data from entering this PUBLIC repository.
+#
+# WHY THIS EXISTS
+# ---------------
+# Between 2026-08-15 and 2026-09-17 the same class of mistake recurred five
+# times: real booking numbers, the operator's real name, and absolute local
+# paths were committed, twice reaching the public remote and needing a
+# history rewrite. Every one was caught by a human reading a diff, and the
+# misses are the interesting part -- an incomplete scan left five real IDs
+# public for twelve days, and alphanumeric booking references (GoCCL and
+# Princess use PNR-style codes, not digits) went unnoticed entirely because
+# every scan looked only for 5-9 digit numbers.
+#
+# A machine check has neither of those blind spots. This is that check.
+#
+# IMPORTANT: this file is PUBLIC. It must never contain a real booking
+# reference, name, or path -- it matches on SHAPE. For exact private values,
+# keep a local denylist, one term per line, at:
+#
+#     .git/sensitive-terms.txt      (inside .git/, so never committed)
+#
+# INSTALL   ./.githooks/install.sh
+# BYPASS    git commit --no-verify        (deliberate/intentional examples)
+#
+set -uo pipefail
+
+RED=$'\033[31m'; YEL=$'\033[33m'; GRN=$'\033[32m'; OFF=$'\033[0m'
+fail=0
+note() { printf '%s\n' "$*" >&2; }
+problem() {
+  fail=1
+  note "${RED}BLOCKED${OFF}  $1"
+  shift
+  for l in "$@"; do note "         $l"; done
+  note ""
+}
+
+staged=$(git diff --cached --name-only --diff-filter=ACMR)
+[ -z "$staged" ] && exit 0
+
+# `git grep -I` skips binary blobs on its own, so pass paths through as-is.
+mapfile -t FILES <<< "$staged" 2>/dev/null || { FILES=(); while IFS= read -r l; do FILES+=("$l"); done <<< "$staged"; }
+
+scan() {  # case-sensitive
+  git grep -I --cached -nE "$1" -- "${FILES[@]}" 2>/dev/null
+}
+iscan() { # case-insensitive -- PASSWORD= and password= are the same mistake
+  git grep -I --cached -niE "$1" -- "${FILES[@]}" 2>/dev/null
+}
+
+# ------------------------------------------------------------- 1. filenames
+# .gitignore covers these, but `git add -f` bypasses it, and a stray file no
+# rule happens to name would otherwise sail straight through.
+while IFS= read -r f; do
+  case "$f" in
+    .env|*.env|*.env.*)                      problem "$f" "environment file -- may hold credentials";;
+    *.db|*.sqlite|*.sqlite3|*.db-wal|*.db-shm|*.db.backup*|*.db.bak*)
+                                             problem "$f" "database file -- holds real booking rows";;
+    *.jsonl)                                 problem "$f" "capture/scrape output -- holds real booking data";;
+    *storage_state*|*cookies*.json)          problem "$f" "browser session state -- live login cookies";;
+    *.pem|*.key|*.p12|*.pfx|id_rsa*)         problem "$f" "private key material";;
+    *[Ww]atchlist*)                          problem "$f" "booking-ID input list";;
+    *SESSION_CHANGES*|*New\ Text\ Document*) problem "$f" "raw session transcript -- real IDs and names";;
+  esac
+done <<< "$staged"
+
+# --------------------------------------------------------- 2. local denylist
+DENY="$(git rev-parse --git-dir)/sensitive-terms.txt"
+if [ -s "$DENY" ]; then
+  while IFS= read -r term; do
+    [ -z "$term" ] && continue
+    case "$term" in \#*) continue;; esac
+    hits=$(git grep -I --cached -n -i -F "$term" -- "${FILES[@]}" 2>/dev/null | head -5)
+    [ -n "$hits" ] && problem "local denylist term: \"$term\"" "$hits"
+  done < "$DENY"
+fi
+
+# ---------------------------------------------------- 3. booking references
+# Allowed placeholders: 3000xxx, DEMOnn, and the README's demo pair.
+numeric=$(scan '[Bb]ooking[s]?[[:space:]_-]*(id|ref|number|#)?[[:space:]:=#-]*[0-9]{5,9}' \
+  | grep -vE '3000[0-9]{3}|1234567|7654321' | head -8)
+[ -n "$numeric" ] && problem "real-looking numeric booking reference" "$numeric" \
+  "Use a placeholder in the 3000xxx range instead."
+
+# PNR-shaped (GoCCL/Princess). Excludes DEMOnn and all-caps English words that
+# legitimately follow the word "booking".
+pnr=$(scan '[Bb]ooking[s]?[[:space:]:=#-]+[A-Z0-9]{6}([^A-Z0-9]|$)' \
+  | grep -vE 'DEMO[0-9]{2}' \
+  | grep -vE '(FAILED|RUNNING|STATUS|ERRORS|CANCEL|ACTIVE|CLOSED|EXISTS|REASON|DETAIL|COMMIT|RESULT|SEARCH|UPDATE|NUMBER|RECORD|SINGLE|SECOND|CHANGE|SHOULD|SYSTEM|OBJECT|VALUES|ROWS|NOTHING)' \
+  | head -8)
+[ -n "$pnr" ] && problem "real-looking alphanumeric booking reference (PNR-style)" "$pnr" \
+  "GoCCL/Princess use these. Use DEMOnn instead."
+
+# -------------------------------------------------------- 4. personal paths
+paths=$(scan '[A-Za-z]:\\+Users\\+[A-Za-z0-9._-]+|/Users/[a-z][a-z0-9._-]+/|/home/[a-z][a-z0-9._-]+/' | head -5)
+[ -n "$paths" ] && problem "absolute personal path (leaks a username, breaks on other machines)" "$paths" \
+  "Derive it from __file__ or the script location instead."
+
+# --------------------------------------------------------------- 5. secrets
+secrets=$(scan '[-]{5}BEGIN [A-Z ]*PRIVATE KEY|AKIA[0-9A-Z]{16}|ASIA[0-9A-Z]{16}|ghp_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{30,}|xox[baprs]-[A-Za-z0-9-]{12,}|sk-[A-Za-z0-9]{32,}|AIza[A-Za-z0-9_-]{33}' | head -5)
+[ -n "$secrets" ] && problem "credential or API key" "$secrets" \
+  "Store it in the OS keychain (see platform/save_login.py), never in the repo."
+
+assigned=$(iscan '(password|passwd|api_?key|secret|auth_token)[[:space:]]*[:=][[:space:]]*["'"'"'][^"'"'"']{6,}' \
+  | grep -viE 'getpass|input\(|placeholder|os\.environ|keyring|settings\.|help=|description|selector|label|example' | head -5)
+[ -n "$assigned" ] && problem "hardcoded credential literal" "$assigned" \
+  "Store it in the OS keychain instead."
+
+# ---------------------------------------------------------------- 6. result
+if [ "$fail" -ne 0 ]; then
+  note "${YEL}This repository is PUBLIC.${OFF} Real customer booking references, operator"
+  note "names, local paths and credentials must not be committed."
+  note ""
+  note "Fix the lines above, or if a match is genuinely a false positive:"
+  note "    git commit --no-verify"
+  exit 1
+fi
+
+note "${GRN}pre-commit: no sensitive data detected${OFF}"
+exit 0

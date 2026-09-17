@@ -2,6 +2,18 @@
 
 Thank you for considering contributing! This project is open source and we welcome pull requests from everyone.
 
+> ### ⚠️ First: install the git hooks
+>
+> ```bash
+> ./.githooks/install.sh
+> ```
+>
+> This tool runs against live agent portals, so real customer booking references, operator
+> names and session cookies exist in the working environment — and must never reach this
+> public repo. The hook blocks them at commit time. Git does not install hooks on clone, so
+> **this is needed once per clone**. Read [`SECURITY.md`](SECURITY.md) before your first
+> commit; use placeholder booking references (`3000xxx`, `DEMOnn`), never real ones.
+
 ## Project Structure
 
 This is a **monorepo** containing two projects:
