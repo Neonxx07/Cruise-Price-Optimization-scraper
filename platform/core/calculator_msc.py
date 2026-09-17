@@ -85,6 +85,7 @@ from __future__ import annotations
 import re
 
 from .calculator import round2, safe_float
+from .price_scope import PriceScope, scopes_comparable
 from .models import (
     MSC_PAID_IN_FULL_DUE_THRESHOLD,
     MscBookingResult,
@@ -182,13 +183,41 @@ def _due_amount_context_note(estimated_value: float, due_amount: float | None) -
 def _check_price_match(
     current_base_price: float | None,
     today_base_price: float | None,
+    *,
     current_total_price: float | None = None,
     due_amount: float | None = None,
     today_price_tab_confirmed: bool = False,
     is_group_rate: bool = False,
     is_paid_in_full: bool = False,
     final_payment_date_passed: bool = False,
+    occupancy_verified: bool = True,
+    occupancy_note: str = "",
+    customer_has_club_membership: bool = False,
+    today_price_includes_club_discount: bool = False,
+    club_entry_note: str = "",
+    # Excursions/transfers/flights inside the booking total. A category
+    # quote never includes these, so they are backed out before comparing.
+    non_cruise_charges: float = 0.0,
+    # What each side of the comparison actually covers. The backstop for
+    # the whole class of bug the four specific guards each fix one case of.
+    current_scope: PriceScope | None = None,
+    today_scope: PriceScope | None = None,
 ) -> MscCheck:
+    """KEYWORD-ONLY past the two prices, deliberately.
+
+    On 2026-09-01 `occupancy_verified` / `occupancy_note` were inserted in
+    the middle of this signature while the only production call site passed
+    everything POSITIONALLY. That silently re-bound `is_group_rate` to
+    `occupancy_verified` and `is_paid_in_full` to `occupancy_note` - so the
+    paid-in-full rule and the final-payment gate, two HARD business rules,
+    stopped being applied at all. Nothing raised; one pre-existing test
+    caught it by luck.
+
+    Eight boolean-ish parameters in a fixed order is a blind spot waiting to
+    happen. `*` makes the same mistake a TypeError instead of a wrong
+    answer, and lets parameters be added in future without re-checking every
+    caller.
+    """
     # HARD RULE, confirmed directly by Neon 2026-08-12: a paid-in-full
     # booking can still have a discount ADDED (see DISCOUNT_ADD/
     # DISCOUNT_TIER_UPGRADE/VOYAGERS_SELECTION — none of those are
@@ -260,6 +289,28 @@ def _check_price_match(
             ),
         )
 
+    # OCCUPANCY GUARD, added 2026-09-01. Every price below compares a
+    # today-quote against the booking's own total, which is only valid if
+    # both cover the SAME guests. Booking 3000081 was priced as 1 adult
+    # while the invoice said 2, turning a genuine "no opportunity" (2-adult
+    # quote $3,610.66 ABOVE the current $3,517.34) into a fake $267.01
+    # opportunity - the real answer was $81.98. Booking 3000024 did the
+    # same thing with 3 dropped kids and a fake $1,929.61.
+    #
+    # Checked BEFORE any arithmetic: a per-guest price compared against a
+    # whole-booking total is meaningless, so there is no number worth
+    # computing here. Refusing is the only safe answer.
+    if not occupancy_verified:
+        return MscCheck(
+            type=MscOpportunityType.PRICE_MATCH,
+            status=MscCheckStatus.INSUFFICIENT_DATA,
+            note=(
+                "cannot price this booking: the guest count used for today's "
+                "quote is not verified against the invoice"
+                + (f" - {occupancy_note}" if occupancy_note else "")
+            ),
+        )
+
     if current_base_price is not None:
         diff = round2(current_base_price - today_base_price)
         if diff > 0.01:
@@ -279,6 +330,77 @@ def _check_price_match(
             status=MscCheckStatus.NO_OPPORTUNITY,
             note=f"today's base rate (${today_base_price:.2f}) is not lower than the current rate (${current_base_price:.2f})",
         )
+
+    # THE COMPARISON MUST BE LIKE FOR LIKE, added 2026-09-01.
+    #
+    # `current_total_price` is the customer's real total, with whatever
+    # discount they hold already baked in. If today's quote was captured
+    # WITHOUT that same discount, the two are not comparable and the
+    # comparison is biased against ever finding a saving. That is not a
+    # theoretical concern: it is why MSC scans returned no opportunities at
+    # all. Booking 3000081, against Neon's own screenshot of the listing:
+    #     without the membership entered  $3,610.66 > $3,517.34 -> "no"
+    #     with it entered (MSC's own card) $3,435.36 < $3,517.34 -> $81.98
+    #
+    # Staging now enters the customer's Voyagers membership on the dummy
+    # booking so the harvested price already carries the 5% club discount.
+    # When that fails - the crown control is missing, MSC rejects the
+    # details, the page does not echo the number back - the resulting price
+    # is a LIST price, and reporting NO_OPPORTUNITY from it would silently
+    # reinstate the original bug on that booking. So it refuses instead.
+    if customer_has_club_membership and not today_price_includes_club_discount:
+        return MscCheck(
+            type=MscOpportunityType.PRICE_MATCH,
+            status=MscCheckStatus.INSUFFICIENT_DATA,
+            note=(
+                "this customer holds a Voyagers Club membership but today's quote "
+                "was captured without it, so it cannot be compared against their "
+                "current total, which already includes their discount"
+                + (f" — {club_entry_note}" if club_entry_note else "")
+            ),
+        )
+
+    # LIKE-FOR-LIKE BACKSTOP, added 2026-09-02. Every guard below fixes ONE
+    # instance of a single recurring mistake: comparing two prices that do
+    # not cover the same thing. This catches an instance nobody has written
+    # a guard for yet, and names the dimension that differs rather than
+    # leaving a wrong dollar figure to be diagnosed later.
+    comparable, why = scopes_comparable(current_scope, today_scope)
+    if not comparable:
+        return MscCheck(
+            type=MscOpportunityType.PRICE_MATCH,
+            status=MscCheckStatus.INSUFFICIENT_DATA,
+            note=f"cannot compare these prices: {why}",
+        )
+
+    # NON-CRUISE ADDED SERVICES, added 2026-09-02. The booking total can
+    # include excursions (ACT), transfers (TRF) and flights (AIR) - lines a
+    # category quote can never contain. Comparing the two overstates the
+    # saving by exactly those amounts, the same like-for-like flaw as the
+    # club discount, the occupancy and the multi-cabin bugs.
+    #
+    # Found by the invoice reconciliation check (msc_invoice_components):
+    # 4 of 100 invoices did not add up, and every gap was one of these
+    # lines - a $112.00 Pisa excursion, a $48.00 backstage tour x2, airport
+    # transfers. Booking 3000013, cited in msc_project_knowledge.md as a
+    # real $1,292.51 price-match opportunity, carries $96.00 of excursions,
+    # so that figure was overstated by $96.00.
+    #
+    # Subtracted rather than refused: the amount is known exactly, so the
+    # comparison can be corrected instead of abandoned. Refusing would
+    # throw away four real bookings for no reason.
+    if current_total_price is not None and non_cruise_charges:
+        current_total_price = round2(current_total_price - non_cruise_charges)
+
+    # A ZERO TOTAL IS NOT A TOTAL. Found in the 2026-09-01 full audit:
+    # bookings 3000076 and 3000012 both parse a "Value of the cruise" of
+    # exactly $0.00. No real cruise costs nothing, so this means the figure
+    # was not on the page (or the booking is a placeholder shell) - and
+    # every comparison below would then measure today's price against zero,
+    # which can only ever produce nonsense in one direction or the other.
+    # Treated as "not captured", which is what it actually is.
+    if current_total_price is not None and current_total_price <= 0:
+        current_total_price = None
 
     if current_total_price is not None:
         # Conservative fallback when the true pre-discount base isn't
@@ -748,6 +870,22 @@ def evaluate_msc_booking(
     is_group_rate: bool = False,
     club_discount_offered: bool | None = None,
     final_payment_date_passed: bool = False,
+    # Forwarded to the PRICE_MATCH occupancy guard. Defaults keep every
+    # existing caller working unchanged; the MSC scraper passes the real
+    # values from msc_occupancy_is_trustworthy().
+    occupancy_verified: bool = True,
+    occupancy_note: str = "",
+    is_overpayment: bool = False,
+    # Whether today's captured quote already carries the customer's own
+    # Voyagers Club discount. Without this the price comparison is a list
+    # price against a discounted total — the bug that hid every MSC
+    # opportunity. See _check_price_match.
+    customer_has_club_membership: bool = False,
+    today_price_includes_club_discount: bool = False,
+    club_entry_note: str = "",
+    non_cruise_charges: float = 0.0,
+    current_scope: PriceScope | None = None,
+    today_scope: PriceScope | None = None,
 ) -> MscBookingResult:
     """Run all three opportunity checks for one booking.
 
@@ -870,6 +1008,34 @@ def evaluate_msc_booking(
             (the two are related but distinct: a booking can be past its
             final payment date without having actually paid yet).
     """
+    # HARD RULE, stated directly by Neon 2026-09-01: "3000071 this booking
+    # has an overpayment it is not optimizable."
+    #
+    # An overpaid booking is off the table entirely - not merely paid in full.
+    # Overpayment was already detected (msc_commands._extract_booking_essentials
+    # sets is_overpayment from an "Overpayment" label or a negative Due Amount)
+    # but it only ever fed `is_paid_in_full`, which softens PRICE_MATCH while
+    # leaving all three discount checks free to report an opportunity.
+    #
+    # This is checked BEFORE anything else because it is a property of the
+    # booking, not of any one lever - the same shape of gate as a cancelled
+    # sailing, and the same shape as NCL's final-payment-date rule.
+    #
+    # It also retires a misleading data point: 3000071's $63.24 was being
+    # treated as ground truth for the discount arithmetic, and two bookings
+    # appearing to agree at ~3.07% of CAB gross drove that investigation. With
+    # this booking excluded, that agreement is coincidence, not evidence.
+    if is_overpayment:
+        return MscBookingResult(
+            booking_id=booking_id,
+            category=category,
+            cancelled_or_postponed=False,
+            is_paid_in_full=True,
+            checks=[],
+            has_any_opportunity=False,
+            note="booking is OVERPAID — not optimizable (hard rule)",
+        )
+
     if cancelled_or_postponed:
         return MscBookingResult(
             booking_id=booking_id,
@@ -910,8 +1076,22 @@ def evaluate_msc_booking(
 
     checks = [
         _check_price_match(
-            current_base_price, today_base_price, current_total_price, due_amount,
-            today_price_tab_confirmed, is_group_rate, is_paid_in_full, final_payment_date_passed,
+            current_base_price,
+            today_base_price,
+            current_total_price=current_total_price,
+            due_amount=due_amount,
+            today_price_tab_confirmed=today_price_tab_confirmed,
+            is_group_rate=is_group_rate,
+            is_paid_in_full=is_paid_in_full,
+            final_payment_date_passed=final_payment_date_passed,
+            occupancy_verified=occupancy_verified,
+            customer_has_club_membership=customer_has_club_membership,
+            today_price_includes_club_discount=today_price_includes_club_discount,
+            club_entry_note=club_entry_note,
+            non_cruise_charges=non_cruise_charges,
+            current_scope=current_scope,
+            today_scope=today_scope,
+            occupancy_note=occupancy_note,
         ),
         _check_discount_add(
             current_discounts, allowed_discount_options, is_group_rate, club_discount_offered,
@@ -931,3 +1111,123 @@ def evaluate_msc_booking(
         has_any_opportunity=has_any_opportunity,
         note="opportunity found" if has_any_opportunity else "no opportunity found on the data available",
     )
+
+
+# ---------------------------------------------------------------------------
+# How MSC's discount percentages actually arithmetise
+# ---------------------------------------------------------------------------
+# DERIVED 2026-09-01 from the 100 stored MSC invoices, at Neon's request
+# ("do a deep research online and from the data we captured to figure out
+# averages"). Until now every discount check could name a better discount but
+# never say what it was WORTH, because nothing knew what the percentage
+# multiplied.
+#
+# Two independent findings from the corpus, both exact rather than approximate:
+#
+# 1. STACKED DISCOUNTS COMPOUND, THEY DO NOT ADD.
+#    MSC brochure fares are whole dollars, so the correct model is the one
+#    that recovers a whole-dollar list fare. Across the 13 invoices carrying
+#    two disclosed discounts, gross/((1-p1)(1-p2)) lands on a whole dollar
+#    per guest 10 times; gross/(1-p1-p2) does so once. Examples:
+#      3000008  15% + 5%  3,396.34 -> compounded 2,103.00/guest (additive 2,122.71)
+#      3000078  10% + 5%  2,052.00 -> compounded 1,200.00/guest (additive 1,207.06)
+#      3000079  10% + 5%  1,822.86 -> compounded 1,066.00/guest (additive 1,072.27)
+#
+# 2. THE BASE IS CAB + SRN. TAXES AND PORT CHARGES (PCH) ARE EXCLUDED.
+#    SRN looked like a fixed per-guest tariff with six different values. It is
+#    not - it is ONE tariff seen through the same compounded factor as the
+#    cabin fare. On the $182.00/guest sailing family:
+#      182.00 x 1.0000 = 182.00  (no discount)      x10 bookings
+#      182.00 x 0.9500 = 172.90  (5%)               x10
+#      182.00 x 0.9025 = 164.25  (9.75%)            x8
+#      182.00 x 0.8550 = 155.61  (10% + 5%)         x6
+#      182.00 x 0.8075 = 146.96  (15% + 5%)         x6
+#    Five clusters, five exact hits. Booking 3000081's 277.97/guest is the
+#    same relationship on a $308.00 tariff (308.00 x 0.9025 = 277.97).
+#    Excluding PCH matches MSC's published promotional terms, which state
+#    that government fees, taxes and port expenses are additional per guest.
+#
+# NOT YET USED TO PRODUCE A REPORTED SAVING - see msc_discount_delta.
+
+
+def msc_discount_factor(pcts) -> float:
+    """The multiplier MSC's discounts apply to a fare component.
+
+    Compounding, not addition - see the block comment above. A 15% and a 5%
+    discount together leave 0.85 x 0.95 = 0.8075 of the fare, not 0.80.
+    """
+    factor = 1.0
+    for pct in pcts or ():
+        if pct is None:
+            continue
+        factor *= 1.0 - (float(pct) / 100.0)
+    return factor
+
+
+def msc_list_fare(component_gross: float | None, pcts) -> float | None:
+    """Recover a fare component's pre-discount (brochure) value.
+
+    Discounts are baked into the figures MSC prints - the invoice's own
+    discount column is $0.00 on all 217 captured CAB lines - so the list
+    fare has to be divided back out. Returns None rather than a guess when
+    the inputs cannot support the calculation.
+    """
+    if not component_gross or component_gross <= 0:
+        return None
+    factor = msc_discount_factor(pcts)
+    if factor <= 0:
+        return None
+    return round(component_gross / factor, 2)
+
+
+def msc_discount_delta(
+    cab_gross: float | None,
+    srn_gross: float | None,
+    current_pcts,
+    new_pcts,
+) -> float | None:
+    """What moving from one discount set to another is worth, in dollars.
+
+    Both sets are absolute, not deltas: to add a cumulable 5% on top of an
+    existing 9.75%, pass current=[9.75] and new=[9.75, 5.0].
+
+    A CAUTION THAT MUST TRAVEL WITH THIS FUNCTION. The mechanism above is
+    confirmed exactly against 100 invoices, but the resulting dollar figures
+    do NOT yet reproduce Neon's three verified answers, and they miss high.
+    Adding a cumulable 5%, against both candidate bases:
+
+        booking     real     CAB+SRN base      CAB-only base
+        3000081   $81.98   $161.37 (0.508)   $133.57 (0.6138)
+        3000071   $63.24   $111.26 (0.568)   $102.61 (0.6163)
+        3000083   $23.66    $85.03 (0.278)    $67.73 (0.3493)
+
+    RETRACTED 2026-09-01, same day: 3000071's row above is not evidence.
+    Neon: "3000071 this booking has an overpayment it is not optimizable."
+    Its $63.24 was never a discount saving, so the apparent agreement
+    between it and 3000081 at 3.069% / 3.081% of CAB gross - which is what
+    made this look like a solvable arithmetic problem - was coincidence
+    between two unrelated numbers. Worth remembering how convincing two
+    figures agreeing to 0.012 points looked.
+
+    That leaves TWO usable ground-truth answers, and they do not agree with
+    each other on any base: $81.98 is 2.540% of 3000081's CAB+SRN while
+    $23.66 is 1.391% of 3000083's. Neon also confirmed he only ever
+    applies senior, Voyagers Club, Voyagers Exclusive or Voyagers Selection
+    (5/10/15%) - and an exhaustive search over exactly those levers, on
+    CAB+SRN / CAB-only / SRN-only, as both an addition and a swap, whole-
+    booking and per-guest, produces nothing within $1.30 of either answer.
+
+    Until that is settled, this function must not feed `estimated_value` on a
+    check: a figure 63% too high on two independently verified bookings is
+    precisely the fabricated-opportunity failure this module already guards
+    against (bookings 3000081 $267.01, 3000024 $1,929.61).
+    """
+    if not cab_gross or cab_gross <= 0:
+        return None
+    base = cab_gross + (srn_gross or 0.0)
+    cur = msc_discount_factor(current_pcts)
+    new = msc_discount_factor(new_pcts)
+    if cur <= 0 or new <= 0:
+        return None
+    list_base = base / cur
+    return round(list_base * (cur - new), 2)

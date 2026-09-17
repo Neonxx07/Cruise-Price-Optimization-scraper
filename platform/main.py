@@ -101,9 +101,6 @@ async def _run_login_check(args):
     """
     from config.settings import settings
     from core.models import CruiseLine
-    from scraper.espresso import EspressoScraper
-    from scraper.goccl import GoCCLScraper
-    from scraper.ncl import NclScraper
     from utils.logging import setup_logging
 
     setup_logging(settings.log_level)

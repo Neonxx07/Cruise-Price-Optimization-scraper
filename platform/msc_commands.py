@@ -515,10 +515,10 @@ async def _check_today_rate(page, booking_id: str) -> dict:
             await page.wait_for_timeout(500)
         return await page.inner_text("body")
 
-    resp = await page.goto(url, wait_until="domcontentloaded")
+    await page.goto(url, wait_until="domcontentloaded")
     booking_text = await _wait_for("Booking Value", "No bookings found")
     if "welcome" in page.url or "login" in page.url.lower():
-        resp = await page.goto(url, wait_until="domcontentloaded")
+        await page.goto(url, wait_until="domcontentloaded")
         booking_text = await _wait_for("Booking Value", "No bookings found")
 
     if "No bookings found" in booking_text:
@@ -580,6 +580,15 @@ async def _check_today_rate(page, booking_id: str) -> dict:
         # False here means the listing page never actually loaded in time —
         # listing_text is stale (the previous page), don't trust it.
         "listing_confirmed": listing_confirmed,
+        # The occupancy cross-check result (see msc_occupancy_is_trustworthy).
+        # Recorded so the run itself shows whether today's quote covered the
+        # same guests as the booking - the exact thing that was invisible
+        # when booking 3000081 was priced as 1 guest instead of 2.
+        # The invoice's OWN passenger count, read from the booking page this
+        # function already opened. `staged` does not exist in this scope -
+        # referencing it here was a NameError on every console check-rates
+        # run (my bug, 2026-09-01).
+        "invoice_guest_count": msc_invoice_guest_count(booking_text, None),
         "discount_options": discount_options,
     }
 
@@ -880,9 +889,15 @@ def _compute_required_occupancy(passengers: list) -> dict:
     before that was fixed."""
     counts = {"adult": 0, "child": 0, "jrchild": 0, "infant": 0}
     ages = {"child": [], "jrchild": [], "infant": []}
+    # A passenger with no readable age used to be `continue`d SILENTLY, so a
+    # 2-guest booking could be priced as 1 guest with nothing recorded. Now
+    # counted and returned - see the `dropped` key and
+    # msc_occupancy_is_trustworthy().
+    dropped = 0
     for p in passengers:
         age = p.get("age")
         if age is None:
+            dropped += 1
             continue
         if age >= 18:
             counts["adult"] += 1
@@ -898,7 +913,169 @@ def _compute_required_occupancy(passengers: list) -> dict:
     ages["child"].sort()
     ages["jrchild"].sort()
     ages["infant"].sort()
-    return {"counts": counts, "ages": ages}
+    return {
+        "counts": counts,
+        "ages": ages,
+        # How many passengers had no readable age (silently skipped before).
+        "dropped": dropped,
+        # Total guests this occupancy actually represents, for the
+        # cross-check against the invoice's own passenger count.
+        "total_guests": sum(counts.values()),
+        "passengers_seen": len(passengers),
+    }
+
+
+_PASSENGER_COUNT_RE = re.compile(r"Passengers\s*:?\s*\n\s*(\d+)", re.I)
+
+
+def msc_invoice_guest_count(summary_text: str | None,
+                            breakdown_text: str | None) -> int | None:
+    """The guest count as the INVOICE ITSELF states it, independent of
+    passenger-row extraction.
+
+    Two independent readings, both confirmed present on real captured
+    pages for booking 3000081:
+      * summary_text  -> "Passengers :\n2"
+      * breakdown_text -> one "Total Adult N" line per guest
+
+    Returns None when neither can be read - the caller must then treat the
+    occupancy as unverified rather than assume agreement.
+    """
+    from_summary = None
+    if summary_text:
+        m = _PASSENGER_COUNT_RE.search(summary_text)
+        if m:
+            try:
+                from_summary = int(m.group(1))
+            except ValueError:
+                from_summary = None
+    from_breakdown = None
+    if breakdown_text:
+        n = breakdown_text.count("Total Adult")
+        if n > 0:
+            from_breakdown = n
+    # Prefer agreement; fall back to whichever exists.
+    if from_summary and from_breakdown:
+        return from_summary if from_summary == from_breakdown else max(
+            from_summary, from_breakdown)
+    return from_summary or from_breakdown
+
+
+def msc_occupancy_is_trustworthy(required: dict,
+                                 invoice_guests: int | None,
+                                 occupancy_fix: dict | None = None,
+                                 cabin_count: int | None = None) -> tuple[bool, str]:
+    """Whether an occupancy may be used to price a booking.
+
+    THE ANTI-BLIND-SPOT RULE, added 2026-09-01. Counting guests from a
+    single source (the passenger rows) has now produced a wrong price twice:
+    booking 3000024 (3 kids dropped -> fake $1,929.61) and booking
+    3000081 (1 of 2 adults dropped -> fake $267.01, real answer $81.98).
+    Both times the count was internally consistent and simply wrong.
+
+    So the count is cross-checked against a figure the invoice states in
+    its own words. If they disagree, or the invoice count cannot be read,
+    the price is NOT trustworthy and the caller must report
+    INSUFFICIENT_DATA instead of a number. Refusing to answer is the only
+    safe failure mode here: a fabricated opportunity gets acted on.
+    """
+    total = required.get("total_guests")
+    if total is None:
+        total = sum((required.get("counts") or {}).values())
+    # ZERO guests is never a valid basis for a price. It means passenger
+    # extraction returned nothing at all - which really happened on booking
+    # 3000081 at 2026-08-12T10:15:26 (extracted 0 while the invoice said 2).
+    if not total:
+        return False, (
+            "no guests were resolved for this booking, so there is nothing "
+            "to price against"
+        )
+    dropped = required.get("dropped") or 0
+    if dropped:
+        return False, (
+            f"{dropped} passenger(s) had no readable age and were skipped, so "
+            f"the occupancy ({total} guest(s)) may be short"
+        )
+    # MSC'S OWN PRE-FILL is the second source that actually exists, found
+    # 2026-09-01 while checking why invoice_guest_count came back None on all
+    # three of Neon's bookings. MSC arrives at the occupancy screen already
+    # populated FROM THE BOOKING, captured as occupancy_fix["before"]. Across
+    # every dated capture of booking 3000081 it read 2 - correct every time,
+    # including on the run that produced the fake price.
+    #
+    # That reframes the bug. On 2026-08-24 the pre-fill said 2 and our own
+    # passenger extraction said 1, so the code did not merely fail to read
+    # the count - it ACTIVELY REDUCED a correct 2-guest occupancy to 1 and
+    # priced that ($3,250.33 against a 2-guest total of $3,517.34 -> fake
+    # $267.01; the real answer was $81.98).
+    #
+    # So a downward correction is the dangerous direction and is refused
+    # outright. Upward is harmless: MSC pre-filling fewer guests than the
+    # booking has cannot manufacture a saving.
+    # MULTI-CABIN comes first, because on such a booking neither the pre-fill
+    # nor the booking total means what the price path assumes. Found
+    # 2026-09-01 on booking 3000071, one of the three Neon gave a real
+    # answer for: its invoice carries TWO cabin rows (Cabin 1 and Cabin 2)
+    # but only ONE "Total Adult" line. Every selector in the pricing flow
+    # targets cabin 1 only, while `current_value` is the whole-booking total
+    # across both cabins - so a today-quote for one cabin was being compared
+    # against a two-cabin total. That comparison cannot be right in either
+    # direction, whatever the guest count says.
+    #
+    # It also explains why the pre-fill read 2 on that booking: it tracks the
+    # two CABIN rows, not two guests. Checking cabins before guests keeps the
+    # pre-fill rule below applied only where it is meaningful.
+    if cabin_count and cabin_count > 1:
+        return False, (
+            f"this booking has {cabin_count} cabins: the pricing flow quotes "
+            f"cabin 1 only while the booking total covers all of them, so the "
+            f"two figures are not comparable"
+        )
+    prefill = None
+    if occupancy_fix:
+        before = occupancy_fix.get("before") or {}
+        prefill = sum(v for v in before.values() if isinstance(v, int)) or None
+    if prefill and total < prefill:
+        return False, (
+            f"occupancy was REDUCED below MSC's own pre-fill: MSC arrived with "
+            f"{prefill} guest(s) from the booking and passenger extraction "
+            f"produced only {total} - this exact downward correction is what "
+            f"priced booking 3000081 as 1 adult and reported a fake $267.01"
+        )
+    if invoice_guests is None and prefill is None:
+        return False, (
+            f"neither the invoice's passenger count nor MSC's own occupancy "
+            f"pre-fill could be read, so the computed occupancy ({total} "
+            f"guest(s)) cannot be cross-checked"
+        )
+    if invoice_guests is None:
+        # Cross-checked against the pre-fill instead, which agrees.
+        invoice_guests = total if total == prefill else prefill
+    if total != invoice_guests:
+        return False, (
+            f"occupancy MISMATCH: priced {total} guest(s) but the invoice says "
+            f"{invoice_guests} - a per-guest price compared against a "
+            f"whole-booking total is exactly how booking 3000081 reported a "
+            f"fake $267.01 opportunity"
+        )
+    # THE APPLIED STATE. On 2026-08-24 booking 3000081 passed every check
+    # above (2 extracted, 2 on the invoice) and the SCREEN still ended at 1
+    # adult. Intent agreeing with the invoice proves nothing about what was
+    # actually priced.
+    if occupancy_fix:
+        applied = occupancy_fix.get("applied_guests")
+        if applied is None:
+            applied = sum(v for v in (occupancy_fix.get("after") or {}).values()
+                          if isinstance(v, int))
+        if occupancy_fix.get("stalled"):
+            return False, "the occupancy fix stalled before reaching the required count"
+        if applied != invoice_guests:
+            return False, (
+                f"the occupancy screen ended at {applied} guest(s) but the "
+                f"invoice says {invoice_guests} - today's quote is for the "
+                f"wrong number of people (booking 3000081, 2026-08-24)"
+            )
+    return True, ""
 
 
 async def _read_occupancy(page) -> dict:
@@ -945,6 +1122,106 @@ async def _select_age(page, tier: str, cabin: int, index: int, age: int) -> bool
         return True
     except Exception:
         return False
+
+
+async def _apply_voyagers_club(page, passengers: list, cabin: int = 1) -> dict:
+    """Enter the real booking's Voyagers Club membership on the dummy
+    booking, so the harvested category prices carry the same 5% club
+    discount the customer already has.
+
+    WHY THIS EXISTS - the single most consequential MSC bug found so far.
+    Staging used to skip this on purpose, to keep today's price
+    "undiscounted". But nothing ever removed the discount from the OTHER
+    side of the comparison: `current_value` is the customer's real total,
+    with their discount already in it. So every booking was scored as
+    today's LIST price against the customer's DISCOUNTED price - which can
+    almost never show a saving. That is why MSC runs came back with no
+    opportunities at all.
+
+    Confirmed on booking 3000081 against Neon's own screenshot of the
+    IR2 card: $3,610.66 without the membership entered, $3,435.36 with it,
+    against a current total of $3,517.34. The first says "no opportunity";
+    the second is a real $81.98.
+
+    Read-only in the sense that matters: this is the dummy/practice booking
+    that MSC never records, and entering a membership number changes only
+    what price is DISPLAYED. It commits nothing.
+
+    Returns a dict that always records what happened, because a silent
+    failure here would put us straight back to comparing a list price
+    against a discounted one - the exact bug this fixes. `applied` False
+    with a `reason` is a first-class outcome, never an exception.
+    """
+    member = next((p for p in (passengers or []) if p.get("voyagers_number")), None)
+    if member is None:
+        return {"applied": False, "reason": "no passenger holds a Voyagers membership",
+                "member": None, "verified": False}
+
+    name_parts = (member.get("name") or "").split()
+    if len(name_parts) < 2 or not member.get("dob"):
+        return {"applied": False, "reason": "member name or date of birth unreadable",
+                "member": member.get("voyagers_number"), "verified": False}
+    first, last = name_parts[0], name_parts[-1]
+
+    try:
+        crown = page.locator(f'.club-btn[data-cabin="{cabin}"]')
+        if await crown.count() == 0:
+            return {"applied": False, "reason": "no Voyagers Club control on this screen",
+                    "member": member.get("voyagers_number"), "verified": False}
+        await crown.first.click()
+        await page.wait_for_timeout(1200)
+
+        # Set every field through JS rather than typing. A native date
+        # picker on #club-dob once intercepted a later click and silently
+        # rewrote the DOB to today's date, which failed validation with a
+        # generic "FOUND ERROR ON FIELD" - see msc_project_knowledge.md.
+        # Setting the value and dispatching the events the page listens for
+        # avoids opening the picker at all.
+        await page.evaluate(
+            """(v) => {
+                const set = (sel, val) => {
+                    const el = document.querySelector(sel);
+                    if (!el) return false;
+                    el.value = val;
+                    el.dispatchEvent(new Event('input', {bubbles: true}));
+                    el.dispatchEvent(new Event('change', {bubbles: true}));
+                    return true;
+                };
+                return ['#club-firstname', '#club-lastname', '#club-dob', '#club-card']
+                    .map((s, i) => set(s, [v.first, v.last, v.dob, v.card][i]))
+                    .every(Boolean);
+            }""",
+            {"first": first, "last": last, "dob": member["dob"],
+             "card": member["voyagers_number"]},
+        )
+        await page.evaluate(
+            "() => { const b = document.querySelector('.club-search-btn');"
+            " if (b) b.click(); }"
+        )
+        await page.wait_for_timeout(2500)
+
+        # Verify against the page's own words. The membership number
+        # echoed back is MSC confirming it accepted and matched the
+        # member - not us assuming the click worked.
+        body = await page.inner_text("body")
+        number = member["voyagers_number"]
+        verified = number in body and "voyagers club" in body.lower()
+        failed = "found error on field" in body.lower()
+        return {
+            "applied": bool(verified and not failed),
+            "reason": ("MSC rejected the membership details" if failed else
+                       "" if verified else
+                       "membership number was not echoed back by the page"),
+            "member": number,
+            "member_name": member.get("name"),
+            "tier": member.get("voyagers_tier"),
+            "verified": bool(verified),
+        }
+    except Exception as exc:  # noqa: BLE001 - never let this abort a scan
+        logger.warning("msc.voyagers_club_entry_failed",
+                       error=str(exc)[:200], member=member.get("voyagers_number"))
+        return {"applied": False, "reason": f"error entering membership: {exc}"[:200],
+                "member": member.get("voyagers_number"), "verified": False}
 
 
 async def _fix_occupancy(page, passengers: list) -> dict:
@@ -1002,6 +1279,19 @@ async def _fix_occupancy(page, passengers: list) -> dict:
             if not ok:
                 stalled = True
 
+    # VERIFY WHAT THE SCREEN ACTUALLY ENDED AT, not what we intended.
+    # CONFIRMED on booking 3000081, 2026-08-24: passenger extraction
+    # returned 2 guests AND the invoice said 2, so the computed requirement
+    # was right - yet the screen finished at adult=1 and today's quote came
+    # back $3,250.33 (a ONE-guest price) against a two-guest total of
+    # $3,517.34, reported as a fake $267.01 opportunity. Twelve days earlier
+    # the same booking reached adult=2 and correctly found nothing
+    # ($3,610.66, above the current total).
+    #
+    # Checking the INTENT can never catch that. Only the applied state can.
+    applied_guests = sum(v for v in (after or {}).values() if isinstance(v, int))
+    intended_guests = sum(counts_required.values())
+    occupancy_applied_ok = applied_guests == intended_guests and not stalled
     return {
         "before": before,
         "required": counts_required,
@@ -1009,6 +1299,14 @@ async def _fix_occupancy(page, passengers: list) -> dict:
         "adjusted": adjusted or bool(ages_filled),
         "ages_filled": ages_filled,
         "stalled": stalled,
+        # Carried through so the calculator can refuse to price rather than
+        # compare mismatched guest counts. See
+        # msc_occupancy_is_trustworthy.
+        "applied_guests": applied_guests,
+        "intended_guests": intended_guests,
+        "occupancy_applied_ok": occupancy_applied_ok,
+        "dropped_passengers": required.get("dropped", 0),
+        "passengers_seen": required.get("passengers_seen", len(passengers)),
     }
 
 
@@ -1237,6 +1535,64 @@ def _find_today_price(listing_text: str, category: str, is_guaranteed: bool = Fa
         return None
     m = re.search(r"\$\s*([\d,]+(?:\.\d{2})?)", listing_text[idx:idx + 200])
     return m.group(1) if m else None
+
+
+_MONEY_NEAR_RE = re.compile(r"\$\s*([\d,]+(?:\.\d{2})?)")
+
+
+def today_price_detail(listing_text: str, category: str,
+                       is_guaranteed: bool = False) -> dict:
+    """Everything the listing says near this category, not just one number.
+
+    ADDED 2026-09-01 for a data-collection run. `_find_today_price` returns
+    a single scalar - the FIRST dollar figure within 200 characters of the
+    category code - and that one number is then compared against the
+    booking's whole-invoice total. Three real bookings show that is not
+    enough to reproduce the true answer:
+
+        3000081  system $267.01   Neon $81.98 + $25 extra OBC
+        3000071  system (none)    Neon $63.24
+        3000083  system (none)    Neon $23.66
+
+    Two of those land at ~3.07% of the commissionable cruise fare
+    (81.98/2671.40 = 3.069%, 63.24/2052.28 = 3.081%) - agreeing to within
+    0.012 points across different bookings, which is a real signal but not
+    yet an explained mechanism. A single scalar cannot tell us whether the
+    listing price is per-guest or a total, whether it includes taxes/NCF, or
+    what OBC it carries - so it cannot be reconciled against the invoice.
+
+    Purely additive and READ-ONLY: it re-reads text already captured and
+    changes no decision. `_find_today_price` is deliberately left untouched
+    so no existing behaviour moves while evidence is still being gathered.
+    """
+    out = {
+        "matched_price": _find_today_price(listing_text, category, is_guaranteed),
+        "window": None,
+        "all_prices_near": [],
+        "obc_mentions": [],
+        "per_guest_hints": [],
+    }
+    if not listing_text or not category:
+        return out
+    idx = listing_text.find("(" + category + ")")
+    if idx == -1 and is_guaranteed:
+        idx = listing_text.upper().find(category.upper())
+    if idx == -1:
+        return out
+    start = max(0, idx - 400)
+    window = listing_text[start:idx + 900]
+    out["window"] = window
+    out["all_prices_near"] = [
+        m.group(1) for m in re.finditer(_MONEY_NEAR_RE, window)
+    ]
+    for line in window.split(chr(10)):
+        low = line.lower()
+        if any(k in low for k in ("obc", "onboard credit", "on board credit",
+                                  "shipboard credit")):
+            out["obc_mentions"].append(line.strip()[:120])
+        if any(k in low for k in ("per person", "per guest", " pp", "total")):
+            out["per_guest_hints"].append(line.strip()[:120])
+    return out
 
 
 def _parse_discount_rules(rules: str) -> dict:
@@ -1668,6 +2024,102 @@ def _parse_dollars_safe(value):
 #      Threshold lives in core/models.py (MSC_PAID_IN_FULL_DUE_THRESHOLD)
 #      so calculator_msc.py's _due_amount_context_note wording stays in
 #      sync with this check rather than drifting to its own number.
+def is_valid_msc_booking_id(candidate: str) -> bool:
+    """Whether a string is plausibly a real MSC booking number.
+
+    ADDED 2026-09-01 after the full audit found a record in
+    booking_data.jsonl stored under the booking_id "/*" — a shell glob that
+    reached a lookup command as if it were a booking number, and then had a
+    full invoice captured against it. It sat in the corpus as a phantom
+    booking, and any per-booking analysis silently counted it.
+
+    Real MSC booking numbers are purely numeric and 6-9 digits long across
+    every one of the 118 captured bookings. Validating at the point ids are
+    parsed is what stops this recurring; the existing bad record is left in
+    place (it is real captured data under a wrong key, not something to
+    delete quietly) and simply skipped.
+    """
+    return bool(candidate) and bool(re.fullmatch(r"\d{6,9}", candidate.strip()))
+
+
+# Invoice line codes, decoded from 100 captured MSC invoices 2026-09-02.
+# Column order on every line is:
+#     CODE  description  commission$  discount$  comm%  NET  GROSS
+# (verified: gross - net == commission, and commission/gross == comm%, on
+# bookings with several different commission rates including 17% and 18.84%)
+_CRUISE_CODES = frozenset({"CAB", "SRN", "PCH", "OBS"})
+# NON-CRUISE ADDED SERVICES. A category quote can never include these, so a
+# booking total containing them is not comparable to one - the same
+# like-for-like flaw as the club discount, the occupancy and the multi-cabin
+# bugs. Found by the reconciliation check below: 4 of 100 invoices failed to
+# add up, and every gap was one of these lines (a $112.00 Pisa excursion, a
+# $48.00 backstage tour x2, airport transfers, flights).
+_ADDED_SERVICE_CODES = frozenset({"ACT", "TRF", "AIR", "MSC"})
+
+_INVOICE_LINE_RE = re.compile(
+    r"^([A-Z]{2,4})	(.*?)	\$([\d,]+\.\d{2})	\$([\d,]+\.\d{2})	"
+    r"([\d.]+%|-)	\$([\d,]+\.\d{2})	\$([\d,]+\.\d{2})\s*$", re.M)
+_INVOICE_TOTAL_RE = re.compile(
+    r"^Total (?:Adult|Child|Infant)\s+\d+	\$([\d,]+\.\d{2})	"
+    r"\$([\d,]+\.\d{2})	(?:[\d.]+%|-)	\$([\d,]+\.\d{2})	"
+    r"\$([\d,]+\.\d{2})\s*$", re.M)
+
+
+def msc_invoice_components(breakdown_text: str | None) -> dict:
+    """Itemise an invoice and check that it ADDS UP.
+
+    ADDED 2026-09-02 at Neon's request to make the scan "as accurate as
+    human eyes". The cheapest possible correctness check: MSC prints both
+    the component lines and per-guest Total lines, so the components must
+    sum to the totals. A misparse, a truncated capture or an unknown line
+    code shows up immediately as a gap, instead of silently producing a
+    plausible wrong number - which is exactly what the truncated
+    `breakdown_text` incident did (an empty current_discounts on a booking
+    that really had a disclosed discount, producing a false DISCOUNT_ADD).
+
+    Measured on the corpus: 96 of 100 invoices reconcile to the cent. All
+    four failures were real findings, not noise - each gap was an unparsed
+    non-cruise service line.
+
+    `reconciles` False is a data-quality signal, never a verdict on the
+    booking. `non_cruise_total` above zero means the booking total includes
+    excursions/transfers/flights that no category quote can contain.
+    """
+    out = {
+        "by_code": {}, "cruise_total": 0.0, "non_cruise_total": 0.0,
+        "non_cruise_codes": [], "stated_total": None, "gap": None,
+        "reconciles": False, "unknown_codes": [], "lines": 0,
+    }
+    if not breakdown_text:
+        return out
+    by_code: dict[str, float] = {}
+    for code, _desc, _comm, _disc, _pct, _net, gross in _INVOICE_LINE_RE.findall(
+            breakdown_text):
+        by_code[code] = round(by_code.get(code, 0.0) + _parse_money(gross), 2)
+        out["lines"] += 1
+    out["by_code"] = by_code
+    out["cruise_total"] = round(
+        sum(v for k, v in by_code.items() if k in _CRUISE_CODES), 2)
+    out["non_cruise_total"] = round(
+        sum(v for k, v in by_code.items() if k in _ADDED_SERVICE_CODES), 2)
+    out["non_cruise_codes"] = sorted(
+        k for k, v in by_code.items() if k in _ADDED_SERVICE_CODES and v)
+    out["unknown_codes"] = sorted(
+        k for k in by_code if k not in _CRUISE_CODES and k not in _ADDED_SERVICE_CODES)
+    totals = _INVOICE_TOTAL_RE.findall(breakdown_text)
+    if totals:
+        stated = round(sum(_parse_money(t[3]) for t in totals), 2)
+        out["stated_total"] = stated
+        component_sum = round(sum(by_code.values()), 2)
+        out["gap"] = round(stated - component_sum, 2)
+        out["reconciles"] = abs(out["gap"]) <= 0.02
+    return out
+
+
+def _parse_money(raw: str) -> float:
+    return float(str(raw).replace(",", "").replace("$", "").strip())
+
+
 def _is_paid_in_full(due_amount: float, is_overpayment: bool, threshold: float) -> bool:
     if is_overpayment:
         return True
@@ -1792,7 +2244,7 @@ async def _stage_booking_for_confirm(page, booking_id: str) -> dict:
             await page.wait_for_timeout(500)
         return await page.inner_text("body")
 
-    resp = await page.goto(url, wait_until="domcontentloaded")
+    await page.goto(url, wait_until="domcontentloaded")
     booking_text = await _wait_for_booking_page()
     if (
         "welcome" in page.url
@@ -1800,7 +2252,7 @@ async def _stage_booking_for_confirm(page, booking_id: str) -> dict:
         or "ReLogonFormView" in page.url
         or "Session Timed Out" in booking_text
     ):
-        resp = await page.goto(url, wait_until="domcontentloaded")
+        await page.goto(url, wait_until="domcontentloaded")
         booking_text = await _wait_for_booking_page()
 
     if "No bookings found" in booking_text:
@@ -1872,6 +2324,14 @@ async def _stage_booking_for_confirm(page, booking_id: str) -> dict:
     discount_options = None
     club_discount_offered = None
     occupancy_fix = None
+    # Same defaulting as occupancy_fix above: the return dict below sits
+    # OUTSIDE `if clicked:`, so anything assigned only inside it would be a
+    # NameError on the not-clicked path. Defaulting to an explicit
+    # "never attempted" also keeps the meaning honest downstream - the
+    # calculator refuses to price a club member whose discount was not
+    # entered, and must not read a missing value as "no membership".
+    voyagers_fix = {"applied": False, "member": None, "verified": False,
+                    "reason": "never reached the discount screen"}
     if clicked:
         # "CONFIRM AND PROCEED" only ever renders once this screen has
         # actually loaded (confirmed against a real recorded session,
@@ -1933,6 +2393,14 @@ async def _stage_booking_for_confirm(page, booking_id: str) -> dict:
         # 2026-08-12: 3 kids silently dropped, dummy quote for 2 guests
         # got compared against the real 5-guest total).
         occupancy_fix = await _fix_occupancy(page, passenger_info["passengers"])
+
+        # Apply the customer's own Voyagers membership so the prices
+        # harvested next are comparable with their CURRENT total, which
+        # already includes their discount. Skipping this is what made
+        # every MSC booking look like "no opportunity" - see
+        # _apply_voyagers_club for the confirmed 3000081 figures.
+        voyagers_fix = await _apply_voyagers_club(
+            page, passenger_info["passengers"])
 
         # Capture the "Additional Discounts" dropdown options while we're
         # on this screen — needed by calculator_msc.py's DISCOUNT_ADD/
@@ -2004,6 +2472,23 @@ async def _stage_booking_for_confirm(page, booking_id: str) -> dict:
         # flow targets cabin 1 only, so a multi-cabin "savings" figure
         # would be wrong by roughly the other cabins).
         "cabin_count": _count_cabins(booking_text),
+        # What happened when the customer's Voyagers membership was
+        # entered, and therefore whether the prices harvested from this
+        # screen already carry the 5% club discount. The calculator MUST
+        # know this: comparing a discounted today-price against a
+        # discounted current total is valid, comparing a list price
+        # against a discounted total is the bug that hid every
+        # opportunity.
+        "voyagers_fix": voyagers_fix,
+        "today_price_includes_club_discount": bool(voyagers_fix.get("applied")),
+        # A SECOND, INDEPENDENT guest count - what the booking page itself
+        # says, not what passenger-row extraction produced. Required by
+        # msc_occupancy_is_trustworthy: counting from one source has now
+        # priced two bookings wrong (3000024, three kids dropped, fake
+        # $1,929.61; 3000081, one of two adults dropped, fake $267.01
+        # against a real $81.98). Both counts were self-consistent and
+        # wrong, so only a cross-check can catch it.
+        "invoice_guest_count": msc_invoice_guest_count(booking_text, None),
     }
 
 
@@ -2900,6 +3385,20 @@ async def _check_booking_msc(state: dict, booking_id: str, page=None) -> dict:
         "is_group_rate": staged.get("is_group_rate", False),
         "rate_tab_match": rate_tab_match,
         "today_price_same_category": today_price,
+        # ADDED 2026-09-01 for the data-collection run. The scalar above is
+        # the FIRST dollar figure within 200 chars of the category code, and
+        # comparing it against the booking's whole-invoice total produced a
+        # fake $267.01 on booking 3000081 (real answer $81.98 + $25 OBC).
+        # This records the surrounding listing window, EVERY price in it,
+        # any OBC wording and any per-person/total wording - so the units
+        # can finally be established instead of assumed. Read-only; drives
+        # no decision.
+        "today_price_detail": today_price_detail(
+            listing_text, staged["category"], staged.get("is_guaranteed", False)),
+        # Recorded so a run's own output shows whether today's quote covered
+        # the same guests as the booking - invisible when 3000081 was
+        # priced as 1 guest against a 2-guest invoice total.
+        "invoice_guest_count": staged.get("invoice_guest_count"),
         "all_tab_prices": all_tab_prices,
         "listing_text": listing_text[:4000],
         "listing_confirmed": listing_confirmed,
@@ -2968,12 +3467,100 @@ async def _check_booking_msc(state: dict, booking_id: str, page=None) -> dict:
             booking_data["summary_text"], booking_data.get("breakdown_text")
         )
     due_amount = _parse_dollars_safe(essentials.get("due_amount"))
+    # Itemise the invoice once: used for the non-cruise correction below and
+    # as a data-quality check (96 of 100 captured invoices reconcile to the
+    # cent; every failure so far was a real unparsed line, not noise).
+    from core.price_scope import PriceScope
+
+    _invoice_parts = msc_invoice_components(booking_data.get("breakdown_text"))
+    if not _invoice_parts.get("reconciles"):
+        logger.warning(
+            "msc.invoice_does_not_reconcile",
+            booking_id=booking_id, gap=_invoice_parts.get("gap"),
+            unknown_codes=_invoice_parts.get("unknown_codes"),
+            note="component lines do not sum to the stated totals — the "
+                 "capture may be truncated or a new line code exists",
+        )
+
+    # THE OCCUPANCY CROSS-CHECK, wired in 2026-09-01. It was written but
+    # never CALLED - `evaluate_msc_booking` accepted `occupancy_verified`
+    # and nothing computed it, so the guard was completely inert in
+    # production. Neon's live run on 3000081 / 3000071 / 3000083 is what
+    # exposed that: every capture reported invoice_guest_count = None.
+    #
+    # Computed HERE because this is the one place with both halves in scope:
+    # `booking_data` carries the untruncated summary/breakdown text (so the
+    # invoice's own passenger count can be read) and `staged["occupancy_fix"]`
+    # carries MSC's pre-fill plus the state the occupancy screen actually
+    # reached. Every price below is only meaningful if today's quote covered
+    # the same guests as the booking.
+    occupancy_fix = staged.get("occupancy_fix") or {}
+    invoice_guests = staged.get("invoice_guest_count")
+    if invoice_guests is None:
+        invoice_guests = msc_invoice_guest_count(
+            booking_data.get("summary_text"), booking_data.get("breakdown_text")
+        )
+    occupancy_verified, occupancy_note = msc_occupancy_is_trustworthy(
+        {
+            "counts": occupancy_fix.get("required") or {},
+            "total_guests": occupancy_fix.get("intended_guests"),
+            "dropped": occupancy_fix.get("dropped_passengers") or 0,
+            "passengers_seen": occupancy_fix.get("passengers_seen"),
+        },
+        invoice_guests,
+        occupancy_fix or None,
+        staged.get("cabin_count"),
+    )
+    if not occupancy_verified:
+        logger.warning(
+            "msc.occupancy_not_verified",
+            booking_id=booking_id,
+            note=occupancy_note,
+            invoice_guests=invoice_guests,
+            occupancy_fix=occupancy_fix,
+        )
+
     result = evaluate_msc_booking(
         booking_id=booking_id,
+        occupancy_verified=occupancy_verified,
+        occupancy_note=occupancy_note,
         category=staged["category"],
         cancelled_or_postponed=False,
         is_paid_in_full=_is_paid_in_full(
             due_amount, essentials.get("is_overpayment", False), core.models.MSC_PAID_IN_FULL_DUE_THRESHOLD
+        ),
+        # HARD RULE 2026-09-01: an overpaid booking is not optimizable at all.
+        is_overpayment=bool(essentials.get("is_overpayment", False)),
+        # Today's quote now carries the customer's own club discount when
+        # staging managed to enter it — the difference between a real
+        # $81.98 and a false "no opportunity" on booking 3000081.
+        customer_has_club_membership=bool(
+            (staged.get("voyagers_fix") or {}).get("member")),
+        today_price_includes_club_discount=bool(
+            staged.get("today_price_includes_club_discount")),
+        club_entry_note=str((staged.get("voyagers_fix") or {}).get("reason") or ""),
+        # Excursions/transfers/flights in the booking total, backed out so
+        # the comparison is against the cruise alone.
+        non_cruise_charges=_invoice_parts.get("non_cruise_total") or 0.0,
+        # What each side of the comparison covers, so a mismatch in a
+        # dimension nobody has written a specific guard for still refuses
+        # instead of producing a confident wrong number.
+        current_scope=PriceScope(
+            guests=msc_invoice_guest_count(
+                booking_data.get("summary_text"),
+                booking_data.get("breakdown_text")),
+            cabins=staged.get("cabin_count"),
+            includes_club_discount=True,
+            non_cruise_charges=0.0,   # backed out above
+            label="the booking's own total",
+        ),
+        today_scope=PriceScope(
+            guests=(staged.get("occupancy_fix") or {}).get("applied_guests"),
+            cabins=1,                 # a category quote is always one cabin
+            includes_club_discount=bool(
+                staged.get("today_price_includes_club_discount")),
+            non_cruise_charges=0.0,
+            label="today's listing card",
         ),
         due_amount=due_amount,
         current_total_price=_parse_dollars_safe(essentials.get("value")),
@@ -2992,7 +3579,17 @@ async def _check_booking_msc(state: dict, booking_id: str, page=None) -> dict:
 
     os.makedirs(os.path.dirname(LIVE_CHECK_RESULTS_PATH), exist_ok=True)
     with open(LIVE_CHECK_RESULTS_PATH, "a", encoding="utf-8") as f:
-        f.write(result.model_dump_json() + "\n")
+        # STAMPED, added 2026-09-03. This file is append-only and holds
+        # several results per booking, but carried NO timestamp on any of
+        # its 154 records — so nothing downstream could tell which result
+        # for a booking was the current one. Every reader was reduced to
+        # "whichever line I read last", which is only correct while append
+        # order happens to match real order. Concurrent scanning (two
+        # cruise lines at once, now supported) can interleave writes and
+        # break that silently.
+        record = json.loads(result.model_dump_json())
+        record["captured_at"] = datetime.now().isoformat()
+        f.write(json.dumps(record) + "\n")
 
     return {
         "booking_id": booking_id,
@@ -3182,7 +3779,8 @@ async def run_command(state: dict, command: str) -> str:
         return f"saved booking {booking_id} to {BOOKING_DATA_PATH}\n---\n{preview}"
 
     if command.startswith("batch_lookup:"):
-        ids = [b.strip() for b in command[len("batch_lookup:"):].split(",") if b.strip()]
+        ids = [b.strip() for b in command[len("batch_lookup:"):].split(",")
+               if b.strip() and is_valid_msc_booking_id(b)]
         os.makedirs(os.path.dirname(BOOKING_DATA_PATH), exist_ok=True)
         results = []
         for booking_id in ids:
@@ -3196,7 +3794,8 @@ async def run_command(state: dict, command: str) -> str:
         return f"batch of {len(ids)} done, saved to {BOOKING_DATA_PATH}:\n" + "\n".join(results)
 
     if command.startswith("batch_check_today_rate:"):
-        ids = [b.strip() for b in command[len("batch_check_today_rate:"):].split(",") if b.strip()]
+        ids = [b.strip() for b in command[len("batch_check_today_rate:"):].split(",")
+               if b.strip() and is_valid_msc_booking_id(b)]
         os.makedirs(os.path.dirname(RATE_CHECK_DATA_PATH), exist_ok=True)
         results = []
         for booking_id in ids:
@@ -3259,7 +3858,7 @@ async def run_command(state: dict, command: str) -> str:
         # before these classes existed — reload before importing them.
         import core.models
         importlib.reload(core.models)
-        from core.models import MscDiscountApplicationMethod, MscDiscountCandidate, MscDiscountTestStatus
+        from core.models import MscDiscountApplicationMethod, MscDiscountCandidate
 
         rest = command[len("test_discount:"):]
         try:
@@ -3281,7 +3880,7 @@ async def run_command(state: dict, command: str) -> str:
     if command.startswith("test_voyagers_discount:"):
         import core.models
         importlib.reload(core.models)
-        from core.models import MscDiscountApplicationMethod, MscDiscountCandidate, MscDiscountTestStatus
+        from core.models import MscDiscountApplicationMethod, MscDiscountCandidate
 
         booking_id = command[len("test_voyagers_discount:"):].strip()
         booking_data = await _lookup_one_booking(page, booking_id)
@@ -3310,7 +3909,8 @@ async def run_command(state: dict, command: str) -> str:
         return _format_discount_test_result(test_result, extra=f"Voyagers Club member {member['name']!r}")
 
     if command.startswith("check_booking_batch:"):
-        ids = [b.strip() for b in command[len("check_booking_batch:"):].split(",") if b.strip()]
+        ids = [b.strip() for b in command[len("check_booking_batch:"):].split(",")
+               if b.strip() and is_valid_msc_booking_id(b)]
         lines = []
         for booking_id in ids:
             try:
@@ -3341,7 +3941,12 @@ async def run_command(state: dict, command: str) -> str:
         # if MSC's backend itself ever serves back a session-confused
         # response, this surfaces as an explicit 'sailing_identity_mismatch'
         # result instead of a silently wrong one.
-        ids_raw = [b.strip() for b in command[len("check_booking_batch2:"):].split(",") if b.strip()]
+        # Validated the same way as the other three batch commands — this
+        # was the one site the 2026-09-01 booking-id fix missed, and it is
+        # the most dangerous one to leave open because it drives two
+        # concurrent tabs.
+        ids_raw = [b.strip() for b in command[len("check_booking_batch2:"):].split(",")
+                   if b.strip() and is_valid_msc_booking_id(b)]
         # CONFIRMED REAL RISK, fixed 2026-08-13 (Phase 0 correctness audit):
         # the same booking ID appearing twice in the input, at positions of
         # different parity (e.g. index 0 and index 1), used to be processed

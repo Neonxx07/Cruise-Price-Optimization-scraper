@@ -1385,11 +1385,38 @@ def calculate_goccl(
                 new_total=estimated_new_total,
             )
 
+        # A CANDIDATE WITHOUT AN OFFER CODE CANNOT BE ACTED ON, added
+        # 2026-09-03 by the cross-line audit. Three of the five GoCCL
+        # candidates ever stored (DEMO02 $880, DEMO03 $740, DEMO01 $1,560 —
+        # $3,180 of the $4,100 GoCCL has ever claimed) carry an EMPTY offer
+        # code. The code is the whole point of the finding: it is what the
+        # reprice popup passes to fn_goccl_selectOfferAndContinue(), so
+        # without it there is nothing to select and no way to verify the
+        # figure. Reporting a dollar amount nobody can use is worse than
+        # reporting nothing, because it goes into a total and gets planned
+        # around.
+        offer_code = str(cheapest.get("offer_code") or "").strip()
+        if not offer_code:
+            return BookingResult(
+                cruise_line=CruiseLine.GOCCL,
+                status=BookingStatus.NO_SAVING,
+                note=(
+                    f"a ${round(price_drop)} cheaper fare was seen but its offer "
+                    f"code was not captured ({cheapest.get('offer_name', '') or 'unnamed offer'}) "
+                    f"— nothing to select or verify, so not reported as a saving"
+                    f"{guest_note}"
+                ),
+                booking_id=booking_id,
+                price_category=price_category,
+                old_total=old_total,
+                new_total=estimated_new_total,
+            )
+
         return BookingResult(
             cruise_line=CruiseLine.GOCCL,
             status=BookingStatus.OPTIMIZATION,
             note=(
-                f"candidate ${round(price_drop)} — offer code '{cheapest.get('offer_code', '')}' "
+                f"candidate ${round(price_drop)} — offer code '{offer_code}' "
                 f"({cheapest.get('offer_name', '')}) — UNCONFIRMED, run preview_fare_code to verify "
                 f"gross total + OBC before repricing{guest_note}"
             ),

@@ -93,6 +93,123 @@ class EspressoScraper(BaseScraper):
         "/sso/", "/saml", "/federate", "/as/authorization",
     )
 
+    @property
+    def credential_service(self) -> str:
+        """Where save_login.py stores this account's credential."""
+        return settings.espresso_credential_service
+
+    async def auto_login(self) -> str:
+        """Fill the ESPRESSO login form from the saved credential.
+
+        NEVER RAISES - returns a status string, matching NclScraper.
+        auto_login and msc_commands.auto_login, so a caller can fall back
+        to a manual prompt instead of crashing a run. Returns "OK",
+        "ALREADY_LOGGED_IN", "NO_CREDENTIALS_SAVED", "NO_LOGIN_FORM",
+        "FILLED_AWAITING_MFA", or "ERROR: ...".
+
+        "OK" means fully authenticated. "FILLED_AWAITING_MFA" means the
+        credential went in and the human must finish - ESPRESSO requires
+        MFA, so a fully unattended login is not possible and this does not
+        pretend otherwise.
+
+        Never logs, prints or returns the credential values themselves.
+        """
+        try:
+            import keyring
+        except Exception as exc:  # never crash a login on the keyring
+            return f"ERROR: keyring unavailable ({exc})"
+
+        username = keyring.get_password(self.credential_service, "username")
+        password = keyring.get_password(self.credential_service, "password")
+        if not username or not password:
+            return "NO_CREDENTIALS_SAVED"
+
+        try:
+            # A restored session may already be valid. Re-submitting a
+            # login over a live one is pointless and, on this portal,
+            # risky - ESPRESSO allows a single active session per account.
+            if await self._check_login():
+                logger.info("espresso.auto_login", result="ALREADY_LOGGED_IN")
+                return "ALREADY_LOGGED_IN"
+
+            # Evidence for the future: no ESPRESSO login page has ever been
+            # captured, which is why the selectors below are discovered
+            # rather than exact. Dumping it once means the next change can
+            # be made against real markup.
+            try:
+                await self.dump_page_snapshot("_login", "espresso_login_form")
+            except Exception:
+                pass
+
+            found = await self.page.evaluate("""
+                (() => {
+                  const vis = el => {
+                    if (!el) return false;
+                    const r = el.getBoundingClientRect();
+                    const s = window.getComputedStyle(el);
+                    return r.width > 0 && r.height > 0
+                        && s.visibility !== 'hidden' && s.display !== 'none';
+                  };
+                  const pw = Array.from(
+                      document.querySelectorAll('input[type="password"]')).filter(vis)[0];
+                  if (!pw) return {ok: false, why: 'no visible password input'};
+                  // The username box is the nearest preceding visible
+                  // text/email input - that IS the shape of a login form.
+                  const scope = pw.form || document;
+                  const texts = Array.from(scope.querySelectorAll(
+                      'input[type="text"], input[type="email"], input:not([type])'))
+                      .filter(vis);
+                  const before = texts.filter(el =>
+                      pw.compareDocumentPosition(el) & Node.DOCUMENT_POSITION_PRECEDING);
+                  const user = before.length ? before[before.length - 1] : texts[0];
+                  if (!user) return {ok: false, why: 'no visible username input'};
+                  const mark = (el, name) => { el.setAttribute('data-ch-login', name); };
+                  mark(user, 'user'); mark(pw, 'pass');
+                  const submit = scope.querySelector(
+                      'input[type="submit"], button[type="submit"], button:not([type])');
+                  if (submit && vis(submit)) submit.setAttribute('data-ch-login', 'submit');
+                  return {ok: true, hasSubmit: !!(submit && vis(submit)),
+                          userId: user.id || user.name || '(unnamed)',
+                          passId: pw.id || pw.name || '(unnamed)'};
+                })()
+            """)
+
+            if not found or not found.get("ok"):
+                logger.warning("espresso.auto_login", result="NO_LOGIN_FORM",
+                               why=(found or {}).get("why"), url=self.page.url)
+                return "NO_LOGIN_FORM"
+
+            logger.info("espresso.auto_login_form_found",
+                        user_field=found.get("userId"),
+                        pass_field=found.get("passId"),
+                        has_submit=found.get("hasSubmit"))
+
+            await self.page.fill('[data-ch-login="user"]', username)
+            await self.page.fill('[data-ch-login="pass"]', password)
+            if found.get("hasSubmit"):
+                await self.page.click('[data-ch-login="submit"]')
+            else:
+                await self.page.press('[data-ch-login="pass"]', "Enter")
+
+            # Short settle only. Anything longer would be waiting on MFA,
+            # which is the human's job - blocking here would look like a
+            # hang with no explanation.
+            try:
+                await self.page.wait_for_load_state("networkidle", timeout=15000)
+            except Exception:
+                pass
+
+            if await self._check_login():
+                logger.info("espresso.auto_login", result="OK")
+                return "OK"
+
+            logger.info("espresso.auto_login", result="FILLED_AWAITING_MFA",
+                        url=self.page.url)
+            return "FILLED_AWAITING_MFA"
+        except Exception as exc:
+            logger.warning("espresso.auto_login_failed", error=str(exc)[:200])
+            return f"ERROR: {exc}"[:200]
+
     async def _check_login(self) -> bool:
         """Whether we are really authenticated on the page we are on now.
 
@@ -531,6 +648,74 @@ class EspressoScraper(BaseScraper):
         """)
         return result
 
+    async def release_booking(self, booking_id: str = "") -> bool:
+        """Exit a retrieved reservation so ESPRESSO frees its 15-minute lock.
+
+        Neon 2026-09-16: "esspresso has a lock mechanisem we need to exit
+        every booking after checking or else the booking stay locked for 15
+        mins". Nothing released it before - the scan just moved on - so
+        every booking checked was locked for a quarter of an hour, blocking
+        both a human and a re-scan.
+
+        Returns True if the release was issued, False otherwise. NEVER
+        raises: a failed release must not turn a good result into an error.
+        Worst case the lock expires on its own, which is today's behaviour.
+
+        NOT a cancellation. The portal's own wording for this control is
+        "any changes you made since you retrieved this reservation will not
+        be saved" - it discards and unlocks. "Cancel Reservation" is a
+        different, destructive control on the same page and is never
+        touched here; this scan never intends to save anything anyway.
+        """
+        try:
+            # 1) The real control, as captured: the Exit link, then the
+            # confirm button inside the dialog it opens.
+            link = self.page.locator("#ignoreReservationLink")
+            if await link.count() > 0:
+                await link.first.click()
+                confirm = self.page.locator("#acceptIgnoreReservation")
+                try:
+                    await confirm.first.wait_for(state="visible", timeout=4000)
+                    await confirm.first.click()
+                except Exception:
+                    # Some flows exit without the confirm step.
+                    pass
+                await self.page.wait_for_load_state("domcontentloaded", timeout=10000)
+                logger.info("espresso.booking_released", booking_id=booking_id,
+                            via="ignoreReservationLink")
+                self.log_action("release_booking", booking_id=booking_id,
+                                via="ignoreReservationLink")
+                return True
+
+            # 2) Fallback: the navigation the page's own handler performs.
+            # Group bookings use a DIFFERENT event - taken from that same
+            # handler, not assumed.
+            released = await self.page.evaluate("""
+                (() => {
+                  if (!window.Base || !window.Base.flowExecutionURL) return null;
+                  const group = (typeof isGroupBooking !== 'undefined') && isGroupBooking;
+                  return window.Base.flowExecutionURL + '&_eventId='
+                       + (group ? 'linkToCompleteIgnoreReservationGb'
+                                : 'linkToIgnoreReservation');
+                })()
+            """)
+            if released:
+                await self.navigate(released)
+                logger.info("espresso.booking_released", booking_id=booking_id,
+                            via="flowExecutionURL")
+                self.log_action("release_booking", booking_id=booking_id,
+                                via="flowExecutionURL")
+                return True
+
+            logger.info("espresso.booking_release_skipped", booking_id=booking_id,
+                        reason="no exit control on this page")
+            return False
+        except Exception as exc:
+            # Deliberately swallowed - see the docstring.
+            logger.warning("espresso.booking_release_failed",
+                           booking_id=booking_id, error=str(exc)[:200])
+            return False
+
     async def check_booking(self, booking_id: str, capture_market_data: bool = False) -> BookingResult:
         """
         Full ESPRESSO booking check flow.
@@ -767,6 +952,12 @@ class EspressoScraper(BaseScraper):
         # than silently absent — a human reviewing this result now knows a
         # second, unevaluated rate-program column exists on this booking.
         result.note = _append_dual_rate_note(result.note, self.last_market_data)
+
+        # RELEASE THE LOCK before moving on. Placed here so it runs for
+        # every branch above - WLT, paid-in-full, skip-reprice,
+        # no-price-change, the calculated result and the upgrade override
+        # alike. A booking left retrieved stays locked for 15 minutes.
+        await self.release_booking(booking_id)
 
         logger.info("espresso.result", booking_id=booking_id, status=result.status.value, net=result.net_saving)
         self.log_action("result", booking_id=booking_id, status=result.status.value, net_saving=result.net_saving)

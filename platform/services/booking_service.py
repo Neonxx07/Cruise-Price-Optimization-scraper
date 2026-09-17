@@ -158,16 +158,30 @@ class BookingService:
 
     async def check_login(
         self, cruise_line: CruiseLine, timeout_minutes: float = 15.0,
-        market: str | None = None,
+        market: str | None = None, headless: bool = False,
     ) -> bool:
         """
-        Open (or reuse) the live browser, visibly, and wait for the user to
-        log in. The same browser instance stays open afterward for
-        start_scan to reuse — never closed and reopened, since that's what
-        triggers the bot-detection replay flag.
+        Open (or reuse) the live browser and wait for the user to log in. The
+        same browser instance stays open afterward for start_scan to reuse —
+        never closed and reopened, since that's what triggers the
+        bot-detection replay flag.
+
+        `headless` was hardcoded False here until 2026-09-16, which is why the
+        GUI always showed a window: the browser a GUI scan runs in is the one
+        THIS method opens, and start_scan's own `headless` argument never
+        applies because the GUI passes keep_browser_open=True.
+
+        NCL ONLY. Neon asked for the choice on NCL, and NCL earned it —
+        headless was proven to drive the entire flow (Switch to Edit Mode, the
+        SlickGrid category read, the price comparison, cancel-and-release):
+        headless and headed returned identical totals and identical category
+        counts (30/23/31 from _form_12) across the same three bookings.
+        ESPRESSO can NEVER be headless whatever is passed here — its Akamai
+        bot detection breaks it, and scraper/base.py enforces that
+        independently of this argument.
         """
         scraper = await self.get_or_create_scraper(
-            cruise_line, headless=False, market=market,
+            cruise_line, headless=headless, market=market,
         )
         base_url = self._login_base_url(cruise_line)
         await scraper.navigate(base_url)
@@ -183,8 +197,20 @@ class BookingService:
         # Best-effort by contract: auto_login never raises (see
         # NclScraper.auto_login) and returns a status string. On anything
         # other than OK we simply fall through to the manual poll below,
-        # which is the pre-existing behaviour - ESPRESSO has no auto-login
-        # at all (MFA) and must always be done by hand.
+        # which is the pre-existing behaviour.
+        #
+        # UPDATED 2026-09-16. ESPRESSO now has an auto_login too. Neon:
+        # "there is a bug with espresso logging in ... although i have
+        # entered the passwords using the command" - and he was right,
+        # EspressoScraper simply had no auto_login method, so the
+        # credential save_login.py stored was read by nothing at all.
+        #
+        # It returns "FILLED_AWAITING_MFA" on the normal path rather than
+        # "OK", because ESPRESSO requires MFA and a fully unattended login
+        # is not possible. That deliberately falls through to the manual
+        # poll below: the username and password are already typed in, and
+        # the human only completes MFA. The poll then sees the real
+        # session. `hasattr` means no wiring change was needed here.
         if hasattr(scraper, "auto_login"):
             try:
                 status = await scraper.auto_login()
@@ -527,6 +553,23 @@ class BookingService:
                 except Exception as e:
                     logger.error("batch.error", booking_id=booking_id, error=str(e))
                     result = make_error_result(booking_id, None, job.cruise_line, str(e))
+
+                    # RELEASE THE LOCK ON THE ERROR PATH TOO, added
+                    # 2026-09-16. check_booking releases it on every
+                    # successful branch, but a booking that FAILED is
+                    # still retrieved and therefore still locked - and
+                    # ESPRESSO holds that lock for 15 minutes. Failures
+                    # are not rare (141 ESPRESSO timeouts historically),
+                    # so skipping this would leave exactly the bookings
+                    # someone wants to look at by hand locked out.
+                    #
+                    # Best-effort and non-fatal: release_booking never
+                    # raises, and this must not replace the real error.
+                    if hasattr(scraper, "release_booking"):
+                        try:
+                            await scraper.release_booking(booking_id)
+                        except Exception:
+                            pass
 
                     if self._is_dead_browser_error(e):
                         logger.warning("batch.browser_dead_restarting", booking_id=booking_id)
@@ -899,15 +942,34 @@ class BookingService:
             CruiseLine.GOCCL: "goccl_offer_code_comparison",
         }
 
+        # HONOUR THE SCRAPER'S OWN LABEL, fixed 2026-09-16. This function
+        # assumed every capture looks like ESPRESSO's - a category table
+        # under "rows" - and forced the cruise line's default label on top.
+        # NCL's capture has NO "rows" key at all: it carries the payment
+        # state. So all 135 NCL rows written in the 2026-09-16 run were
+        # empty AND mislabelled "ncl_category_table" when the scraper had
+        # already said "ncl_booking_details".
+        capture_type = (market_data.get("capture_type")
+                        or capture_types.get(result.cruise_line, "category_table"))
+
+        # Keep the WHOLE payload. The fields being dropped here -
+        # final_payment_date, amount_due, commission_rate, inside NCL's
+        # "derived" - are exactly the ones needed to rank a booking by
+        # urgency and to warn that a finding is about to expire. Their
+        # absence is what let $3,945 of found savings lapse during an
+        # 18-day scan gap: nothing could tell which findings were about to
+        # become unoptimizable. Storing the raw capture means a future
+        # question can be answered from history instead of another live run.
         async with async_session() as session:
             session.add(MarketDataRecord(
                 booking_id=result.booking_id,
                 cruise_line=result.cruise_line.value,
-                capture_type=capture_types.get(result.cruise_line, "category_table"),
+                capture_type=capture_type,
                 current_category=market_data.get("currentCategory"),
                 execution_token=market_data.get("executionToken"),
                 selection_json=market_data.get("selectionJSON"),
                 category_table_json=json.dumps(market_data.get("rows", []), ensure_ascii=False),
+                payload_json=json.dumps(market_data, ensure_ascii=False, default=str),
             ))
             await session.commit()
 

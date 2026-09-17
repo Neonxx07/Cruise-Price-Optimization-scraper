@@ -65,7 +65,7 @@ def menu_scan():
     _banner()
     n = _count_bookings()
     if n == 0:
-        print(f"You don't have any booking IDs yet. Add some first (option 4).")
+        print("You don't have any booking IDs yet. Add some first (option 4).")
         _pause()
         return
     headless_mode = _ask_headless_mode()
@@ -92,7 +92,7 @@ def menu_watch():
     _banner()
     n = _count_bookings()
     if n == 0:
-        print(f"You don't have any booking IDs yet. Add some first (option 4).")
+        print("You don't have any booking IDs yet. Add some first (option 4).")
         _pause()
         return
     print(f"This will keep re-checking your {n} booking(s) automatically.")

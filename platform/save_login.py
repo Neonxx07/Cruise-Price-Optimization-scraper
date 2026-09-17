@@ -33,7 +33,6 @@ from __future__ import annotations
 
 import getpass
 import re
-import sys
 
 import keyring
 

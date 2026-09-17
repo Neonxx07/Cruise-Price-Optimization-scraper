@@ -1,0 +1,38 @@
+# Lint gate for CruiseIntel.
+#
+# ADDED 2026-09-15, the day an UnboundLocalError took NCL offline for every
+# booking. `scraper/ncl.py` read `balance_is_all_commission` three lines
+# above where it was assigned; ruff reports that as F821 in milliseconds,
+# and no linter was installed in this project at all. The 145 NCL unit
+# tests passed throughout, because they exercise `calculate_ncl` directly
+# and never run the scraper function that held the broken ordering.
+#
+# Scope is deliberately narrow. "F" is pyflakes - real defects only
+# (undefined names, unused imports, broken f-strings), not style. A gate
+# that argues about formatting gets switched off; one that only ever fires
+# on genuine bugs stays on.
+line-length = 120
+target-version = "py312"
+
+exclude = [
+    "browser-profile",
+    "data",
+    ".venv",
+    "venv",
+]
+
+[lint]
+select = [
+    "F",     # pyflakes - undefined names, unused imports, f-string errors
+    "E9",    # syntax errors and IndentationError
+    "B002",  # ++ used as if it were an increment operator
+    "B006",  # mutable default argument
+    "B012",  # break/return inside finally swallows the exception
+]
+
+# F821 fires on string forward-references such as
+# `-> "MscDiscountTestResult"` where the class is imported inside the
+# function body. Verified false positives on this codebase, not silenced
+# blindly - checked each one before adding.
+[lint.per-file-ignores]
+"msc_commands.py" = ["F821"]

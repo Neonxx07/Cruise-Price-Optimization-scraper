@@ -88,6 +88,71 @@ def is_dead_browser_error(exc: Exception) -> bool:
     return any(s in msg for s in _DEAD_TRANSPORT_SIGNATURES)
 
 
+# RETENTION IS OFF BY DEFAULT, set 2026-09-15 on Neon's explicit
+# instruction: "do not delete the data because we use it to use it make the
+# project better and the resu,lts better".
+#
+# Captured failures are not waste here - they are the corpus this project
+# mines to improve detection. The pruner below is kept because bounding the
+# directory is still sometimes wanted, but nothing calls it automatically
+# any more. Set this to a positive integer to re-enable per-booking
+# retention; None means keep every snapshot forever.
+MAX_FAILURE_SNAPSHOTS_PER_BOOKING = None
+
+
+def _prune_failure_snapshots(failures_dir: str, booking_prefix: str,
+                             keep: int | None = None) -> int:
+    """Keep only the newest `keep` failure snapshots for one booking.
+
+    Added 2026-09-15 after measuring data/failures/ at 82.8 MB over 662
+    files with no retention of any kind. A booking that fails usually fails
+    repeatedly, so the directory filled with near-duplicates of the same
+    page - three snapshots of booking 3000041 from one afternoon, three of
+    3000066 from a single run.
+
+    Groups by the SNAPSHOT (the shared .png/.html/.json stem), not by file,
+    so a set is always removed together and a screenshot is never orphaned
+    from the URL and error that explain it. Returns how many files were
+    removed, for logging and for the test.
+    """
+    import os
+
+    # `keep is None` means retain everything - the default, per Neon's
+    # instruction that captured data is the raw material for improving the
+    # project, not clutter to be tidied away.
+    if keep is None:
+        keep = MAX_FAILURE_SNAPSHOTS_PER_BOOKING
+    if not keep:
+        return 0
+
+    stems = {}
+    try:
+        names = os.listdir(failures_dir)
+    except OSError:
+        return 0
+    for name in names:
+        stem, ext = os.path.splitext(name)
+        if ext.lower() not in (".png", ".html", ".json"):
+            continue
+        if not stem.startswith(booking_prefix + "__"):
+            continue
+        stems.setdefault(stem, []).append(os.path.join(failures_dir, name))
+
+    # The timestamp is the last __-separated field, so a plain sort is
+    # chronological - no stat() call per file, and no dependence on mtime,
+    # which copying or syncing the folder would scramble.
+    doomed = sorted(stems)[:-keep] if len(stems) > keep else []
+    removed = 0
+    for stem in doomed:
+        for path in stems[stem]:
+            try:
+                os.remove(path)
+                removed += 1
+            except OSError:
+                pass
+    return removed
+
+
 def _sanitize_filename_component(value: str) -> str:
     """CONFIRMED REAL RISK 2026-08-12: dump_page_snapshot/
     dump_failure_snapshot build a filename directly from booking_id (and
@@ -715,6 +780,13 @@ class BaseScraper(ABC):
         stamp = datetime.utcnow().strftime("%Y%m%dT%H%M%S%f")
         base = f"{_sanitize_filename_component(booking_id)}__{_sanitize_filename_component(step)}__{stamp}"
 
+        # FULL PAGE, restored 2026-09-15. I had switched this to a viewport
+        # shot to save disk (~0.8 MB -> ~100 KB), then Neon said plainly:
+        # "do not delete the data because we use it to use it make the
+        # project better and the resu,lts better". A viewport shot captures
+        # LESS - anything below the fold is gone, and on these portals the
+        # price breakdown is often exactly what is below the fold. Cheaper
+        # to store, worse to learn from, so the trade goes the other way.
         try:
             await self.page.screenshot(path=os.path.join(failures_dir, base + ".png"), full_page=True)
         except Exception:
@@ -732,6 +804,19 @@ class BaseScraper(ABC):
                 json.dump({"url": self.page.url, "error": error}, f, ensure_ascii=False, indent=2)
         except Exception:
             logger.warning("failure_snapshot.meta_error", booking_id=booking_id, step=step, exc_info=True)
+
+        # RETENTION. Nothing ever deleted these, so every failed booking
+        # added ~1 MB forever - and a booking that fails tends to fail on
+        # every scan, producing near-identical snapshots. Real example:
+        # booking 3000041 has three from one afternoon, 3000066 three more
+        # from a single run. Keeping the newest few per booking preserves
+        # the diagnostic value (you look at the latest failure, not one
+        # from three weeks ago) while bounding the directory.
+        # NOT pruned automatically. Neon 2026-09-15: the captured failures
+        # are mined to improve the project, so deleting them costs more
+        # than the disk they use. _prune_failure_snapshots stays available
+        # for a deliberate, explicit cleanup and is a no-op while
+        # MAX_FAILURE_SNAPSHOTS_PER_BOOKING is None.
 
         self.log_action("failure_snapshot", booking_id=booking_id, step=step, error=error, file=base)
 

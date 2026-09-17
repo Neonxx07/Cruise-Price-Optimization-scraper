@@ -170,12 +170,19 @@ class BookingQueueManager:
     async def initialize(self) -> None:
         await init_db()
 
-    async def check_login(self, cruise_line: CruiseLine, timeout_minutes: float = 15.0) -> bool:
+    async def check_login(self, cruise_line: CruiseLine, timeout_minutes: float = 15.0,
+                          headless: bool = False) -> bool:
         """Log in via the shared, continuous browser session (see
         BookingService.check_login) — the same instance stays open for
-        start_processing to reuse afterward."""
+        start_processing to reuse afterward.
+
+        `headless` therefore decides how the SCAN runs too, not just the
+        login: the GUI passes keep_browser_open=True, so every booking is
+        checked in the browser this call opens.
+        """
         await self.initialize()
-        return await self._service.check_login(cruise_line, timeout_minutes=timeout_minutes)
+        return await self._service.check_login(
+            cruise_line, timeout_minutes=timeout_minutes, headless=headless)
 
     async def close_live_session(self) -> None:
         """Close the shared browser session, if one is open. Call on app exit."""
@@ -331,7 +338,6 @@ class BookingQueueManager:
 
     @staticmethod
     def _parse_bulk_text(text: str) -> list[str]:
-        separators = ["\n", ","]
         normalized = text.replace(",", "\n")
         lines = [line.strip() for line in normalized.splitlines()]
         return [line for line in lines if line]

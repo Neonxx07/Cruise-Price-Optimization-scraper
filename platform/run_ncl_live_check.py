@@ -45,7 +45,6 @@ import sys
 import time
 
 from config.settings import settings
-from core.models import CruiseLine
 from scraper.ncl import NclScraper
 from utils.logging import setup_logging
 
