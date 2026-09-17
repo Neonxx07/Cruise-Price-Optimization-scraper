@@ -128,6 +128,7 @@ START_GUI.bat               # Windows double-click launcher
 | **Cruise line selector** | Pick the portal before scanning — the GUI routes to the right engine |
 | **Login check** | Verifies the saved session is still valid *before* a scan starts, so a batch doesn't die halfway |
 | **Live results table** | Rows fill in as each booking finishes; Stop halts cleanly between bookings |
+| **Headless toggle (NCL only)** | "Run hidden (headless)" appears only for NCL, where it was measured end-to-end. ESPRESSO can never be headless (Akamai); MSC/GoCCL are untested, so no toggle is offered |
 | **MSC support** | Routed through `services/msc_live_service.py` rather than the shared scan pipeline, because an MSC result carries three-to-four independent opportunity checks instead of one net-saving figure |
 | **Export** | Writes `reports/scan_results.csv` + `.xlsx` (MSC results export separately, with their own columns) |
 
@@ -241,6 +242,27 @@ Full policy, plus the incident record that produced these rules:
 
 ## What's New
 
+### NCL headless toggle — and why only NCL
+
+The GUI now offers **"Run hidden (headless)"**, and the checkbox appears *only* when NCL is
+selected. That scope is measured, not assumed: the same three bookings run headless and
+headed returned identical totals **and** identical category counts, driving the whole flow —
+Switch to Edit Mode, the SlickGrid read, the price comparison, and cancel-and-release — not
+merely opening a booking.
+
+- **ESPRESSO can never run headless.** Akamai bot detection breaks it, and
+  `scraper/base.py` enforces that regardless of the setting or any `headless` argument a
+  caller passes.
+- **MSC and GoCCL simply haven't been tested this way**, so no toggle is offered. Shipping an
+  untested toggle would just be inviting the next silent failure.
+
+### Princess (POLAR) — groundwork, not yet usable
+
+[`core/princess_packages.py`](platform/core/princess_packages.py) maps Princess Plus/Premier
+fare packages, because POLAR's promo list describes fares by package name and two Princess
+fares are usually **not** comparable without knowing what each package contains. No scraper,
+no enum entry, not yet wired into the pipeline.
+
 ### Sensitive-data guardrails
 
 A pre-commit hook ([`.githooks/pre-commit`](.githooks/pre-commit)) plus
@@ -348,6 +370,13 @@ logged-in session.
 | Norwegian (NCL) | SeaWeb Agents (US + Canada/CAD) | ✅ | ✅ | ✅ |
 | Carnival (GoCCL) | GoCCL | ✅ | ✅ | ✅ |
 | MSC Cruises | MSC Book | — | ✅ | ✅ |
+| Princess | POLAR | — | 🚧 in progress | — |
+
+> **Princess is not usable yet.** What exists is the hard part of the domain research —
+> [`core/princess_packages.py`](platform/core/princess_packages.py) maps the Plus/Premier
+> fare packages so two Princess fares are never compared as if their package contents
+> matched. There is no POLAR scraper, no `CruiseLine.PRINCESS`, and nothing imports the
+> module yet. Treat it as groundwork, not a supported line.
 
 > **NCL uses a separate agent account per market.** A Canadian booking checked against the US
 > login reports "Reservation is not found" — it's on the other account, not missing. Set the
