@@ -98,9 +98,16 @@ python main.py api
 python main.py scan --bookings "1234567,7654321" --cruise-line ESPRESSO -o results.csv
 ```
 
-> Booking numbers shown anywhere in this repo are **fake demo values**. Real reservation
-> numbers, scan output, captured pages, and the local database are git-ignored by design —
-> see [`.gitignore`](.gitignore).
+> **Contributors: install the git hooks first.**
+>
+> ```bash
+> ./.githooks/install.sh
+> ```
+>
+> Booking numbers shown anywhere in this repo are **fake demo values** (`3000xxx`,
+> `DEMOnn`). Real reservation numbers, scan output, captured pages, session cookies and the
+> local database are git-ignored by design, and a pre-commit hook blocks them from being
+> committed by accident. See [`SECURITY.md`](SECURITY.md).
 
 ---
 
@@ -207,7 +214,41 @@ Commands that genuinely would commit a change (`CruiseCabinLockCmd` /
 
 ---
 
+## 🔒 Keeping Real Data Out of a Public Repo
+
+This tool runs against live agent portals, so the environment around it holds real customer
+and operator data — none of which belongs in a public repository. Three defences, each one
+added after something actually slipped through:
+
+| Defence | What it does |
+|---|---|
+| **`.gitignore` allowlist** | Loose files under `platform/` are ignored by default; only genuine source is re-admitted. The old file-by-file rules lost the race when 167 real booking numbers arrived in newly-named watchlists. |
+| **Pre-commit hook** | Blocks booking references (numeric *and* PNR-style), operator/customer names, absolute personal paths, credentials, and data/DB/session files — reporting file and line. |
+| **`.gitattributes`** | Normalises line endings, so a Windows round-trip stops reporting unchanged files as fully rewritten and hiding real edits in the noise. |
+
+```bash
+./.githooks/install.sh     # once per clone — git never installs hooks automatically
+```
+
+The installer also creates `.git/sensitive-terms.txt`, a **local** denylist for exact private
+values (your real name, agent login, agency id). It lives inside `.git/`, so it is never
+committed — the hook itself is public and matches only on shape.
+
+Full policy, plus the incident record that produced these rules:
+**[`SECURITY.md`](SECURITY.md)**.
+
+---
+
 ## What's New
+
+### Sensitive-data guardrails
+
+A pre-commit hook ([`.githooks/pre-commit`](.githooks/pre-commit)) plus
+[`SECURITY.md`](SECURITY.md). Two failure modes drove this: a scan is only as good as its
+reference list — one exposure persisted 12 days because the ID list never included the
+database, and another because every scan matched only 5–9 digit numbers while GoCCL and
+Princess use PNR-style codes — and a manual exclusion step that worked for a month
+eventually didn't. Both are now mechanical.
 
 ### Concurrent multi-line scanning
 
@@ -325,6 +366,8 @@ logged-in session.
   and the MSC-specific reference
 - [`RECREATE_PROMPT.md`](RECREATE_PROMPT.md) — a self-contained prompt that can rebuild the
   whole system from scratch
+- [`SECURITY.md`](SECURITY.md) — what must never be committed, the three defences that
+  enforce it, and the incident record behind each rule
 - [`CONTRIBUTING.md`](CONTRIBUTING.md) — guidelines for adding a new cruise line
 - [`HOW_TO_CHECK_A_BOOKING.md`](HOW_TO_CHECK_A_BOOKING.md) — the plain-English manual process
   the ESPRESSO automation is based on
