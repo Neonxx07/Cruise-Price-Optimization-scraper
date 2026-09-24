@@ -36,7 +36,7 @@ def main() -> int:
     # logger.info/warning/error call made during a GUI-driven scan
     # (including ones that would explain a failed session save) is
     # silently dropped instead of reaching stderr.
-    setup_logging(settings.log_level)
+    setup_logging(settings.log_level, settings.log_file)
     QCoreApplication.setAttribute(Qt.ApplicationAttribute.AA_EnableHighDpiScaling, True)
 
     app = QApplication(sys.argv)
@@ -110,7 +110,14 @@ def main() -> int:
 
     try:
         with loop:
-            return loop.run_forever()
+            loop.run_forever()
+        # EXPLICIT 0 ON A CLEAN SHUTDOWN. Fixed 2026-09-22: this returned
+        # whatever qasync's run_forever handed back, and a perfectly normal
+        # close - the log's own "gui.shutdown_complete" was the last line -
+        # exited with code 1. That makes every ordinary quit look like a
+        # crash, which is precisely the kind of noise that hides a REAL one.
+        # A genuine failure still propagates as an exception.
+        return 0
     finally:
         guard.release()
 

@@ -104,7 +104,7 @@ python main.py scan --bookings "1234567,7654321" --cruise-line ESPRESSO -o resul
 > ./.githooks/install.sh
 > ```
 >
-> Booking numbers shown anywhere in this repo are **fake demo values** (`3000xxx`,
+> Booking numbers shown anywhere in this repo are **fake demo values** (`300xxxx`,
 > `DEMOnn`). Real reservation numbers, scan output, captured pages, session cookies and the
 > local database are git-ignored by design, and a pre-commit hook blocks them from being
 > committed by accident. See [`SECURITY.md`](SECURITY.md).
@@ -241,6 +241,35 @@ Full policy, plus the incident record that produced these rules:
 ---
 
 ## What's New
+
+### Scan watchdog — a third eye on a running scan
+
+[`scan_watchdog.py`](platform/scan_watchdog.py) watches a scan *while it runs* rather than
+reporting after the fact, which matters when a run takes hours. Monitors cover session
+health, error streaks, slowdown, status mix, structure drift, feature-capture coverage,
+cancellations and advisories.
+
+### GoCCL: the review invoice and fare-type scoring
+
+- [`core/goccl_review.py`](platform/core/goccl_review.py) — the `/review` invoice is the only
+  *confirmed* price Carnival exposes, reached on the safe path ("Keep Same Stateroom", never
+  selecting a different cabin).
+- [`core/goccl_fare_types.py`](platform/core/goccl_fare_types.py) — ranks fare types by what a
+  cheaper rate actually costs the customer, feeding the 1–5 confidence score, so a headline
+  discount with restrictive terms can't outrank a genuinely better fare.
+
+### MSC extras and per-scan feature capture
+
+- [`core/msc_booking_extras.py`](platform/core/msc_booking_extras.py) — parses perks, shipboard
+  credit and applied discounts from the bottom of the booking page, where MSC actually puts them.
+- [`core/booking_features.py`](platform/core/booking_features.py) — captures the factors that
+  move a cruise price on every scan, across all lines, as groundwork for prediction.
+
+### Reliability fixes
+
+ESPRESSO auto-logout and SSO-race handling, session recovery, cancelled-booking detection,
+currency-aware paid-in-full, and a GUI Start re-entrancy guard (a second Start click during a
+modal could destroy the running batch).
 
 ### NCL headless toggle — and why only NCL
 

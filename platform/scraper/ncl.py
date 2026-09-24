@@ -1454,6 +1454,35 @@ class NclScraper(BaseScraper):
             # and failed. Nothing but a logging argument was wrong - the
             # calculation itself was fine - but it aborted the whole scrape
             # before any result could be produced.
+            # FAIL SAFE WHEN THE PAYMENT PANEL COULD NOT BE READ.
+            #
+            # Added 2026-09-22 alongside the ESPRESSO fix for booking
+            # 3001001, because NCL had the SAME SHAPE of hole. If
+            # _read_payment_state raises or comes back empty, `payment` is
+            # {} and every figure below is None - so cruise_line_fully_paid
+            # evaluates False, not "unknown", and the scan carries on to
+            # report a saving on a booking whose balance was never seen.
+            # The comment above already said "the values simply become
+            # unknown"; nothing acted on it.
+            #
+            # An unreadable payment panel is not evidence of an outstanding
+            # balance. A saving on a settled booking is worse than no saving.
+            payment_state_readable = any(
+                v is not None for v in (amount_due, net_due, com_due, invoice_total))
+            if not payment_state_readable:
+                logger.warning(
+                    "ncl.payment_state_unreadable", booking_id=booking_id,
+                    msg="no payment figures could be read - refusing to report "
+                        "a saving for a booking whose balance is unknown",
+                )
+                self.log_action("payment_state_unreadable", booking_id=booking_id)
+                return make_error_result(
+                    booking_id, current_category, CruiseLine.NCL,
+                    "payment panel unreadable — cannot confirm whether this "
+                    "booking is paid in full, so no saving is reported. Check "
+                    "the reservation by hand.",
+                )
+
             cruise_line_fully_paid = net_due is not None and net_due <= 0.01
             balance_is_all_commission = (
                 amount_due is not None and com_due is not None

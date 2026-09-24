@@ -30,6 +30,8 @@ from core.calculator import (
     calculate_espresso,
     find_upgrade_candidates,
     is_paid_in_full,
+    make_cancelled_result,
+    make_error_result,
     make_no_price_change_result,
     make_paid_in_full_result,
     make_skip_reprice_result,
@@ -40,7 +42,7 @@ from core.models import BookingResult, BookingStatus, CruiseLine
 from utils.logging import get_logger
 from utils.retry import retry_async
 
-from .base import BaseScraper
+from .base import BaseScraper, _Stopwatch
 
 logger = get_logger(__name__)
 
@@ -54,22 +56,143 @@ def _is_template_placeholder(value: str) -> bool:
     return bool(_TEMPLATE_PLACEHOLDER_RE.match(value.strip()))
 
 
-_DUAL_RATE_COLUMN_NOTE = (
-    " [NOTE: this booking has a second rate-program column (c3) on the "
-    "categories table that was captured but NOT evaluated — verify by hand "
-    "whether it shows a lower price than the one used here]"
-)
+_RATE_CELL_PRICE_RE = re.compile(r"([\d,]+\.\d{2})")
+
+
+def _cell_price(cells: list | None) -> float | None:
+    """Last money-looking figure in a row's cells for one rate column.
+
+    Read from the RIGHT: a cell can carry a trailing extra like
+    "4,268.50175 OBC", where the fare is the first figure and the OBC rides
+    behind it in the same cell, so the regex takes whole ``nnn.nn`` groups
+    and the price is the last complete one before any suffix.
+    """
+    for cell in reversed(cells or []):
+        matches = _RATE_CELL_PRICE_RE.findall(str(cell))
+        if matches:
+            return float(matches[0].replace(",", ""))
+    return None
+
+
+def summarize_rate_columns(market_data: dict | None) -> dict:
+    """Compare the two rate-program columns row by row.
+
+    REWRITTEN 2026-09-18, replacing a note that said c3 was "captured but
+    NOT evaluated". That caveat was written when no live evidence existed.
+    It does now: 60 captures in market_data carry both columns, and they
+    say two different things depending on the booking type.
+
+      INDIVIDUAL  (41 bookings, 1,602 rows priced in both columns)
+        "Best Rate" (c2) and "Best Value" (c3) were IDENTICAL in every
+        single row - zero divergence. Reading only c2 lost nothing.
+
+      GROUP       (19 bookings, 730 rows)
+        "Group Allocation" (c2) was EMPTY on 677 of 730 rows - 93%. Every
+        price sat in "Group Prevailing" (c3). Of the 53 rows priced in
+        both, 48 differed and c3 was the cheaper side 16 times, by up to
+        $776.00 (booking 3001006, category I2).
+
+    So c3 is not a curiosity - on group bookings it is where the prices
+    live, and a scraper reading only c2 was reading a blank column.
+
+    Returns counts and the best c3 undercut. It does NOT pick a column:
+    moving between rate programs is a scope change (see core.price_scope),
+    and whether a booking may actually move from Allocation to Prevailing
+    is a commercial question this scraper has no evidence for. It reports.
+    """
+    summary = {
+        "dual": False, "c2_label": None, "c3_label": None,
+        "c2_code": None, "c3_code": None,
+        "rows": 0, "c2_priced": 0, "c3_priced": 0,
+        "only_c3": 0, "c3_cheaper": 0, "c2_cheaper": 0,
+        "best_c3_gain": None,
+    }
+    if not market_data or not market_data.get("dualRateColumns"):
+        return summary
+    summary["dual"] = True
+    summary["c2_label"] = market_data.get("c2Label")
+    summary["c3_label"] = market_data.get("c3Label")
+
+    for row in market_data.get("rows") or []:
+        cols = {c.get("column"): c for c in (row.get("columns") or []) if c}
+        c2, c3 = cols.get("c2"), cols.get("c3")
+        # Fall back to the raw cell lists for captures taken before
+        # `columns` existed, so historical rows still summarise.
+        p2 = _cell_price(c2["cells"] if c2 else row.get("c2Cells"))
+        p3 = _cell_price(c3["cells"] if c3 else row.get("c3Cells"))
+        if c2 and c2.get("requestedCode"):
+            summary["c2_code"] = c2["requestedCode"]
+        if c3 and c3.get("requestedCode"):
+            summary["c3_code"] = c3["requestedCode"]
+
+        summary["rows"] += 1
+        summary["c2_priced"] += p2 is not None
+        summary["c3_priced"] += p3 is not None
+        if p2 is None and p3 is not None:
+            summary["only_c3"] += 1
+        elif p2 is not None and p3 is not None and abs(p2 - p3) > 0.005:
+            if p3 < p2:
+                summary["c3_cheaper"] += 1
+                gain = p2 - p3
+                best = summary["best_c3_gain"]
+                if best is None or gain > best["gain"]:
+                    summary["best_c3_gain"] = {
+                        "category": row.get("category"),
+                        "c2_price": p2, "c3_price": p3, "gain": round(gain, 2),
+                    }
+            else:
+                summary["c2_cheaper"] += 1
+    return summary
 
 
 def _append_dual_rate_note(note: str, market_data: dict | None) -> str:
     """Extracted as a pure function (2026-08-13, Phase 0 correctness audit)
     so the dual-rate-column visibility fix is directly unit-testable.
-    See check_booking's own comment for why this only appends a note
-    rather than comparing c2/c3 prices — no live evidence exists for what
-    c3 actually means, so guessing at it is deliberately avoided."""
-    if market_data and market_data.get("dualRateColumns"):
-        return note + _DUAL_RATE_COLUMN_NOTE
-    return note
+
+    Still a note rather than an automatic column switch - see
+    summarize_rate_columns for why - but the note now states what THIS
+    booking's second column actually contains instead of a blanket
+    "not evaluated" on every dual-column booking alike.
+    """
+    s = summarize_rate_columns(market_data)
+    if not s["dual"]:
+        return note
+
+    c3_name = s["c3_label"] or s["c3_code"] or "second rate program"
+    c2_name = s["c2_label"] or s["c2_code"] or "the column used here"
+
+    if s["only_c3"] and s["c2_priced"] == 0:
+        return note + (
+            f" [RATE COLUMNS: '{c2_name}' is EMPTY on this booking — all "
+            f"{s['only_c3']} priced categories are quoted under '{c3_name}' "
+            f"only. The price used here comes from a column with no "
+            f"quotes; check '{c3_name}' by hand]"
+        )
+    if s["only_c3"]:
+        detail = (
+            f" [RATE COLUMNS: {s['only_c3']} of {s['rows']} categories are "
+            f"priced ONLY under '{c3_name}', not under '{c2_name}'"
+        )
+    elif s["c3_cheaper"] or s["c2_cheaper"]:
+        detail = (
+            f" [RATE COLUMNS: '{c3_name}' differs from '{c2_name}' on this "
+            f"booking"
+        )
+    else:
+        return note + (
+            f" [RATE COLUMNS: '{c3_name}' quotes the same price as "
+            f"'{c2_name}' on all {s['c2_priced']} priced categories — no "
+            f"second-column opportunity]"
+        )
+
+    if s["best_c3_gain"]:
+        g = s["best_c3_gain"]
+        detail += (
+            f"; cheapest undercut is category {g['category']} at "
+            f"{g['c3_price']:,.2f} vs {g['c2_price']:,.2f} "
+            f"(-{g['gain']:,.2f})"
+        )
+    return note + detail + ". Verify by hand — switching rate program is not automatic]"
 
 
 class EspressoScraper(BaseScraper):
@@ -184,12 +307,45 @@ class EspressoScraper(BaseScraper):
                         pass_field=found.get("passId"),
                         has_submit=found.get("hasSubmit"))
 
-            await self.page.fill('[data-ch-login="user"]', username)
-            await self.page.fill('[data-ch-login="pass"]', password)
+            # FILL VIA LOCATORS, NOT VIA THE MARKS ABOVE.
+            #
+            # CONFIRMED BUG, fixed 2026-09-22 from the first log file this
+            # project has ever had. Neon: "check login and then when i press
+            # start the page refreshes and i need to log in again", still
+            # happening after the auto-logout fix. The log showed exactly
+            # why, twice in the same second:
+            #
+            #   14:36:24 espresso.auto_login_form_found
+            #            user_field=mantine-d8ke1v2g9 pass_field=mantine-ytoafz0pi
+            #   14:36:54 espresso.auto_login_failed
+            #            Page.fill: Timeout 30000ms exceeded
+            #            waiting for locator("[data-ch-login=\\"user\\"]")
+            #
+            # The discovery JS above FOUND the fields and stamped them with
+            # data-ch-login - and then a SEPARATE page.fill call could not
+            # find the stamp. Those ids are the tell: "mantine-d8ke1v2g9" is
+            # generated fresh on every render, so this is a React/Mantine
+            # form that re-renders between the two calls and throws away the
+            # attribute along with the node it was on.
+            #
+            # So auto-login has never worked: it burned 30 seconds per
+            # attempt and always ended in a manual login. Playwright
+            # locators re-resolve at action time, which is exactly what a
+            # re-rendering form needs - the marks are kept only as the
+            # diagnostic they always really were.
+            pass_box = self.page.locator("input[type='password']:visible").first
+            user_box = self.page.locator(
+                "input[type='text']:visible, input[type='email']:visible, "
+                "input:not([type]):visible").first
+
+            await user_box.fill(username, timeout=10000)
+            await pass_box.fill(password, timeout=10000)
             if found.get("hasSubmit"):
-                await self.page.click('[data-ch-login="submit"]')
+                submit = self.page.locator(
+                    "input[type='submit']:visible, button[type='submit']:visible").first
+                await submit.click(timeout=10000)
             else:
-                await self.page.press('[data-ch-login="pass"]', "Enter")
+                await pass_box.press("Enter")
 
             # Short settle only. Anything longer would be waiting on MFA,
             # which is the human's job - blocking here would look like a
@@ -209,6 +365,164 @@ class EspressoScraper(BaseScraper):
         except Exception as exc:
             logger.warning("espresso.auto_login_failed", error=str(exc)[:200])
             return f"ERROR: {exc}"[:200]
+
+    # Keys core.booking_features wants from the booking page. Read IN THE
+    # PAGE and returned as a ~200-byte dict.
+    _FEATURE_KEYS = ("sailDate", "sailingDate", "shipCode", "shipName",
+                     "currency", "stateroomType")
+
+    async def read_feature_fields(self) -> dict:
+        """The price-driver fields, without serialising the whole DOM.
+
+        PERFORMANCE FIX, 2026-09-21. Feature capture was added earlier the
+        same day by calling `page.content()` and regexing the result - which
+        pulls the ENTIRE page over CDP. Real ESPRESSO booking pages average
+        422 KB, and the scan already does that twice per booking for the two
+        page snapshots, so this made it three times: ~1.27 MB serialised per
+        booking, ~630 MB across a 500-booking watchlist, for six short
+        strings.
+
+        This runs a regex over the page's own inline scripts INSIDE the
+        browser and returns only the matches. Same source, same values,
+        about 200 bytes on the wire.
+
+        Never raises: a feature is a nice-to-have, a booking result is not.
+        """
+        try:
+            return await self.page.evaluate(
+                r"""(keys) => {
+                    // SCRIPTS ONLY, not the whole DOM. These values live in
+                    // the page's inline Angular bootstrap, and
+                    // document.documentElement.innerHTML SERIALISES THE
+                    // ENTIRE DOCUMENT to find them - ~108 KB on a real
+                    // booking page, rebuilt once per booking. The script
+                    // nodes' textContent is the same source without the
+                    // serialisation, and the loop stops as soon as every
+                    // key is found.
+                    const out = {};
+                    const want = keys.slice();
+                    const scripts = document.querySelectorAll('script');
+                    for (const s of scripts) {
+                        const text = s.textContent;
+                        if (!text || text.length < 32) continue;
+                        for (let i = want.length - 1; i >= 0; i--) {
+                            const k = want[i];
+                            const m = text.match(
+                                new RegExp('"' + k + '"\s*:\s*"([^"]{1,60})"'));
+                            if (m) { out[k] = m[1]; want.splice(i, 1); }
+                        }
+                        if (!want.length) break;
+                    }
+                    return out;
+                }""",
+                list(self._FEATURE_KEYS),
+            )
+        except Exception as exc:
+            logger.debug("espresso.feature_fields_failed", error=str(exc)[:200])
+            return {}
+
+    # ESPRESSO'S OWN AUTO-LOGOUT, found 2026-09-21 in a live failure capture
+    # from Neon's running scan and then confirmed in 50 occurrences across
+    # 25 captured pages - it is armed on EVERY page load:
+    #
+    #     setTimeout(function(){
+    #         window.location.href = window.Base.flowExecutionURL
+    #                              + "&_eventId=logout"
+    #     }, 1830000);
+    #
+    # 1,830,000 ms = 30.5 minutes. The BROWSER signs itself out. Every
+    # navigation re-arms it, so an active scan keeps resetting it - but a
+    # session that sits idle does not, which is exactly the reported
+    # sequence: "Check login" succeeds, the operator does something else for
+    # half an hour, presses Start, and is sent back to a login screen they
+    # had already completed. Nothing in this project reset it, because
+    # nothing knew it existed.
+    ESPRESSO_AUTO_LOGOUT_MS = 1_830_000
+    #: Re-touch the portal well inside that window. 20 minutes leaves 10
+    #: minutes of headroom for a slow page or a paused scan.
+    SESSION_KEEPALIVE_SECONDS = 20 * 60
+
+    async def keep_session_alive(self, force: bool = False) -> bool:
+        """Re-arm ESPRESSO's auto-logout timer if the session has gone idle.
+
+        Returns True if a refresh was performed. Cheap: one navigation, and
+        only when the page has been sitting longer than
+        SESSION_KEEPALIVE_SECONDS. Never raises - a failed keepalive must
+        not take down a scan that might still be perfectly fine.
+        """
+        last = getattr(self, "_last_navigation_at", None)
+        idle = time.monotonic() - last if last is not None else None
+        if not force and (idle is None or idle < self.SESSION_KEEPALIVE_SECONDS):
+            return False
+        try:
+            logger.info("espresso.session_keepalive",
+                        idle_seconds=int(idle) if idle is not None else None,
+                        auto_logout_seconds=self.ESPRESSO_AUTO_LOGOUT_MS // 1000)
+            await self.navigate(settings.espresso_home_url)
+            self._last_navigation_at = time.monotonic()
+            return True
+        except Exception as exc:
+            logger.warning("espresso.session_keepalive_failed",
+                           error=str(exc)[:200])
+            return False
+
+    async def _adopt_authenticated_tab(self) -> bool:
+        """If the live session ended up in ANOTHER TAB, move to it.
+
+        HYPOTHESIS UNDER TEST, added 2026-09-21. Neon: "i press in logg in
+        yes it does logg in however when i press on start the pages
+        refreshes and then i need to log in again", still happening after
+        the SSO-race fix.
+
+        Nothing in this project has ever tracked more than one tab:
+        BaseScraper.start does a single `context.new_page()` and there is no
+        `context.on("page")` handler anywhere. GoCCL turned out to open its
+        booking engine in a second window (target="_blank"), so the pattern
+        is real on these portals - and if ESPRESSO's OAuth round-trip ever
+        lands the authenticated session in a new tab, `self.page` keeps
+        pointing at the ORIGINAL one, which still shows the login form.
+        _check_login then reports "not logged in" about a session the human
+        can plainly see working, and Start sends them back to log in again.
+
+        NOT YET CONFIRMED against a live ESPRESSO login - it explains every
+        symptom, including why it strikes only sometimes, but the proof
+        needs a watched session. It is implemented anyway because it can
+        only ever help: it is reached solely on the paths that were about to
+        return False, and it adopts a tab ONLY if that tab is genuinely on
+        ESPRESSO with no login form. Nothing is adopted speculatively.
+        """
+        try:
+            context = self.page.context
+        except Exception:
+            return False
+
+        for candidate in list(getattr(context, "pages", []) or []):
+            if candidate is self.page or candidate.is_closed():
+                continue
+            try:
+                url = (candidate.url or "").lower()
+                if "cruisingpower.com" not in url:
+                    continue
+                from urllib.parse import urlsplit
+
+                parts = urlsplit(url)
+                if parts.netloc.startswith(self._AUTH_HOST_PREFIXES) or any(
+                    seg in parts.path for seg in self._AUTH_PATH_SEGMENTS
+                ):
+                    continue
+                if await candidate.locator("input[type='password']").count() > 0:
+                    continue
+            except Exception:
+                continue
+
+            logger.warning(
+                "login.adopted_other_tab",
+                was=(self.page.url or "")[:120], now=(candidate.url or "")[:120],
+                msg="the authenticated session was in a different tab",
+            )
+            self._page = candidate
+            return True
+        return False
 
     async def _check_login(self) -> bool:
         """Whether we are really authenticated on the page we are on now.
@@ -249,12 +563,55 @@ class EspressoScraper(BaseScraper):
         if host.startswith(self._AUTH_HOST_PREFIXES) or any(
             seg in path for seg in self._AUTH_PATH_SEGMENTS
         ):
-            logger.warning(
-                "login.required", url=url,
-                msg="on an auth/SSO page - please log into ESPRESSO",
-            )
-            return False
+            # AN SSO HOP IS NOT A LOGOUT. Fixed 2026-09-18. Neon: "i press
+            # in logg in yes it does logg in however when i press on start
+            # the pages refreshes and then i need to log in again".
+            #
+            # ESPRESSO authenticates through an OAuth round-trip -
+            # `auth.cruisingpower.com` - and `auth.` is the first entry in
+            # _AUTH_HOST_PREFIXES. check_booking navigates to /home and calls
+            # this IMMEDIATELY afterwards, so when the sample lands mid-hop
+            # the caller is told "Not logged in" and the operator is sent
+            # back to a login screen they had just completed.
+            #
+            # That is a RACE, which is why it struck only sometimes and why
+            # logging in again always "fixed" it - the second attempt simply
+            # happened to sample after the redirect settled.
+            #
+            # So give the chain a moment to land before judging. A genuine
+            # logout STAYS on the auth page and still returns False; all this
+            # costs in that case is a few seconds, against a login loop.
+            settled_url = url
+            for _ in range(8):
+                try:
+                    await self.page.wait_for_load_state(
+                        "domcontentloaded", timeout=1500)
+                except Exception:
+                    pass
+                settled_url = (self.page.url or "").lower()
+                settled = urlsplit(settled_url)
+                still_auth = settled.netloc.startswith(self._AUTH_HOST_PREFIXES) or any(
+                    seg in settled.path for seg in self._AUTH_PATH_SEGMENTS
+                )
+                if not still_auth:
+                    logger.info(
+                        "login.sso_hop_settled", was=url, now=settled_url,
+                        msg="transient SSO redirect, not a logout",
+                    )
+                    url, parts = settled_url, settled
+                    host, path = parts.netloc, parts.path
+                    break
+            else:
+                if await self._adopt_authenticated_tab():
+                    return True
+                logger.warning(
+                    "login.required", url=settled_url,
+                    msg="still on an auth/SSO page after waiting - please log into ESPRESSO",
+                )
+                return False
         if "cruisingpower.com" not in url:
+            if await self._adopt_authenticated_tab():
+                return True
             logger.warning("login.required", url=url, msg="not on ESPRESSO at all")
             return False
         try:
@@ -263,6 +620,43 @@ class EspressoScraper(BaseScraper):
             # probe failure must not be read as "logged out" (that would
             # refuse a perfectly good session).
             if await self.page.locator("input[type='password']").count() > 0:
+                # A LOGIN FORM MID-HYDRATION IS NOT A LOGOUT. Fixed
+                # 2026-09-22 from the live log. Neon: "i still get this
+                # page however it is checking bookings normally which is
+                # weird i feel it is login in and out".
+                #
+                # Exactly that, captured at 17:39:31 on booking 299 of 721:
+                #
+                #   17:39:30 espresso.navigate_home  booking 3001004
+                #   17:39:31 login.required "password field present"
+                #   17:39:31 Attempt 1/3 failed: Not logged in - retry in 3s
+                #   17:39:34 espresso.navigate_home  (retry)
+                #   17:39:38 browser.navigate_recovered
+                #
+                # /home renders a login form for a moment while it
+                # bootstraps, this sampled it at that instant, and the retry
+                # three seconds later sailed through - so the operator sees
+                # the login page flash while the scan carries on.
+                #
+                # The SSO-host branch above already waits for the page to
+                # settle; this branch returned False immediately. Same race,
+                # same treatment. A GENUINE logout still keeps its form for
+                # the whole window and still returns False - the only cost
+                # is a few seconds on a booking that was going to fail
+                # anyway, against a needless retry plus two navigations
+                # every time it struck.
+                for _ in range(6):                      # ~6s
+                    await asyncio.sleep(1.0)
+                    try:
+                        if await self.page.locator(
+                                "input[type='password']").count() == 0:
+                            logger.info(
+                                "login.password_form_settled", url=url,
+                                msg="transient login form during page "
+                                    "bootstrap, not a logout")
+                            return True
+                    except Exception:
+                        pass
                 logger.warning(
                     "login.required", url=url,
                     msg="password field present - login form still showing",
@@ -395,12 +789,40 @@ class EspressoScraper(BaseScraper):
         """)
         return result
 
+    # CURRENCY-AGNOSTIC, fixed 2026-09-22. Neon: booking 3001001 "was paid
+    # in full and the project did not detect it".
+    #
+    # That booking is CANADIAN. These patterns required the literal "(USD)",
+    # so on a CAD reservation every field came back None - and the earlier
+    # note here argued that was CORRECT, because refusing to parse beats
+    # parsing a foreign amount as a USD one. The refusal was right; what
+    # happened next was not. is_paid_in_full(None, ...) returns False, the
+    # scan read that as "not paid in full" rather than "unknown", and
+    # reported a $400 optimization on a reservation with 2 cents outstanding
+    # (Total Price (CAD) 2,109.00, Payments Received (CAD) 2,108.98).
+    #
+    # 11 of 120 sampled ESPRESSO booking pages are CAD - roughly 9% of the
+    # watchlist had NO payment gate at all. The amount FORMAT is identical
+    # across currencies; only the label differs, and the code is captured
+    # separately by _CURRENCY_LABEL_RE, so accepting any ISO code loses
+    # nothing and closes the hole.
     _PAYMENT_FIELD_PATTERNS = {
-        "total_price": re.compile(r"Total Price \(USD\):\s*(-?[\d,]+\.?\d*)", re.IGNORECASE),
-        "deposit": re.compile(r"Deposit \(USD\):\s*(-?[\d,]+\.?\d*)", re.IGNORECASE),
-        "payments_received": re.compile(r"Payments Received \(USD\):\s*(-?[\d,]+\.?\d*)", re.IGNORECASE),
-        "final_payment_due": re.compile(r"Final Payment Due \(USD\):\s*(-?[\d,]+\.?\d*)", re.IGNORECASE),
+        "total_price": re.compile(r"Total Price \([A-Z]{3}\):\s*(-?[\d,]+\.?\d*)", re.IGNORECASE),
+        "deposit": re.compile(r"Deposit \([A-Z]{3}\):\s*(-?[\d,]+\.?\d*)", re.IGNORECASE),
+        "payments_received": re.compile(r"Payments Received \([A-Z]{3}\):\s*(-?[\d,]+\.?\d*)", re.IGNORECASE),
+        "final_payment_due": re.compile(r"Final Payment Due \([A-Z]{3}\):\s*(-?[\d,]+\.?\d*)", re.IGNORECASE),
     }
+
+    # The outstanding amount also appears under its OWN label, separate from
+    # the "Final Payment Due (XXX):" line, which on the current layout is
+    # followed by a DATE rather than a figure:
+    #
+    #   Final Payment Due (CAD):  Due: 10JUL2026
+    #   Final Payment:            0.02
+    #
+    # Used as a fallback so the gate survives either layout.
+    _FINAL_PAYMENT_AMOUNT_RE = re.compile(
+        r"Final Payment:\s*(-?[\d,]+\.?\d*)", re.IGNORECASE)
 
     # ADDED 2026-08-13 (Phase 0 correctness audit): the amount patterns
     # above are deliberately UNCHANGED (still require the literal "(USD)"
@@ -418,6 +840,59 @@ class EspressoScraper(BaseScraper):
         re.IGNORECASE,
     )
 
+    async def is_cancelled(self) -> bool:
+        """Is this reservation CANCELLED?
+
+        VIP RULE, added 2026-09-22 at Neon's explicit instruction: "IF THE
+        SCANNER OR SCRIPT CATCHES THIS IT MEANS THAT THE BOOKING IS CANCELED
+        AND IT IS VERY MADNATORY TO REPORT IT AS IT SOMETHING VERY
+        CRITICAL".
+
+        ESPRESSO marks it with sb.reservation.status == 'CX' and renders
+        "N/A" wherever a price would go:
+
+            <span ng-show="'CX' == sb.reservation.status">{{labels.NA}}</span>
+
+        WHY THIS CANNOT BE A TEXT OR MARKUP MATCH. That span is in EVERY
+        booking page - it is an Angular template, present whether or not the
+        booking is cancelled, and Angular simply hides it when the status is
+        something else. The page also carries the opposite guard
+        ("'CX' != sb.reservation.status") on each price link. So the only
+        honest signal is the RUNTIME one: is such a span actually VISIBLE.
+
+        WHY IT MATTERS SO MUCH. A cancelled booking's payment panel still
+        reads Total Price 0.00 and Final Payment Due 0.00 - and
+        is_paid_in_full(0.00, 0.00) is True. Booking 3001005 was therefore
+        reported as "Fully paid - repricing unavailable" on 15, 16, 21 and
+        22 September. 87 stored results across 27 distinct bookings carry
+        that same zero-total signature.
+
+        Returns False when it cannot tell. A false CANCELLED would hide a
+        live booking from the watchlist, so this errs toward saying nothing
+        - the payment-readability guard downstream still refuses to invent a
+        saving from an unreadable panel.
+        """
+        try:
+            return bool(await self.page.evaluate(
+                r"""() => {
+                    const nodes = document.querySelectorAll('[ng-show]');
+                    for (const el of nodes) {
+                        const cond = el.getAttribute('ng-show') || '';
+                        // the POSITIVE guard only: "'CX' == ...status".
+                        // The negative one ("'CX' != ...") is on every
+                        // price link of a perfectly healthy booking.
+                        if (!/'CX'\s*==\s*sb\.reservation\.status/.test(cond)) continue;
+                        // Angular hides via ng-hide; offsetParent covers
+                        // display:none on the node or any ancestor.
+                        if (el.offsetParent !== null &&
+                            !el.classList.contains('ng-hide')) return true;
+                    }
+                    return false;
+                }"""))
+        except Exception as exc:
+            logger.debug("espresso.cancel_probe_failed", error=str(exc)[:200])
+            return False
+
     async def _read_payment_status(self) -> dict:
         """Reads Total Price / Deposit / Payments Received / Final Payment
         Due directly from the Reservation Summary page's plain body text.
@@ -434,8 +909,22 @@ class EspressoScraper(BaseScraper):
         for key, pattern in self._PAYMENT_FIELD_PATTERNS.items():
             m = pattern.search(body_text)
             values[key] = float(m.group(1).replace(",", "")) if m else None
+        # Fallback for the layout where "Final Payment Due (XXX):" carries a
+        # date and the figure sits under its own "Final Payment:" label.
+        if values.get("final_payment_due") is None:
+            m = self._FINAL_PAYMENT_AMOUNT_RE.search(body_text)
+            if m:
+                values["final_payment_due"] = float(m.group(1).replace(",", ""))
+                values["final_payment_due_source"] = "final_payment_label"
+
         currency_match = self._CURRENCY_LABEL_RE.search(body_text)
         values["currency"] = currency_match.group(1).upper() if currency_match else None
+        # Whether the payment panel was readable AT ALL. The caller must be
+        # able to tell "this booking owes nothing" from "we could not see
+        # what it owes" - conflating them is what produced the false $400.
+        values["payment_state_readable"] = any(
+            values.get(k) is not None
+            for k in ("total_price", "payments_received", "final_payment_due"))
         return values
 
     async def _click_categories(self) -> None:
@@ -484,6 +973,33 @@ class EspressoScraper(BaseScraper):
                                    || row.querySelector('input[type="radio"]');
                         const c2Cells = Array.from(row.querySelectorAll('td.c2:not(.clearCell)')).map(td => td.textContent.trim());
                         const c3Cells = Array.from(row.querySelectorAll('td.c3:not(.clearCell)')).map(td => td.textContent.trim());
+                        // BOTH rate-program radios, not just the left one.
+                        // Verified 2026-09-18 against the saved categories
+                        // pages: every row carries TWO rbCategorySelection
+                        // radios, data-columnindex="0" (c2) and "1" (c3),
+                        // each with its own data-id/value and a
+                        // data-requestedcode naming the rate program -
+                        // INDIVIDUAL-BESTRATE / INDIVIDUAL-BVL /
+                        // GROUP_ALLOCATION-BESTRATE / GROUP_PREVAILING-BESTRATE.
+                        // The program therefore never has to be inferred from
+                        // the header label; the row states it.
+                        const allRadios = Array.from(row.querySelectorAll('input[name="rbCategorySelection"]'));
+                        const describe = (idx, cells) => {{
+                            const el = allRadios.find(
+                                r => r.getAttribute('data-columnindex') === String(idx)) || null;
+                            if (!el && !(cells || []).some(t => t)) return null;
+                            return {{
+                                columnIndex: idx,
+                                column: idx === 0 ? 'c2' : 'c3',
+                                dataId: el?.getAttribute('data-id') || null,
+                                radioValue: el?.value || null,
+                                radioChecked: Boolean(el?.checked),
+                                requestedCode: el?.getAttribute('data-requestedcode') || null,
+                                selectable: Boolean(el) && !el.disabled,
+                                cells: cells || [],
+                            }};
+                        }};
+                        const columns = [describe(0, c2Cells), describe(1, c3Cells)].filter(Boolean);
                         rows.push({{
                             category,
                             status,
@@ -493,6 +1009,7 @@ class EspressoScraper(BaseScraper):
                             rowText: row.innerText.trim(),
                             c2Cells,
                             c3Cells,
+                            columns,
                         }});
                     }}
                 }}
@@ -673,18 +1190,81 @@ class EspressoScraper(BaseScraper):
             link = self.page.locator("#ignoreReservationLink")
             if await link.count() > 0:
                 await link.first.click()
-                confirm = self.page.locator("#acceptIgnoreReservation")
+
+                # THE CONFIRM STEP IS NOT OPTIONAL. Neon 2026-09-18: "the
+                # script is not pressong on exit i have to press it
+                # manually", and supplied the real element:
+                #
+                #   <input type="button" id="acceptIgnoreReservation"
+                #          class="submit" value="Exit">
+                #
+                # The previous version waited 4s for it and, on timeout,
+                # silently continued past it on the theory that "some flows
+                # exit without the confirm step" - then logged
+                # booking_released and returned True regardless. So a dialog
+                # that took longer than 4s to draw was left sitting open,
+                # the reservation stayed locked, and the log claimed success.
+                # A human then had to press Exit by hand. That "pass" was
+                # doing the opposite of what it promised.
+                #
+                # Now: wait properly, click, and VERIFY the dialog actually
+                # went away - and if it is still there, say so instead of
+                # reporting a release that did not happen.
+                # THE PAGE SHIPS TWO OF THESE. Confirmed 2026-09-18 across
+                # every captured categories page: the whole Exit dialog is
+                # duplicated, so there are TWO elements with
+                # id="acceptIgnoreReservation", each inside its own
+                #   <div id="ignoreReservationPopup" style="display: none;">
+                # Duplicate ids are invalid HTML, but the portal does it
+                # anyway, and clicking the Exit link reveals only one of them.
+                #
+                # `.first` therefore had a 50/50 chance of targeting a node
+                # that stays hidden forever - the wait times out, the click
+                # lands on nothing, and the dialog is left open for a human
+                # to dismiss. Selecting on VISIBILITY rather than document
+                # order is what actually makes this deterministic.
+                confirm = self.page.locator("#acceptIgnoreReservation").locator(
+                    "visible=true")
+                clicked = False
                 try:
-                    await confirm.first.wait_for(state="visible", timeout=4000)
-                    await confirm.first.click()
+                    await confirm.first.wait_for(state="visible", timeout=15000)
+                    await confirm.first.click(timeout=5000)
+                    clicked = True
                 except Exception:
-                    # Some flows exit without the confirm step.
-                    pass
+                    # A real overlay can swallow a synthetic click; the
+                    # element's own handler still works when invoked
+                    # directly. Only attempted when the control is actually
+                    # present - never as a way to force a missing one.
+                    try:
+                        if await confirm.count() > 0:
+                            await confirm.first.evaluate("el => el.click()")
+                            clicked = True
+                    except Exception:
+                        pass
+
                 await self.page.wait_for_load_state("domcontentloaded", timeout=10000)
+
+                # Still showing the confirm dialog? Then nothing was released.
+                try:
+                    still_open = (await confirm.count() > 0
+                                  and await confirm.first.is_visible())
+                except Exception:
+                    still_open = False
+                if still_open:
+                    logger.warning(
+                        "espresso.booking_release_unconfirmed",
+                        booking_id=booking_id,
+                        reason="Exit dialog still open after clicking "
+                               "#acceptIgnoreReservation",
+                    )
+                    self.log_action("release_booking_unconfirmed",
+                                    booking_id=booking_id)
+                    return False
+
                 logger.info("espresso.booking_released", booking_id=booking_id,
-                            via="ignoreReservationLink")
+                            via="ignoreReservationLink", confirmed=clicked)
                 self.log_action("release_booking", booking_id=booking_id,
-                                via="ignoreReservationLink")
+                                via="ignoreReservationLink", confirmed=clicked)
                 return True
 
             # 2) Fallback: the navigation the page's own handler performs.
@@ -741,17 +1321,34 @@ class EspressoScraper(BaseScraper):
             # reservations.do skips whatever session/flow initialization
             # /home does, and appears to be what was causing the forced
             # logouts and desynced execution tokens seen during testing.
+            # Per-stage timings for this booking (see _Stopwatch). ESPRESSO
+            # performs TWO full navigations and TWO login checks here, which
+            # is the most likely reason a long scan feels heavy - but that
+            # was a hypothesis until this measured it. The /home hop is NOT
+            # removed on a guess: its own comment records that skipping it
+            # previously caused forced logouts and desynced execution
+            # tokens, so it stays until the numbers say otherwise.
+            watch = _Stopwatch()
+            self._last_stage_timings = watch
+            # Cleared per booking: a stale value would silently attribute
+            # the PREVIOUS booking's ship and sail date to this one.
+            self.last_feature_fields = None
+
             logger.info("espresso.navigate_home", booking_id=booking_id)
             self.log_action("navigate", booking_id=booking_id, url=settings.espresso_home_url)
             await self.navigate(settings.espresso_home_url)
+            watch.mark("navigate_home")
             if not await self._check_login():
                 raise RuntimeError("Not logged in — please log into ESPRESSO first")
+            watch.mark("check_login_1")
 
             logger.info("espresso.navigate", booking_id=booking_id)
             self.log_action("navigate", booking_id=booking_id, url=settings.espresso_base_url)
             await self.navigate(settings.espresso_base_url)
+            watch.mark("navigate_reservations")
             if not await self._check_login():
                 raise RuntimeError("Not logged in — please log into ESPRESSO first")
+            watch.mark("check_login_2")
 
             # Early-warning structure check (once per session, not once
             # per booking — see check_structure_drift's docstring). Never
@@ -768,6 +1365,7 @@ class EspressoScraper(BaseScraper):
                 await self.dump_failure_snapshot(booking_id, "search_booking_failed", str(e))
                 raise
             await self.dump_page_snapshot(booking_id, "after_search")
+            watch.mark("search")
 
             price_category = await self._read_category()
             logger.info("espresso.category", booking_id=booking_id, category=price_category)
@@ -781,14 +1379,76 @@ class EspressoScraper(BaseScraper):
             # (3000040) was previously slipping through as a false
             # "$77 OPTIMIZATION" because its API response was a normal
             # length, so the old reactive-only paid-status check never ran.
+            watch.mark("read_category")
+            # CANCELLED FIRST - before every pricing gate. A cancelled
+            # booking's payment panel reads Total Price 0.00 / Final Payment
+            # Due 0.00, which is_paid_in_full() accepts, so checking it
+            # later would keep filing cancellations as "fully paid".
+            if await self.is_cancelled():
+                logger.warning("espresso.booking_cancelled", booking_id=booking_id,
+                               msg="reservation status CX - reported as CANCELLED")
+                self.log_action("booking_cancelled", booking_id=booking_id)
+                return {"_cancelled": True}
+
             payment_status = await self._read_payment_status()
             detected_currency = payment_status.get("currency")
+
+            # PRICE-DRIVER FIELDS, CAPTURED HERE - ON THE BOOKING PAGE.
+            #
+            # CONFIRMED BUG, fixed 2026-09-22. These were read from the
+            # batch loop AFTER check_booking returned - but check_booking
+            # ends with release_booking(), which clicks Exit and navigates
+            # away. So the read happened on whatever page came next, and
+            # sail_date came back None even though the booking page plainly
+            # carried it: bookings 3001000 (02JAN2028), 3000073 (27MAR2027)
+            # and 3001002 (05JUN2028) all logged sail_date=None while their
+            # captured pages contained those exact values.
+            #
+            # 11% of today's ESPRESSO rows lost their sail date that way -
+            # silently, because a missing feature is a NULL column, not an
+            # error. Reading it here, while the booking is still on screen,
+            # is the whole fix.
+            try:
+                watch.mark("payment_status")
+                self.last_feature_fields = await self.read_feature_fields()
+            except Exception:
+                self.last_feature_fields = {}
+            watch.mark("feature_fields")
             self.log_action("payment_status", booking_id=booking_id, **payment_status)
             if is_paid_in_full(
                 payment_status.get("final_payment_due"),
                 payment_status.get("total_price") or 0.0,
             ):
                 return {"_paidInFull": True, "oldTotal": payment_status.get("total_price") or 0.0}
+
+            # FAIL SAFE WHEN THE PAYMENT PANEL CANNOT BE READ AT ALL.
+            #
+            # THE BUG THIS CLOSES, 2026-09-22. Booking 3001001 is Canadian.
+            # The field patterns required a literal "(USD)", so every figure
+            # came back None - and is_paid_in_full(None, ...) returns False
+            # by design, because it refuses to guess. The scan then read that
+            # False as "not paid in full" rather than "we do not know", ran
+            # the whole comparison, and reported a $400 OPTIMIZATION on a
+            # reservation with TWO CENTS outstanding (Total Price (CAD)
+            # 2,109.00 against Payments Received (CAD) 2,108.98).
+            #
+            # The patterns are currency-agnostic now, so this specific
+            # booking parses. This guard is for the NEXT cause - a relabelled
+            # panel, a new layout, a currency written some other way. An
+            # unreadable payment state is not evidence of an outstanding
+            # balance, and a saving on a settled booking is worse than no
+            # saving at all.
+            if not payment_status.get("payment_state_readable"):
+                logger.warning(
+                    "espresso.payment_state_unreadable",
+                    booking_id=booking_id,
+                    currency=detected_currency,
+                    msg="no payment figures could be read - refusing to "
+                        "report a saving for a booking whose balance is unknown",
+                )
+                self.log_action("payment_state_unreadable", booking_id=booking_id,
+                                currency=detected_currency)
+                return {"_paymentUnreadable": True}
 
             # Click categories and load the table
             self.log_action("click_categories", booking_id=booking_id)
@@ -895,6 +1555,20 @@ class EspressoScraper(BaseScraper):
             return make_paid_in_full_result(
                 booking_id, price_category, CruiseLine.ESPRESSO, api_result.get("oldTotal", 0),
             )
+        if api_result.get("_cancelled"):
+            return make_cancelled_result(booking_id, price_category, CruiseLine.ESPRESSO)
+        if api_result.get("_paymentUnreadable"):
+            # See the guard in the flow above. An unreadable payment panel
+            # means the balance is UNKNOWN, and an unknown balance must not
+            # become a reported saving - booking 3001001 was settled to
+            # within two cents and was reported as a $400 optimization
+            # because a CAD label did not match a USD-only pattern.
+            return make_error_result(
+                booking_id, price_category, CruiseLine.ESPRESSO,
+                "payment panel unreadable — cannot confirm whether this "
+                "booking is paid in full, so no saving is reported. Check "
+                "the reservation by hand.",
+            )
         if api_result.get("_skipRepriceModal"):
             return make_skip_reprice_result(booking_id, price_category, CruiseLine.ESPRESSO)
         if api_result.get("_noPriceChange"):
@@ -957,8 +1631,16 @@ class EspressoScraper(BaseScraper):
         # every branch above - WLT, paid-in-full, skip-reprice,
         # no-price-change, the calculated result and the upgrade override
         # alike. A booking left retrieved stays locked for 15 minutes.
+        _release_watch = getattr(self, "_last_stage_timings", None)
         await self.release_booking(booking_id)
+        if _release_watch is not None:
+            _release_watch.mark("release_booking")
 
+        watch = getattr(self, "_last_stage_timings", None)
+        if watch is not None:
+            watch.mark("finish")
+            logger.info("espresso.timings", booking_id=booking_id,
+                        total_ms=watch.total_ms, **watch.stages)
         logger.info("espresso.result", booking_id=booking_id, status=result.status.value, net=result.net_saving)
         self.log_action("result", booking_id=booking_id, status=result.status.value, net_saving=result.net_saving)
         return result

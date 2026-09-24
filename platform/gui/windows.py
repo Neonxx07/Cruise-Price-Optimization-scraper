@@ -3,8 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import logging
+import os
+import threading
 import traceback
 import time
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 
@@ -267,6 +271,13 @@ class CruiseLinePanel(QWidget):
         self.msc_service = MscLiveService()
         self.results: list[BookingResult] = []
         self.msc_results: list[MscCheckOutcome] = []
+        # Re-entrancy guard for _bulk_table_update. Depth, not a flag, so a
+        # per-row helper called inside a batch does not restore sorting
+        # early and re-sort the table N times.
+        self._bulk_depth = 0
+        self._bulk_sorted = True
+        # Chromium census cadence - see _refresh_resources.
+        self._CHROME_CENSUS_EVERY = 5
         self._shutting_down = False
         # Which cruise line we have CONFIRMED a successful login for.
         # ADDED 2026-08-26 — see _on_login_check: `has_live_session()` and
@@ -275,6 +286,10 @@ class CruiseLinePanel(QWidget):
         # guard on their own. Set only on a real success, cleared on
         # timeout/failure and whenever the cruise-line selection changes.
         self._login_ok_for: CruiseLine | None = None
+        # Guards _on_start against re-entry. See the comment there: the
+        # Start button is not disabled until well after two modal dialogs,
+        # and a modal spins the Qt event loop inside the asyncio one.
+        self._start_in_progress = False
 
         self._build_ui()
         self._refresh_summary()
@@ -295,7 +310,13 @@ class CruiseLinePanel(QWidget):
         try:
             if self.queue_manager.is_running:
                 self.queue_manager.stop_processing()
-                for _ in range(120):          # up to ~60s
+                # 60s here was longer than the whole app's shutdown budget,
+                # and with panels closing concurrently it no longer needs to
+                # absorb three other tabs' waits. A batch stops after its
+                # CURRENT booking, and a measured ESPRESSO booking is ~30s,
+                # so 35s covers the realistic case; the window-level ceiling
+                # catches anything worse.
+                for _ in range(70):           # up to ~35s
                     if not self.queue_manager.is_running:
                         break
                     await asyncio.sleep(0.5)
@@ -862,6 +883,35 @@ class CruiseLinePanel(QWidget):
     @asyncSlot()
     async def _on_start(self) -> None:
         print("GUI: _on_start entered")
+        # RE-ENTRANCY GUARD, added 2026-09-23 after a real scan was killed
+        # by one. From the overnight run's log:
+        #
+        #   RuntimeError: Cannot enter into task Task-17 <_on_start at :961>
+        #   while another task Task-546 <_on_start at :898> is being executed
+        #   Task was destroyed but it is pending!  <Task-17 ... :961>
+        #
+        # Task-17 was the RUNNING batch; Task-546 was a second _on_start
+        # sitting on the stale-modules QMessageBox at line 898. A modal
+        # spins the Qt event loop nested inside the asyncio loop, so while
+        # it is up qasync cannot wake the batch task - and the batch task
+        # was then destroyed outright, mid-scan.
+        #
+        # The existing protection is start_button.setEnabled(False), but
+        # that does not happen until ~60 lines below, AFTER two modals that
+        # each spin the loop. Every one of those is a window where a second
+        # click lands. A plain flag set before any dialog closes it, and it
+        # cannot be defeated by a dialog the way the button state can.
+        if self._start_in_progress:
+            logger.warning("gui.start_reentered_ignored",
+                           cruise_line=self.cruise_line.value)
+            return
+        self._start_in_progress = True
+        try:
+            await self._on_start_guarded()
+        finally:
+            self._start_in_progress = False
+
+    async def _on_start_guarded(self) -> None:
         snapshot = self.queue_manager.get_snapshot()
         print(f"GUI: start snapshot queued={snapshot.queued} running={snapshot.running} done={snapshot.done} error={snapshot.error}")
         if snapshot.queued == 0:
@@ -1139,11 +1189,50 @@ class CruiseLinePanel(QWidget):
             return f"+${abs(net_saving):.2f} more expensive"
         return "$0.00"
 
+    @contextmanager
+    def _bulk_table_update(self):
+        """Suspend sorting, repaints and signals for a batch of rows.
+
+        WHY. Each _append_*_row turned sorting off and back ON around its
+        own insert. That is correct for ONE row, but _populate_results_table
+        and the DB reload call them in a loop, so a table of N results paid
+        for N FULL RE-SORTS plus N repaints - the work grows with the square
+        of the result count, which is why a long scan felt progressively
+        heavier as it went.
+
+        Re-entrant on purpose: the per-row helpers still suspend sorting
+        when called on their own (a single live result arriving mid-scan),
+        and become no-ops for that while a bulk update is already in
+        progress. Sorting is restored exactly once, at the end.
+        """
+        table = self.results_table
+        first = self._bulk_depth == 0
+        self._bulk_depth += 1
+        if first:
+            self._bulk_sorted = table.isSortingEnabled()
+            table.setSortingEnabled(False)
+            table.setUpdatesEnabled(False)      # one repaint, not one per row
+            table.blockSignals(True)            # no itemChanged storm
+        try:
+            yield
+        finally:
+            self._bulk_depth -= 1
+            if self._bulk_depth == 0:
+                table.blockSignals(False)
+                table.setUpdatesEnabled(True)
+                table.setSortingEnabled(self._bulk_sorted)
+
     def _append_result_row(self, result: BookingResult) -> None:
         # Sorting must be off while inserting: with it enabled, each
         # setItem() call can trigger an immediate re-sort mid-insert and
         # scatter this row's cells across different rows.
-        self.results_table.setSortingEnabled(False)
+        # Skipped while a bulk update owns the table - see _bulk_table_update.
+        if self._bulk_depth:
+            return self._append_result_row_unguarded(result)
+        with self._bulk_table_update():
+            return self._append_result_row_unguarded(result)
+
+    def _append_result_row_unguarded(self, result: BookingResult) -> None:
         row = self.results_table.rowCount()
         self.results_table.insertRow(row)
         # An ERROR result carries its cause in BOTH .error and .note
@@ -1192,7 +1281,6 @@ class CruiseLinePanel(QWidget):
             item = self.results_table.item(row, col)
             if item is not None:
                 item.setBackground(color)
-        self.results_table.setSortingEnabled(True)
 
     def _append_msc_result_row(self, outcome: MscCheckOutcome) -> None:
         """MSC counterpart to _append_result_row — outcome.result is an
@@ -1201,7 +1289,12 @@ class CruiseLinePanel(QWidget):
         outcome.status == "checked"; otherwise it's a short-circuit status
         (not_found, cancelled, session_expired_after_relogin, etc.) with no
         result to show."""
-        self.results_table.setSortingEnabled(False)
+        if self._bulk_depth:
+            return self._append_msc_result_row_unguarded(outcome)
+        with self._bulk_table_update():
+            return self._append_msc_result_row_unguarded(outcome)
+
+    def _append_msc_result_row_unguarded(self, outcome: MscCheckOutcome) -> None:
         row = self.results_table.rowCount()
         self.results_table.insertRow(row)
         if outcome.status == "checked" and outcome.result is not None:
@@ -1296,7 +1389,6 @@ class CruiseLinePanel(QWidget):
             item = self.results_table.item(row, col)
             if item is not None:
                 item.setBackground(color)
-        self.results_table.setSortingEnabled(True)
 
     def _update_queue_view(self, snapshot) -> None:
         # IMPROVED 2026-08-27: the label used to read only
@@ -1460,11 +1552,12 @@ class CruiseLinePanel(QWidget):
         garbled table. Delegating to the real row builders means there is
         now ONE place that knows the column layout.
         """
-        self.results_table.setRowCount(0)
-        for result in self.results:
-            self._append_result_row(result)
-        for outcome in self.msc_results:
-            self._append_msc_result_row(outcome)
+        with self._bulk_table_update():
+            self.results_table.setRowCount(0)
+            for result in self.results:
+                self._append_result_row(result)
+            for outcome in self.msc_results:
+                self._append_msc_result_row(outcome)
 
     # Row tints. CHANGED 2026-08-28: these were Qt.green / Qt.red /
     # Qt.yellow / Qt.magenta — fully saturated primaries that made a table
@@ -1474,6 +1567,9 @@ class CruiseLinePanel(QWidget):
     # same colour on screen as in the spreadsheet the client sees.
     _STATUS_TINTS = {
         "OPTIMIZATION": "#C6EFCE",          # soft green
+        # Its own strong colour - see services/excel_export.py's _FILLS for
+        # why a cancellation must not share the pale blue of PAID_IN_FULL.
+        "CANCELLED": "#F4B183",             # orange
         # Deliberately distinct from OPTIMIZATION: a category upgrade is a
         # different physical room/deck and always needs human review — never
         # the same one-click confidence as a confirmed same-category win.
@@ -1549,6 +1645,16 @@ class CruiseLinePanel(QWidget):
 
 
 class MainWindow(QMainWindow):
+    #: Grace period between asking the app to quit and forcing the
+    #: process to exit. Long enough for a normal interpreter shutdown,
+    #: short enough that a hang is not something the operator notices.
+    FORCE_EXIT_MS = 3000
+
+    #: Hard ceiling on shutdown. Panels close concurrently, so this is
+    #: the WHOLE app's budget, not per tab. Generous enough for a batch
+    #: to finish its current booking (~30s measured on ESPRESSO) and
+    #: for browsers to save their session state.
+    SHUTDOWN_TIMEOUT_SECONDS = 45
     """Tabbed shell: one CruiseLinePanel per cruise line.
 
     ADDED 2026-08-28 at Neon's request ("change the gui to tabs then so a
@@ -1661,9 +1767,32 @@ class MainWindow(QMainWindow):
         # one, so the field read "(not scanning)" permanently. With several
         # tabs able to hold browsers at once RAM is the real limit, so it is
         # sampled continuously here instead.
+        # Cadence for the Chromium census inside _refresh_resources: every
+        # 5th tick, i.e. ~15s, against the 3s cpu/ram refresh. See the
+        # measurement recorded there for why the two are separated.
+        self._resource_tick = 0
+        self._chrome_census: tuple[int, float] | None = None
         self._resource_timer = QTimer(self)
         self._resource_timer.timeout.connect(self._refresh_resources)
         self._resource_timer.start(3000)
+
+        # KEEP IDLE PORTAL SESSIONS ALIVE.
+        #
+        # ESPRESSO arms a 30.5-minute client-side auto-logout on every page
+        # load (see EspressoScraper.keep_session_alive). A batch re-arms it
+        # constantly while THAT line is scanning - but a tab belonging to a
+        # DIFFERENT line just sits there. Observed 2026-09-22 in the log:
+        # ESPRESSO went quiet at 14:40, NCL scanned from 14:42 onward, and
+        # by 15:15 the ESPRESSO session had signed itself out mid-session -
+        # 35 minutes idle, past its own limit.
+        #
+        # Every 5 minutes, touch any line that has a live session and is NOT
+        # currently scanning. keep_session_alive is itself a no-op unless
+        # the page has actually been idle past its threshold, so this costs
+        # nothing on a busy tab.
+        self._keepalive_timer = QTimer(self)
+        self._keepalive_timer.timeout.connect(self._keep_sessions_alive)
+        self._keepalive_timer.start(5 * 60 * 1000)
         self._refresh_resources()
         self._refresh_global_summary()
 
@@ -1702,6 +1831,35 @@ class MainWindow(QMainWindow):
         except Exception:
             logger.exception("gui.global_summary_failed")
 
+    @asyncSlot()
+    async def _keep_sessions_alive(self) -> None:
+        """Touch idle portal sessions so they do not time themselves out.
+
+        Skips any line that is mid-scan - that line is re-arming its own
+        timer with every navigation, and interrupting it with an extra
+        navigation would be worse than useless. Never raises: a failed
+        keepalive must not disturb a GUI that is otherwise fine.
+        """
+        for line, panel in self.panels.items():
+            try:
+                if panel.is_busy():
+                    continue
+                service = getattr(panel.queue_manager, "_service", None)
+                scraper = getattr(service, "_live_scraper", None)
+                if scraper is None or scraper.cruise_line != line:
+                    continue
+                if not scraper.is_alive:
+                    continue
+                keepalive = getattr(scraper, "keep_session_alive", None)
+                if keepalive is None:
+                    continue
+                if await keepalive():
+                    logger.info("gui.session_kept_alive", cruise_line=line.value)
+            except Exception as exc:
+                logger.debug("gui.keepalive_failed",
+                             cruise_line=getattr(line, "value", "?"),
+                             error=str(exc)[:200])
+
     def _refresh_resources(self) -> None:
         """CPU / RAM / Chromium footprint, sampled for real."""
         try:
@@ -1709,14 +1867,35 @@ class MainWindow(QMainWindow):
 
             cpu = psutil.cpu_percent(interval=None)
             ram = psutil.virtual_memory().percent
-            chrome = [p for p in psutil.process_iter(["name"])
-                      if (p.info["name"] or "").lower() == "chrome.exe"]
-            rss = 0.0
-            for p in chrome:
-                try:
-                    rss += p.memory_info().rss / 1e6
-                except Exception:
-                    pass
+
+            # THE EXPENSIVE HALF, SAMPLED FAR LESS OFTEN.
+            #
+            # Measured on this machine, 2026-09-18: the Chromium census
+            # below costs a MEDIAN of 66 ms and a MAX of 900 ms, against
+            # 4 ms for the cpu/ram read above - because process_iter walks
+            # all 341 processes on the machine and memory_info() is then
+            # called on each of the ~21 Chromium processes. On a 3-second
+            # timer, ON THE UI THREAD, that is 1,200 full process-table
+            # walks an hour and an occasional near-second freeze. It is the
+            # single most expensive thing the GUI does, and it measures
+            # something that barely moves between ticks.
+            #
+            # CPU/RAM still refresh every 3s (they are cheap and they do
+            # move); the census refreshes every _CHROME_CENSUS_EVERY ticks
+            # and is otherwise reused from the last sample.
+            self._resource_tick += 1
+            if (self._chrome_census is None
+                    or self._resource_tick % self._CHROME_CENSUS_EVERY == 0):
+                chrome = [p for p in psutil.process_iter(["name"])
+                          if (p.info["name"] or "").lower() == "chrome.exe"]
+                rss = 0.0
+                for p in chrome:
+                    try:
+                        rss += p.memory_info().rss / 1e6
+                    except Exception:
+                        pass
+                self._chrome_census = (len(chrome), rss)
+            chrome_count, rss = self._chrome_census
             live = []
             for line, panel in self.panels.items():
                 try:
@@ -1727,7 +1906,7 @@ class MainWindow(QMainWindow):
             self.resource_label.setText(
                 "Resources: CPU {:4.1f}%  RAM {:4.1f}%  Chromium {} proc / {:,.0f} MB"
                 "  live sessions: {}".format(
-                    cpu, ram, len(chrome), rss,
+                    cpu, ram, chrome_count, rss,
                     ", ".join(live) if live else "none")
             )
             # 93% is the ResourceGovernor's throttle threshold and this
@@ -1774,12 +1953,139 @@ class MainWindow(QMainWindow):
             "Stopping " + (", ".join(busy) if busy else "all lines")
             + " and closing browser sessions...")
         asyncio.ensure_future(self._shutdown_all())
+        # Tick the message while teardown runs. A close that legitimately
+        # takes 30 seconds - because a booking is mid-flight - is
+        # indistinguishable from a hang if nothing on screen moves.
+        self._shutdown_started = time.monotonic()
+        self._shutdown_ticker = QTimer(self)
+        self._shutdown_ticker.timeout.connect(self._tick_shutdown_message)
+        self._shutdown_ticker.start(1000)
+
+    def _tick_shutdown_message(self) -> None:
+        """Keep the shutdown notice moving so it does not look frozen."""
+        try:
+            waited = int(time.monotonic() - self._shutdown_started)
+            busy = [l.value for l, p in self.panels.items() if p.is_busy()]
+            remaining = max(0, self.SHUTDOWN_TIMEOUT_SECONDS - waited)
+            self.global_summary_label.setText(
+                f"Closing browser sessions... {waited}s"
+                + (f"  (waiting on {', '.join(busy)} to finish the booking "
+                   f"in progress)" if busy else "")
+                + f"  -  will close within {remaining}s"
+            )
+        except Exception:
+            pass
 
     async def _shutdown_all(self) -> None:
-        for line, panel in self.panels.items():
+        """Tear every tab down AT ONCE, with a hard ceiling.
+
+        Neon 2026-09-22: "when i press quite or close it stucks".
+
+        Two reasons it stuck, both fixed here. Panels were shut down
+        SEQUENTIALLY, and each one waits up to 60 seconds for its scan to
+        stop - so four tabs could take four minutes. And that wait is real,
+        not theoretical: a batch deliberately finishes its current booking
+        before stopping, and a measured ESPRESSO booking takes ~30s.
+
+        Panels now run concurrently. The ordering rule INSIDE a panel is
+        untouched and still load-bearing (stop the scan, then close the
+        browser - closing one out from under an in-flight check_booking
+        makes booking_service treat it as a crash and start a SECOND browser
+        while the app is trying to quit). Running different panels at the
+        same time does not affect that: each owns its own queue manager,
+        service and browser.
+
+        The overall ceiling means the window always closes. A browser that
+        will not shut down cleanly is worth at most this wait - the session
+        state is saved by then, and Chromium exits with the process.
+        """
+        started = time.monotonic()
+
+        async def close_panel(line, panel):
             try:
                 await panel.shutdown()
+                logger.info("gui.panel_shutdown_ok", cruise_line=line.value)
             except Exception:
                 logger.exception("gui.panel_shutdown_failed", cruise_line=line.value)
-        logger.info("gui.shutdown_complete")
-        QApplication.instance().quit()
+
+        try:
+            await asyncio.wait_for(
+                asyncio.gather(*(close_panel(line, panel)
+                                 for line, panel in self.panels.items()),
+                               return_exceptions=True),
+                timeout=self.SHUTDOWN_TIMEOUT_SECONDS,
+            )
+        except asyncio.TimeoutError:
+            slow = [l.value for l, p in self.panels.items() if p.is_busy()]
+            logger.warning("gui.shutdown_timed_out",
+                           after_seconds=int(time.monotonic() - started),
+                           still_busy=slow)
+        try:
+            self._shutdown_ticker.stop()
+        except Exception:
+            pass
+        logger.info("gui.shutdown_complete",
+                    seconds=round(time.monotonic() - started, 1))
+
+        # QUIT, THEN MAKE SURE THE PROCESS ACTUALLY ENDS.
+        #
+        # Neon 2026-09-22: "same quiting issue it is not closing it is
+        # still hanging" - AFTER the concurrent-teardown fix. The log showed
+        # teardown was never the problem:
+        #
+        #   18:14:19 gui.panel_shutdown_ok  NCL / GOCCL / MSC
+        #   18:14:19 browser.session_saved  ESPRESSO
+        #   18:14:20 browser.stopped        ESPRESSO
+        #   18:14:20 gui.shutdown_complete  seconds=0.7
+        #
+        # 0.7 seconds, everything saved - and the Python process was still
+        # alive thirteen minutes later. So quit() returns, the window goes,
+        # and the interpreter never exits: qasync's loop is stopped from
+        # inside one of its own callbacks, and what is left (pending tasks,
+        # the default thread-pool executor behind asyncio.to_thread, the
+        # Playwright subprocess transports) keeps the process up.
+        #
+        # Everything that must survive is already on disk BEFORE this point
+        # - browser.session_saved is logged above - so once the loop has had
+        # a moment to unwind there is nothing left worth waiting for. The
+        # timer is the backstop, not the plan: a clean exit cancels it.
+        # ARM THE BACKSTOP FIRST, ON ITS OWN THREAD.
+        #
+        # My previous attempt armed it with QTimer.singleShot AFTER calling
+        # app.quit() and loop.stop() - so it was scheduled on an event loop
+        # that had just been stopped and could never fire. Neon had to end
+        # the process from Task Manager, which is exactly what the backstop
+        # existed to prevent. A watchdog that depends on the thing it is
+        # watching is not a watchdog.
+        #
+        # threading.Timer runs on its own thread and is daemonised, so it
+        # neither depends on Qt or asyncio being alive nor keeps the process
+        # up if the normal path succeeds first.
+        self._exit_timer = threading.Timer(
+            self.FORCE_EXIT_MS / 1000.0, self._force_exit)
+        self._exit_timer.daemon = True
+        self._exit_timer.start()
+
+        app = QApplication.instance()
+        if app is not None:
+            app.quit()
+        try:
+            asyncio.get_running_loop().stop()
+        except Exception:
+            pass
+
+    def _force_exit(self) -> None:
+        """Last resort: end a process that refuses to exit on its own.
+
+        Reached only if the interpreter is still alive after quit(), the
+        loop stop and FORCE_EXIT_MS. Session state and every result are
+        already persisted by then, so there is nothing to lose - and a
+        desktop app that will not close is worse than a blunt exit.
+        """
+        logger.warning("gui.force_exit",
+                       msg="process still alive after shutdown - exiting")
+        try:
+            logging.shutdown()
+        except Exception:
+            pass
+        os._exit(0)

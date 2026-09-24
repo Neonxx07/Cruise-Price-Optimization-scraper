@@ -97,6 +97,48 @@ class Settings(BaseSettings):
     # a plain username/password form, unlike ESPRESSO.
     ncl_login_url: str = "https://seawebagents.ncl.com/Security/login/"
     goccl_search_url: str = "https://www.goccl.com/BookingEngine/BookingSearch/SearchForReservations.aspx"
+    # CONFIRMED 2026-09-18 from a Playwright CRX recording of a real session.
+    # The booking tool is NOT reached by deep-linking: a human signs in here,
+    # then clicks "Individual/Groups Staterooms", and the booking engine opens
+    # in a POPUP WINDOW. The scraper deep-linked to goccl_search_url instead
+    # and never modelled that popup at all - the likeliest reason 8 of its 15
+    # recorded attempts died on Locator.wait_for / Page.inner_text timeouts
+    # while waiting on the wrong page.
+    goccl_login_url: str = "https://www.goccl.com/accounts/login"
+    # The link that opens the booking engine. CORRECTED 2026-09-18 against
+    # the real signed-in dashboard: the visible text is "Individual/Group
+    # Staterooms" - SINGULAR "Group". The CRX recording transcribed it as
+    # "Individual/Groups Staterooms", which matches nothing, so the
+    # accessible-name lookup built from it would have found no link at all.
+    #
+    # Prefer the GTM attribute over the text: it is stable across copy
+    # changes and does not contain the "/" that breaks a regex selector.
+    #   <a href="/BookingEngine/BookingSearch/SearchForReservations.aspx"
+    #      target="_blank" data-gtm-event="individual_group_staterooms">
+    # Note the href IS goccl_search_url - the engine is a plain link opened
+    # in a new window by target="_blank", not a scripted popup.
+    goccl_booking_tool_link: str = "Individual/Group Staterooms"
+    # Matched on the HREF, not on text or a GTM tag. The signed-in dashboard
+    # carries THREE separate links to this same destination (confirmed
+    # 2026-09-18 against the captured dashboard):
+    #
+    #   data-gtm-event="individual_group_staterooms"  "Individual/Group Staterooms"
+    #   data-gtm-event="group_staterooms"             "Individual/Groups Staterooms"
+    #   data-gtm-event="the_fun_shops"                "The Fun Shops"
+    #
+    # Both spellings of Group(s) are real - they are different links, which
+    # is why the CRX recording's "Individual/Groups Staterooms" and the
+    # first one found in the DOM disagreed. Neither text is wrong, and
+    # neither is a safe thing to key on. All three resolve to the same
+    # href, so the href is the stable identity.
+    goccl_booking_tool_selector: str = 'a[href*="SearchForReservations.aspx"]'
+    # A signed-in dashboard exposes these; used to tell a live session from
+    # one that has been bounced back to the login page.
+    goccl_dashboard_url: str = "https://www.goccl.com/"
+    # OS credential-store service name, matching save_login.py. GoCCL was the
+    # only line save_login.py did not offer, so a Carnival scan always needed
+    # a human present.
+    goccl_credential_service: str = "goccl_navigator_login"
     msc_home_url: str = "https://www.mscbook.com/us/home"
     # Param order here must stay byte-identical to what msc_commands.py's
     # three call sites have actually been sending (confirmed 2026-08-11
@@ -194,7 +236,11 @@ class Settings(BaseSettings):
 
     # ── Logging ─────────────────────────────────────────────────
     log_level: str = "INFO"
-    log_file: str = ""
+    # A REAL default, 2026-09-21. This was "" so nothing was ever written
+    # to disk: every ESPRESSO failure lived only in the GUI's scrollback and
+    # was lost the moment the app closed. Rotating, 10 MB x 5 - see
+    # utils.logging.setup_logging.
+    log_file: str = "data/cruiseintel.log"
 
     model_config = {
         "env_file": ".env",

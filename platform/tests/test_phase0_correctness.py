@@ -229,12 +229,127 @@ def test_currency_label_regex_none_when_no_label_present():
 
 # ── Fix 4: ESPRESSO dual-rate columns ────────────────────────────────────
 
-def test_dual_rate_note_appended_when_dual_columns_present():
+def _row(cat, c2_price, c3_price, c2_code="GROUP_ALLOCATION-BESTRATE",
+         c3_code="GROUP_PREVAILING-BESTRATE"):
+    """One categories-table row, shaped like the real capture.
+
+    Verified against the saved pages: every row carries two
+    rbCategorySelection radios, data-columnindex 0 and 1, each naming its
+    rate program in data-requestedcode.
+    """
+    def col(idx, name, price, code):
+        cells = ["STANDARD", "AVL(2)", f"{price:,.2f}"] if price is not None else ["", "", ""]
+        return {"columnIndex": idx, "column": name, "dataId": str(idx + 1),
+                "radioValue": "1", "radioChecked": idx == 0,
+                "requestedCode": code, "selectable": price is not None,
+                "cells": cells}
+    return {"category": cat, "status": "AVL",
+            "columns": [col(0, "c2", c2_price, c2_code),
+                        col(1, "c3", c3_price, c3_code)]}
+
+
+def _table(rows, c2_label, c3_label):
+    return {"dualRateColumns": True, "c2Label": c2_label,
+            "c3Label": c3_label, "rows": rows}
+
+
+def test_identical_columns_are_reported_as_no_opportunity():
+    """REAL DATA, 2026-09-18: across 41 individual bookings and 1,602 rows
+    priced in both columns, 'Best Rate' and 'Best Value' were identical in
+    EVERY row. Saying "unevaluated, check by hand" on these was noise on
+    44 of 60 captures."""
     from scraper.espresso import _append_dual_rate_note
-    note = _append_dual_rate_note("optimized $50", {"dualRateColumns": True})
-    assert "c3" in note
-    assert "NOT evaluated" in note
+    note = _append_dual_rate_note("optimized $50", _table(
+        [_row("I2", 1739.00, 1739.00, "INDIVIDUAL-BESTRATE", "INDIVIDUAL-BVL"),
+         _row("I3", 1500.00, 1500.00, "INDIVIDUAL-BESTRATE", "INDIVIDUAL-BVL")],
+        "Individual - Best Rate (Cruise)", "Individual - Best Value (Cruise)"))
     assert note.startswith("optimized $50")
+    assert "no second-column opportunity" in note
+    assert "Verify by hand" not in note
+
+
+def test_a_blank_left_column_is_called_out_as_blank():
+    """THE BUG THIS FOUND. On group bookings 'Group Allocation' (c2) was
+    empty on 677 of 730 rows - 93% - and every price sat in 'Group
+    Prevailing' (c3). A scraper reading only c2 read nothing at all."""
+    from scraper.espresso import _append_dual_rate_note
+    note = _append_dual_rate_note("no saving", _table(
+        [_row("I2", None, 963.00), _row("I3", None, 1100.00)],
+        "Group Allocation - Best Rate (Cruise)",
+        "Group Prevailing - Best Rate (Cruise)"))
+    assert "is EMPTY on this booking" in note
+    assert "Group Prevailing" in note
+
+
+def test_a_partly_blank_left_column_counts_the_rows_only_c3_prices():
+    from scraper.espresso import _append_dual_rate_note
+    note = _append_dual_rate_note("", _table(
+        [_row("I2", 1739.00, 963.00), _row("I3", None, 1100.00),
+         _row("I4", None, 1200.00)],
+        "Group Allocation - Best Rate (Cruise)",
+        "Group Prevailing - Best Rate (Cruise)"))
+    assert "2 of 3 categories are priced ONLY under" in note
+
+
+def test_the_cheapest_c3_undercut_is_named_with_both_prices():
+    """Booking 3001006 category I2, the largest real gap found: Allocation
+    quotes 1,739.00 where Prevailing quotes 963.00."""
+    from scraper.espresso import _append_dual_rate_note
+    note = _append_dual_rate_note("", _table(
+        [_row("I2", 1739.00, 963.00), _row("I3", 1500.00, 1499.00)],
+        "Group Allocation - Best Rate (Cruise)",
+        "Group Prevailing - Best Rate (Cruise)"))
+    assert "category I2" in note
+    assert "963.00" in note and "1,739.00" in note and "-776.00" in note
+
+
+def test_the_second_column_is_never_selected_automatically():
+    """Moving between rate programs is a scope change (core.price_scope)
+    and a commercial decision - whether a booking may move from Allocation
+    to Prevailing is not something the categories table answers. The note
+    reports; it must not claim the switch was made."""
+    from scraper.espresso import _append_dual_rate_note
+    note = _append_dual_rate_note("", _table(
+        [_row("I2", 1739.00, 963.00)],
+        "Group Allocation - Best Rate (Cruise)",
+        "Group Prevailing - Best Rate (Cruise)"))
+    assert "not automatic" in note
+    for claim in ("switched", "applied", "selected c3", "repriced"):
+        assert claim not in note.lower()
+
+
+def test_both_rate_programs_are_identified_by_their_dom_code_not_the_label():
+    """Labels are display text and vary; data-requestedcode is the portal's
+    own identifier for the program."""
+    from scraper.espresso import summarize_rate_columns
+    s = summarize_rate_columns(_table(
+        [_row("I2", None, 963.00)],
+        "Group Allocation - Best Rate (Cruise)",
+        "Group Prevailing - Best Rate (Cruise)"))
+    assert s["c2_code"] == "GROUP_ALLOCATION-BESTRATE"
+    assert s["c3_code"] == "GROUP_PREVAILING-BESTRATE"
+
+
+def test_a_capture_taken_before_the_columns_field_existed_still_summarises():
+    """60 historical captures carry only c2Cells/c3Cells. They must not
+    silently summarise as zero rows."""
+    from scraper.espresso import summarize_rate_columns
+    s = summarize_rate_columns({
+        "dualRateColumns": True,
+        "c2Label": "Group Allocation - Best Rate (Cruise)",
+        "c3Label": "Group Prevailing - Best Rate (Cruise)",
+        "rows": [{"category": "I2", "c2Cells": ["", "", ""],
+                  "c3Cells": ["GROUPX", "CLS", "963.00"]}],
+    })
+    assert s["rows"] == 1 and s["only_c3"] == 1
+
+
+def test_an_obc_suffix_in_the_same_cell_does_not_become_the_price():
+    """A real cell reads '4,268.50175 OBC' - fare then OBC, one cell. The
+    fare is 4,268.50; 175 is onboard credit and must not be read as money
+    off, the same confusion that produced MSC's fabricated savings."""
+    from scraper.espresso import _cell_price
+    assert _cell_price(["BOGO75 NRD+", "AVL(2)", "4,268.50175 OBC"]) == 4268.50
 
 
 def test_dual_rate_note_not_appended_when_single_column():

@@ -1168,7 +1168,49 @@ async def _apply_voyagers_club(page, passengers: list, cabin: int = 1) -> dict:
         if await crown.count() == 0:
             return {"applied": False, "reason": "no Voyagers Club control on this screen",
                     "member": member.get("voyagers_number"), "verified": False}
-        await crown.first.click()
+        # CLICK IT THE WAY THE REST OF THIS FUNCTION ALREADY DOES.
+        #
+        # CONFIRMED FAILURE, fixed 2026-09-22 from a live MSC run. Neon:
+        # "I JUST DID AN MSC RUN AND IT WAS GIVING FUNKY RESULTS". Twice in
+        # that run:
+        #
+        #   msc.voyagers_club_entry_failed
+        #   Locator.click: Timeout 30000ms exceeded.
+        #     waiting for locator('.club-btn[data-cabin="1"]').first
+        #     - locator resolved to <div data-cabin="1" class="btn-border
+        #       square-box club-btn">...
+        #
+        # The element RESOLVED - it exists - and the click still timed out,
+        # which is Playwright's actionability check failing: present but
+        # covered, unstable or not registering events. This page is already
+        # known to do that; the ".club-search-btn" click a few lines below
+        # is dispatched through JS for exactly that reason, and the #club-dob
+        # date picker has intercepted a click here before.
+        #
+        # So: try the real click briefly, then dispatch it directly. A real
+        # click is still preferred when the page allows it, but 30 seconds
+        # of waiting followed by NO DISCOUNT APPLIED is the worst of both -
+        # the quote then silently lacks a Voyagers discount the booking
+        # itself has, and the two prices are no longer comparable.
+        try:
+            await crown.first.click(timeout=4000)
+        except Exception:
+            clicked = await page.evaluate(
+                """(cabin) => {
+                    const b = document.querySelector(
+                        '.club-btn[data-cabin="' + cabin + '"]');
+                    if (!b) return false;
+                    b.click();
+                    return true;
+                }""",
+                str(cabin),
+            )
+            if not clicked:
+                return {"applied": False,
+                        "reason": "Voyagers Club control could not be opened",
+                        "member": member.get("voyagers_number"),
+                        "verified": False}
+            logger.info("msc.voyagers_club_opened_via_js", cabin=cabin)
         await page.wait_for_timeout(1200)
 
         # Set every field through JS rather than typing. A native date

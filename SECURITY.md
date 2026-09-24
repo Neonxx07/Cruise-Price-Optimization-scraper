@@ -13,7 +13,7 @@ actually gone wrong, since every rule below exists because something slipped.
 
 | Category | Examples | Where it should live instead |
 |---|---|---|
-| **Booking references** | a bare 5–9 digit number, or a 6-character PNR-style code (GoCCL/Princess) | Use placeholders: `3000xxx` (numeric), `DEMOnn` (alphanumeric) |
+| **Booking references** | a bare 5–9 digit number, or a 6-character PNR-style code (GoCCL/Princess) | Use placeholders: `300xxxx` (numeric), `DEMOnn` (alphanumeric) |
 | **Customer / operator identity** | passenger names, the agent's own name, agent login, agency id | Say "the project owner" / "the operator" |
 | **Credentials** | portal passwords, API keys, tokens, private keys | OS keychain via [`platform/save_login.py`](platform/save_login.py) |
 | **Session state** | `storage_state*.json`, cookie jars | `platform/browser-profile/` (git-ignored) |

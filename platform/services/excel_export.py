@@ -38,10 +38,22 @@ _FILLS = {
     # (we learned nothing about price): needs the other account.
     "NOT_ON_THIS_ACCOUNT": PatternFill("solid", fgColor="FFF2CC"),  # light amber
     "SKIPPED_TODAY": PatternFill("solid", fgColor="DDEBF7"),  # light blue
+    # CANCELLED gets its OWN strong colour, not shared with anything.
+    # Neon 2026-09-22: reporting a cancellation is "VERY MADNATORY ...
+    # something very critical". It used to be filed as PAID_IN_FULL, which
+    # is the same pale blue as WLT and SKIPPED_TODAY - invisible in a sheet
+    # of 700 rows. Orange reads as "act on this" without claiming the red
+    # that means the scan itself broke.
+    "CANCELLED": PatternFill("solid", fgColor="F4B183"),      # orange
 }
+# CANCELLED sorts SECOND, immediately under the money. It is not a pricing
+# outcome at all, but it is the one row an agent must see - a cancelled
+# booking sitting unnoticed at the bottom of a 700-row sheet is exactly the
+# failure this ordering exists to prevent.
 _SORT_ORDER = {
-    "OPTIMIZATION": 0, "UPGRADE_AVAILABLE": 1, "TRAP": 2, "WLT": 3,
-    "PAID_IN_FULL": 4, "NO_SAVING": 5, "SKIPPED_TODAY": 6, "NOT_ON_THIS_ACCOUNT": 7, "ERROR": 8,
+    "OPTIMIZATION": 0, "CANCELLED": 1, "UPGRADE_AVAILABLE": 2, "TRAP": 3,
+    "WLT": 4, "PAID_IN_FULL": 5, "NO_SAVING": 6, "SKIPPED_TODAY": 7,
+    "NOT_ON_THIS_ACCOUNT": 8, "ERROR": 9,
 }
 _HDR_FILL = PatternFill("solid", fgColor="1F3864")
 _HDR_FONT = Font(bold=True, color="FFFFFF", name="Calibri", size=10)
