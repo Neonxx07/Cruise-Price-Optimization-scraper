@@ -96,6 +96,10 @@ python main.py api
 
 # Or run a CLI scan (--cruise-line: ESPRESSO, NCL, or GOCCL)
 python main.py scan --bookings "1234567,7654321" --cruise-line ESPRESSO -o results.csv
+
+# Watch a running scan from a second terminal (see "Scan watchdog" below)
+python scan_watchdog.py          # follow the live log
+python scan_watchdog.py --once   # one pass over what is already there
 ```
 
 > **Contributors: install the git hooks first.**
@@ -271,6 +275,9 @@ ESPRESSO auto-logout and SSO-race handling, session recovery, cancelled-booking 
 currency-aware paid-in-full, and a GUI Start re-entrancy guard (a second Start click during a
 modal could destroy the running batch).
 
+<details>
+<summary><strong>Earlier releases</strong></summary>
+
 ### NCL headless toggle — and why only NCL
 
 The GUI now offers **"Run hidden (headless)"**, and the checkbox appears *only* when NCL is
@@ -352,9 +359,6 @@ logged-in session.
 - **10 new test modules** — NCL markets, OBC, payment rules, multi-line concurrency, GUI results
   table, preflight/file-load, MSC eligibility, and JS syntax.
 
-<details>
-<summary><strong>Earlier releases</strong></summary>
-
 - **NCL brought online** — same-category reprice redesign, dialog-handling safety fixes, and
   corrected search/add-on selectors, plus
   [`run_ncl_live_check.py`](platform/run_ncl_live_check.py): a single *watched*, non-headless,
@@ -426,6 +430,8 @@ logged-in session.
   whole system from scratch
 - [`SECURITY.md`](SECURITY.md) — what must never be committed, the three defences that
   enforce it, and the incident record behind each rule
+- [`platform/docs/MSC_DISCOUNT_RULES.md`](platform/docs/MSC_DISCOUNT_RULES.md) — which MSC
+  discounts combine, which are agency-side, and which never apply
 - [`CONTRIBUTING.md`](CONTRIBUTING.md) — guidelines for adding a new cruise line
 - [`HOW_TO_CHECK_A_BOOKING.md`](HOW_TO_CHECK_A_BOOKING.md) — the plain-English manual process
   the ESPRESSO automation is based on
@@ -460,6 +466,9 @@ We welcome contributions! See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
 | Database | chrome.storage | SQLAlchemy + SQLite |
 | Credentials | — | keyring (OS secure store) |
 | Logging | Console | structlog (JSON) |
+| Resource monitoring | — | psutil (throttle gate + watchdog) |
+| Fuzzy matching | — | RapidFuzz (deterministic, no AI) |
+| Lint / tests | — | ruff + pytest (61 test modules) |
 
 ---
 
