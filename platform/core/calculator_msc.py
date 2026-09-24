@@ -111,6 +111,110 @@ def _filter_out_disallowed_discounts(options: list[str] | None) -> list[str] | N
     return [o for o in options if "MIL-CIV" not in o.upper() and "MILITARY" not in o.upper()]
 
 
+#: Labels MSC uses for the Voyagers Selection / "special offer" family.
+#: Revealed behind the crown icon, e.g.
+#:     <span class="switch-label font-weight-bold">SPECIAL OFFER 10%</span>
+#: Seen at 5%, 10% and 15% across 415 occurrences of real captured data.
+SPECIAL_OFFER_LABEL = "SPECIAL OFFER"
+
+
+def special_offer_allowed(senior_discount_applied: bool) -> bool:
+    """RULE MSC-D5: SPECIAL OFFER and the senior discount are exclusive.
+
+    CORRECTED 2026-09-22 the same day it was written. My first reading of
+    "this cannot be applied if the customer is senior" excluded SPECIAL
+    OFFER whenever ANY passenger was 65+. Neon's clarification:
+
+        "only when the senior discount is actually applied? u can choose
+         between one only i usually choose whatever is higher"
+
+    So being a senior is not what blocks it. MSC lets a booking carry ONE
+    discount, and the senior discount is simply one of the candidates. The
+    exclusion bites only once the senior discount is actually ON the
+    booking - otherwise a senior booking is free to take SPECIAL OFFER if
+    that is the better number.
+
+    The strict version would have suppressed a legitimate 15% on every
+    booking with a 65-year-old aboard.
+    """
+    return not senior_discount_applied
+
+
+def best_eligible_discount(options: list[tuple[str, float]] | None,
+                           senior_discount_applied: bool = False,
+                           ) -> tuple[str, float] | None:
+    """The single best discount this booking can actually USE.
+
+    RULE MSC-D6, in Neon's words: "u can choose between one only i usually
+    choose whatever is higher". MSC carries ONE discount, so this is a pick,
+    not a sum - never add percentages together.
+
+    SPECIAL OFFER is dropped only when the senior discount is already
+    applied (see special_offer_allowed). `options` are (label, percent)
+    pairs already confirmed available for this sailing.
+
+    Returns None when nothing is usable - a real answer, not a zero.
+    """
+    usable = [
+        (label, pct) for label, pct in (options or [])
+        if pct and pct > 0
+        and (special_offer_allowed(senior_discount_applied)
+             or SPECIAL_OFFER_LABEL not in (label or "").upper())
+    ]
+    if not usable:
+        return None
+    return max(usable, key=lambda lp: lp[1])
+
+
+def msc_discount_beats_current(current_total: float | None,
+                               today_price: float | None,
+                               discount_pct: float | None) -> tuple[bool | None, str]:
+    """RULE MSC-D1/D2: does applying this discount actually help?
+
+    THE RULE THIS ENCODES, from Neon 2026-09-22: applying a discount does
+    NOT take a percentage off the customer's existing fare. MSC REPRICES the
+    booking at TODAY'S rate and applies the discount to that. So a discount
+    is only worth having when the repriced total lands BELOW what they
+    already pay.
+
+    Booking 3000005 is why this exists:
+
+        current total            1,756.42
+        today, same category     2,109.54   (+353.12)
+          after 5%  club         2,004.06   (+247.64)
+          after 10% selection    1,898.59   (+142.17)
+          after 15% both         1,793.11   (+ 36.69)
+
+    Every one of those leaves the customer WORSE OFF, and the run reported
+    two of them as OPPORTUNITY. That is the same failure as MSC's fabricated
+    $267.01 and GoCCL's +$184-that-was-really-minus-$6: a percentage quoted
+    against a base nobody checked.
+
+    Returns (beats, reason):
+        True  - repriced total is genuinely below the current fare
+        False - it is not; recommending it would cost the customer money
+        None  - cannot tell, so nothing may be claimed either way
+    """
+    if current_total is None or today_price is None:
+        return None, ("today's price or the current total could not be read, "
+                      "so it is unknown whether a discount would beat the "
+                      "fare already held")
+    if discount_pct is None or discount_pct <= 0:
+        return None, "no discount percentage to evaluate"
+    if today_price <= 0 or current_total <= 0:
+        return None, "a zero or negative price cannot be compared"
+
+    repriced = round(today_price * (1 - discount_pct / 100.0), 2)
+    if repriced < current_total:
+        return True, (f"repricing today at {today_price:,.2f} less "
+                      f"{discount_pct:g}% gives {repriced:,.2f}, below the "
+                      f"current {current_total:,.2f}")
+    return False, (f"repricing today at {today_price:,.2f} less "
+                   f"{discount_pct:g}% still gives {repriced:,.2f}, which is "
+                   f"ABOVE the {current_total:,.2f} already booked - applying "
+                   f"it would cost the customer {repriced - current_total:,.2f}")
+
+
 def _filter_out_ineligible_senior_discount(options: list[str] | None, senior_count: int) -> list[str] | None:
     """CONFIRMED HARD RULE, stated directly by Neon 2026-08-18 after a
     real false positive (booking 3000030 — a single 83-year-old traveling

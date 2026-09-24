@@ -78,9 +78,11 @@ if [ -s "$DENY" ]; then
 fi
 
 # ---------------------------------------------------- 3. booking references
-# Allowed placeholders: 3000xxx, DEMOnn, and the README's demo pair.
+# Allowed placeholders: 300xxxx, DEMOnn, and the README's demo pair. The range
+# is 300[0-9]{4} rather than 3000[0-9]{3} because a sanitisation pass on
+# 2026-09-24 ran past 3000999 and its own placeholders were then flagged.
 numeric=$(scan '[Bb]ooking[s]?[[:space:]_-]*(id|ref|number|#)?[[:space:]:=#-]*[0-9]{5,9}' \
-  | grep -vE '3000[0-9]{3}|1234567|7654321' | head -8)
+  | grep -vE '300[0-9]{4}|1234567|7654321' | head -8)
 [ -n "$numeric" ] && problem "real-looking numeric booking reference" "$numeric" \
   "Use a placeholder in the 3000xxx range instead."
 
@@ -104,7 +106,8 @@ secrets=$(scan '[-]{5}BEGIN [A-Z ]*PRIVATE KEY|AKIA[0-9A-Z]{16}|ASIA[0-9A-Z]{16}
   "Store it in the OS keychain (see platform/save_login.py), never in the repo."
 
 assigned=$(iscan '(password|passwd|api_?key|secret|auth_token)[[:space:]]*[:=][[:space:]]*["'"'"'][^"'"'"']{6,}' \
-  | grep -viE 'getpass|input\(|placeholder|os\.environ|keyring|settings\.|help=|description|selector|label|example' | head -5)
+  | grep -viE 'getpass|input\(|placeholder|os\.environ|keyring|settings\.|help=|description|selector|label|example' \
+  | grep -vE '[:=][[:space:]]*["'"'"'][#.\[]' | head -5)   # CSS selectors: "#password", ".pw-field", "[name=secret]"
 [ -n "$assigned" ] && problem "hardcoded credential literal" "$assigned" \
   "Store it in the OS keychain instead."
 

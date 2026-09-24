@@ -16,10 +16,15 @@ from typing import Callable
 from sqlalchemy import select
 
 from config.settings import settings
+from core.booking_features import extract as extract_booking_features
 from core.calculator import make_error_result, make_skipped_result
 from core.models import BookingResult, BookingStatus, CruiseLine, ScanJob, ScanJobStatus
 from models.database import BookingRecord, MarketDataRecord, PriceHistory, ScanJobRecord, async_session
-from scraper.base import BaseScraper, is_dead_browser_error
+from scraper.base import (
+    BaseScraper,
+    is_dead_browser_error,
+    is_session_expired_error,
+)
 from scraper.espresso import EspressoScraper
 from scraper.goccl import GoCCLScraper
 from scraper.ncl import NclScraper
@@ -441,6 +446,25 @@ class BookingService:
             # check_login and DOCUMENTATION.md section L) and reports every
             # client as ERROR. Refusing up-front with an actionable message
             # is strictly better than discovering it 400 bookings in.
+            # RE-ARM THE PORTAL'S OWN AUTO-LOGOUT BEFORE JUDGING THE
+            # SESSION. ESPRESSO arms a 30.5-minute client-side timer on
+            # every page load that navigates the BROWSER to logout; found
+            # 2026-09-21 in a live capture, confirmed in 50 occurrences
+            # across 25 pages. The reported sequence - "Check login"
+            # succeeds, the operator does something else, presses Start and
+            # is told to log in again - is that timer firing in between.
+            # Touching the portal first costs one navigation and removes a
+            # whole class of false "not logged in" failures.
+            keepalive = getattr(scraper, "keep_session_alive", None)
+            if keepalive is not None:
+                try:
+                    if await keepalive():
+                        logger.info("batch.session_refreshed_before_start",
+                                    job_id=job.job_id)
+                except Exception as exc:
+                    logger.warning("batch.keepalive_failed",
+                                   job_id=job.job_id, error=str(exc)[:200])
+
             if "_check_login" in type(scraper).__dict__:
                 try:
                     session_ok = await scraper._check_login()
@@ -506,6 +530,14 @@ class BookingService:
                     )
                     return
 
+            # One re-login attempt per batch - see the session-expiry
+            # branch below. The booking that was interrupted keeps its ERROR
+            # row (it failed to the SESSION, not to anything about itself)
+            # and is named in the job warning so it can be re-run; the
+            # REMAINING bookings are what recovery is really for.
+            session_recovery_used = False
+            interrupted_by_logout: list[str] = []
+
             for i, booking_id in enumerate(job.booking_ids):
                 if self._stop_flags.get(job.job_id):
                     job.status = ScanJobStatus.STOPPED
@@ -570,6 +602,97 @@ class BookingService:
                             await scraper.release_booking(booking_id)
                         except Exception:
                             pass
+
+                    # SESSION EXPIRY IS NOT A DEAD BROWSER. Added 2026-09-21.
+                    #
+                    # Neon: "in the middle of scrapping sometimes the
+                    # account logges out and does not log in automatically".
+                    # EspressoScraper raises "Session logged out while
+                    # searching" when its own _check_login fails mid-batch,
+                    # and nothing recognised it: the loop tested only
+                    # _is_dead_browser_error, and a signed-out portal is a
+                    # perfectly healthy browser showing a login page. So the
+                    # batch carried on into the login wall one booking at a
+                    # time - the recorded 2026-08-27 run where ESPRESSO
+                    # bookings #400-403 died in sequence.
+                    #
+                    # Recovery is attempted ONCE per batch. If it works the
+                    # remaining bookings continue; if it does not, the batch
+                    # STOPS here rather than turning the rest of the
+                    # watchlist into identical ERROR rows against a login
+                    # screen. Stopping with 400 real results and a clear
+                    # reason beats 500 rows where the last 100 are noise -
+                    # and on a bot-sensitive account, hammering a login wall
+                    # is itself a risk.
+                    if is_session_expired_error(e):
+                        if session_recovery_used:
+                            logger.error(
+                                "batch.session_expired_again",
+                                booking_id=booking_id, job_id=job.job_id)
+                            job.error = (
+                                f"{job.cruise_line.value} signed out again at "
+                                f"booking {booking_id} after a successful "
+                                f"re-login. Stopped with {len(job.results)} of "
+                                f"{len(job.booking_ids)} bookings checked."
+                            )
+                            break
+                        session_recovery_used = True
+                        logger.warning("batch.session_expired_recovering",
+                                       booking_id=booking_id, job_id=job.job_id)
+                        status = None
+                        try:
+                            if hasattr(scraper, "auto_login"):
+                                status = await scraper.auto_login()
+                            logger.info("batch.session_recovery_login",
+                                        job_id=job.job_id, status=status)
+                        except Exception as relogin_error:
+                            logger.error("batch.session_recovery_failed",
+                                         job_id=job.job_id,
+                                         error=str(relogin_error)[:200])
+
+                        recovered = False
+                        try:
+                            if "_check_login" in type(scraper).__dict__:
+                                recovered = await scraper._check_login()
+                            else:
+                                recovered = status in ("OK", "ALREADY_LOGGED_IN")
+                        except Exception:
+                            recovered = False
+
+                        if recovered:
+                            logger.info("batch.session_recovered",
+                                        job_id=job.job_id, booking_id=booking_id)
+                            interrupted_by_logout.append(booking_id)
+                            job.warning = (
+                                f"{job.cruise_line.value} signed out during the "
+                                f"scan and was logged back in automatically. "
+                                f"Re-run "
+                                f"{', '.join(interrupted_by_logout)} - "
+                                f"{'it' if len(interrupted_by_logout) == 1 else 'they'} "
+                                f"failed to the logout, not to the booking."
+                            )
+                            # Fall through: this booking keeps its ERROR row,
+                            # and the rest of the batch continues on a good
+                            # session instead of failing one at a time.
+
+                        # Could not get back in. ESPRESSO's auto_login can
+                        # only return FILLED_AWAITING_MFA when the account
+                        # demands MFA - there is no unattended way past that,
+                        # and pretending otherwise would just produce a
+                        # louder failure.
+                        job.error = (
+                            f"{job.cruise_line.value} signed out during the scan "
+                            f"at booking {booking_id} and could not be logged "
+                            f"back in automatically"
+                            + (f" (auto-login said {status})" if status else "")
+                            + f". Stopped with {len(job.results)} of "
+                            f"{len(job.booking_ids)} bookings checked - click "
+                            f"\"Check login\", complete the login, then Start "
+                            f"again to do the rest."
+                        )
+                        logger.error("batch.session_recovery_gave_up",
+                                     job_id=job.job_id, status=status)
+                        break
 
                     if self._is_dead_browser_error(e):
                         logger.warning("batch.browser_dead_restarting", booking_id=booking_id)
@@ -661,10 +784,45 @@ class BookingService:
                 job.results.append(result)
                 job.progress_done = i + 1
 
+                # ESPRESSO states sailDate/shipCode/shipName in the booking
+                # page's own embedded JSON. Read via the scraper's
+                # read_feature_fields(), which matches them INSIDE the page
+                # and returns ~200 bytes.
+                #
+                # It used to call page.content() here, pulling the whole DOM
+                # over CDP. Real booking pages average 422 KB and the scan
+                # already serialises that twice per booking for the two page
+                # snapshots - so this made it three times, ~630 MB across a
+                # 500-booking watchlist, to obtain six short strings.
+                # Taken from what the scraper captured WHILE ON THE
+                # BOOKING PAGE. Calling read_feature_fields() here instead
+                # was the 2026-09-22 bug: check_booking ends with
+                # release_booking(), which navigates away, so the read
+                # landed on the wrong page and silently produced NULLs.
+                feature_fields = getattr(scraper, "last_feature_fields", None)
+
+                # The price DRIVERS for this scan, captured from whatever
+                # the scraper already has in hand - no extra page loads and
+                # no extra requests. Failure here must never cost the result
+                # itself, so it is best-effort and the price row is written
+                # either way.
+                features = None
+                try:
+                    features = extract_booking_features(
+                        result.cruise_line.value,
+                        page_fields=feature_fields,
+                        market_data=getattr(scraper, "last_market_data", None),
+                        initial_data=getattr(scraper, "last_initial_data", None),
+                    )
+                except Exception as feat_error:
+                    logger.warning("batch.feature_extract_failed",
+                                   booking_id=booking_id,
+                                   error=str(feat_error)[:200])
+
                 # Persist result
                 try:
                     await self._save_result_to_db(result)
-                    await self._save_price_history(result)
+                    await self._save_price_history(result, features)
                     persisted = True
                 except Exception as e:
                     persisted = False
@@ -919,18 +1077,52 @@ class BookingService:
             session.add(record)
             await session.commit()
 
-    async def _save_price_history(self, result: BookingResult) -> None:
-        """Record a price snapshot."""
+    async def _save_price_history(self, result: BookingResult,
+                                  features=None) -> None:
+        """Record a price snapshot, with the drivers that move the price.
+
+        `features` is a core.booking_features.BookingFeatures captured from
+        the same scan. It is OPTIONAL and every field inside it is nullable:
+        a scan that could not read a sail date writes NULL, never a 0 that a
+        model would read as "sails today".
+
+        WIDENED 2026-09-21. Until now this stored price, category and a
+        timestamp - and a drop-prediction model built on 5,067 such rows
+        scored 0.549 AUC on a temporal split once scan-cadence features were
+        removed, because the actual drivers (days to sailing above all) were
+        nowhere in the table. Capturing them from now on is what makes the
+        question answerable later; see core/booking_features.py.
+        """
         if result.old_total <= 0:
             return
+        row = dict(
+            booking_id=result.booking_id,
+            cruise_line=result.cruise_line.value,
+            total=result.old_total,
+            category=result.price_category,
+        )
+        if features is not None:
+            try:
+                row.update({k: v for k, v in features.as_row().items()
+                            if v is not None})
+            except Exception as exc:
+                # Never let feature capture cost us the price row itself -
+                # the price is the thing we cannot re-derive later.
+                logger.warning("price_history.features_failed",
+                               booking_id=result.booking_id, error=str(exc)[:200])
         async with async_session() as session:
-            session.add(PriceHistory(
-                booking_id=result.booking_id,
-                cruise_line=result.cruise_line.value,
-                total=result.old_total,
-                category=result.price_category,
-            ))
+            session.add(PriceHistory(**row))
             await session.commit()
+        # One line per stored booking, for scan_watchdog's feature monitor.
+        # ESPRESSO's driver fields come from a regex over its Angular
+        # bootstrap, so a portal restructure would make them silently NULL
+        # rather than raise - this is what makes that visible while the scan
+        # is still running.
+        logger.info("price_history.features",
+                    booking_id=result.booking_id,
+                    cruise_line=result.cruise_line.value,
+                    sail_date=row.get("sail_date"),
+                    days_to_sailing=row.get("days_to_sailing"))
 
     async def _save_market_data_to_db(self, result: BookingResult, market_data: dict) -> None:
         """Persist read-only market/category snapshot data."""

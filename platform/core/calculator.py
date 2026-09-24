@@ -12,6 +12,7 @@ from datetime import datetime
 from decimal import Decimal, ROUND_HALF_UP
 
 from .confidence import calc_confidence
+from .goccl_fare_types import best_and_cheapest, rank_candidates
 from .models import BookingResult, BookingStatus, CruiseLine
 
 
@@ -1284,6 +1285,13 @@ def calculate_goccl(
     available_offer_codes: list[dict],
     guests_count: int = 2,
     guests_count_verified: bool = False,
+    # The booking's CURRENT fare, needed to say what a switch would cost the
+    # customer (core/goccl_fare_types.py). Optional so existing callers and
+    # replayed historical data keep working - when the name is absent the
+    # tier simply reads as unknown and no terms claim is made, rather than a
+    # tier being assumed.
+    current_offer_name: str | None = None,
+    current_disclaimer: str | None = None,
 ) -> BookingResult:
     """
     Analyze a GoCCL (Carnival) booking's offer-code comparison and surface
@@ -1366,10 +1374,77 @@ def calculate_goccl(
             else f" [guest count UNVERIFIED — assumed {guests_count}; confirm real occupancy before trusting this figure]"
         )
 
-        cheapest = min(candidates, key=lambda o: safe_float(o.get("price_per_person", 0)))
+        # PICK THE BEST CANDIDATE, NOT THE CHEAPEST. Changed 2026-09-18.
+        #
+        # This used to be a bare min() on price_per_person. On Carnival the
+        # cheapest fare is reliably the most RESTRICTIVE one: across seven of
+        # Neon's real bookings the cheapest was PSV "SUPER SAVER" four
+        # times, which carries a non-refundable deposit, no price protection,
+        # and hands the choice of stateroom location back to Carnival.
+        #
+        # Offering only that candidate meant the single option on the table
+        # was the one most likely to be a bad trade - and once the 3x OBC
+        # rule (OBC_LOSS_MIN_RATIO, shared with ESPRESSO and NCL) was applied
+        # to it, the booking would come back "no saving" while a perfectly
+        # good option sat a few dollars further down the list.
+        #
+        # Measured on the real ZM57P7 BALCONY column:
+        #     PSV SUPER SAVER  saves 117.04  but loses the cabin choice,
+        #                      price protection and a refundable deposit
+        #     OB7 EARLY SAVER  saves  97.04  and ADDS price protection
+        # $20 buys all of that back. rank_candidates orders on terms first
+        # and money second; the downgrade is still returned, ranked last, so
+        # nothing is hidden and taking it stays a deliberate choice.
+        ranked = rank_candidates(
+            current_offer_name=current_offer_name,
+            current_disclaimer=current_disclaimer,
+            offers=candidates,
+            guests_count=guests_count,
+            current_gross=round2(current_price_gross),
+        )
+        best, cheapest_candidate = best_and_cheapest(ranked)
+        chosen = best or cheapest_candidate
+
+        # What this switch does to the customer's terms, and - when the
+        # recommendation is NOT the cheapest fare - what declining the
+        # cheaper one costs. Both are stated, so the choice stays visible
+        # rather than being quietly made here.
+        terms_note = ""
+        if chosen is not None:
+            if chosen.tier_delta or chosen.is_downgrade:
+                terms_note = f" [TERMS: {chosen.terms_note}]"
+            if (best is not None and cheapest_candidate is not None
+                    and best.offer_code != cheapest_candidate.offer_code):
+                gap = round2(cheapest_candidate.price_drop - best.price_drop)
+                terms_note += (
+                    f" [a cheaper '{cheapest_candidate.offer_code}' saves "
+                    f"${round(cheapest_candidate.price_drop)} "
+                    f"(${round(gap)} more) but {cheapest_candidate.terms_note}]"
+                )
+            if chosen.obc_risk:
+                terms_note += (
+                    " [OBC RISK: the current fare advertises onboard credit and "
+                    "this one does not — confirm on the review screen; the "
+                    f"{OBC_LOSS_MIN_RATIO:.0f}x rule applies to any OBC given up]"
+                )
+
         old_total = round2(current_price_gross)
-        estimated_new_total = round2(safe_float(cheapest.get("price_per_person", 0)) * guests_count)
-        price_drop = round2(old_total - estimated_new_total)
+        if chosen is not None:
+            cheapest = {
+                "offer_code": chosen.offer_code,
+                "offer_name": chosen.offer_name,
+                "price_per_person": chosen.price_per_person,
+            }
+            estimated_new_total = chosen.new_gross
+            price_drop = chosen.price_drop
+        else:
+            # No cheaper offer at all. Fall back to the raw minimum purely so
+            # the existing "isn't actually lower" branch below can report the
+            # real numbers rather than nothing.
+            cheapest = min(candidates, key=lambda o: safe_float(o.get("price_per_person", 0)))
+            estimated_new_total = round2(
+                safe_float(cheapest.get("price_per_person", 0)) * guests_count)
+            price_drop = round2(old_total - estimated_new_total)
 
         if price_drop <= 0:
             return BookingResult(
@@ -1418,7 +1493,7 @@ def calculate_goccl(
             note=(
                 f"candidate ${round(price_drop)} — offer code '{offer_code}' "
                 f"({cheapest.get('offer_name', '')}) — UNCONFIRMED, run preview_fare_code to verify "
-                f"gross total + OBC before repricing{guest_note}"
+                f"gross total + OBC before repricing{guest_note}{terms_note}"
             ),
             booking_id=booking_id,
             price_category=price_category,
@@ -1690,6 +1765,34 @@ def make_skipped_result(
         cruise_line=cruise_line, status=BookingStatus.SKIPPED_TODAY,
         note=f"Checked {h}h ago — no saving cached",
         booking_id=booking_id, price_category=price_category,
+    )
+
+
+def make_cancelled_result(booking_id, price_category, cruise_line,
+                          detail: str = "") -> "BookingResult":
+    """A CANCELLED booking. Never a saving, never "paid in full".
+
+    ESPRESSO renders "N/A" for every price when sb.reservation.status is
+    'CX', while its payment panel still reads Total Price 0.00 and Final
+    Payment Due 0.00 - which is_paid_in_full() accepts. Booking 3001005 was
+    therefore filed as "Fully paid - repricing unavailable" four times.
+
+    Confidence is deliberately 0: this is not a graded opportunity, it is a
+    fact about the account that needs a human.
+    """
+    return BookingResult(
+        cruise_line=cruise_line,
+        status=BookingStatus.CANCELLED,
+        booking_id=booking_id,
+        price_category=price_category,
+        old_total=0.0,
+        new_total=0.0,
+        net_saving=0.0,
+        confidence=0,
+        note=("BOOKING IS CANCELLED — the portal reports this reservation as "
+              "cancelled (status CX) and shows no prices for it. Not a "
+              "repricing opportunity; check the account."
+              + (f" {detail}" if detail else "")),
     )
 
 

@@ -51,6 +51,10 @@ CRUISE_LINES = {
     # must stay in step with NclScraper.credential_service.
     "3": ("NCL — US account (USD)", settings.ncl_credential_service),
     "4": ("NCL — Canada account (CAD)", f"{settings.ncl_credential_service}_ca"),
+    # ADDED 2026-09-18. Carnival/GoCCL was the only line with a scraper but
+    # no way to save a credential, so every Carnival scan needed a human to
+    # sign in by hand first — and nothing could run unattended.
+    "5": ("GoCCL Navigator (Carnival)", settings.goccl_credential_service),
 }
 
 # Strips bracketed-paste escape sequences some terminals wrap pasted text
@@ -269,6 +273,14 @@ def main() -> None:
             "now route agent login through a newer SSO layer (\"Norwegian Central\") rather "
             "than a direct username/password form on seawebagents.ncl.com — check which one "
             "your login actually uses before assuming this saved credential applies as-is.\n"
+        )
+
+    if service_name == settings.goccl_credential_service:
+        print(
+            "Note: the GoCCL username is the short agent ID (e.g. 'neon.lane'), "
+            "NOT an email address — that's the form the real sign-in page takes.\n"
+            "Sign-in happens at www.goccl.com/accounts/login; the booking engine "
+            "then opens in a separate POPUP window.\n"
         )
 
     username = _clean(input(f"{label} username / agent ID: "))

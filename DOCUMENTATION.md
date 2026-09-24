@@ -1648,7 +1648,7 @@ across commits so diffs stay readable:
 
 | Portal family | Real shape | Placeholder |
 |---|---|---|
-| ESPRESSO / NCL / MSC | 5–9 digit number | `3000001`–`3000999` |
+| ESPRESSO / NCL / MSC | 5–9 digit number | `3000001`–`3009999` |
 | GoCCL / Princess (POLAR) | 6-char PNR-style code | `DEMO01`–`DEMO99` |
 | README CLI examples | — | `1234567`, `7654321` |
 

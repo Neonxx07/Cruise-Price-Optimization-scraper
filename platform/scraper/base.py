@@ -6,6 +6,7 @@ All cruise line scrapers inherit from BaseScraper.
 from __future__ import annotations
 
 import asyncio
+import time
 import re
 from abc import ABC, abstractmethod
 from typing import Callable, Optional
@@ -41,6 +42,46 @@ _DEAD_TRANSPORT_SIGNATURES = (
     "browser closed",
     "browser has disconnected",
 )
+
+
+# Markers a scraper uses to say "the portal signed us out mid-scrape". Kept
+# here beside is_dead_browser_error because the two are the SAME KIND of
+# signal - "reusing this scraper as-is will fail identically on every
+# remaining booking" - but need OPPOSITE recovery: a dead browser is
+# restarted, an expired session is re-authenticated.
+_SESSION_EXPIRED_MARKERS = (
+    "session logged out",
+    "please log into",
+    "not logged in",
+    "session expired",
+    "login required",
+)
+
+
+def is_session_expired_error(exc: Exception) -> bool:
+    """Whether an exception means the PORTAL signed us out, not that the
+    browser died.
+
+    THE GAP THIS CLOSES. EspressoScraper._search_booking raises
+    "Session logged out while searching - please log into ESPRESSO again"
+    when its own _check_login fails mid-batch, and nothing recognised it.
+    BookingService's loop tested only is_dead_browser_error - and a
+    logged-out session is a perfectly healthy browser showing a login page,
+    so the restart path never fired. The batch simply carried on into the
+    login wall one booking at a time.
+
+    That is the recorded 2026-08-27 incident, where ESPRESSO bookings
+    #400-403 died in sequence between 14:19 and 14:31 UTC, and it is what
+    Neon reported again on 2026-09-21: "in the middle of scrapping
+    sometimes the account logges out and does not log in automatically".
+
+    Deliberately NARROW: it matches the scrapers' own worded signals, not
+    any timeout that happens to mention a selector. A false positive here
+    would trigger a needless re-login - which on ESPRESSO can itself
+    disturb a live session - so the cost of guessing is real.
+    """
+    text = str(exc).lower()
+    return any(marker in text for marker in _SESSION_EXPIRED_MARKERS)
 
 
 def is_dead_browser_error(exc: Exception) -> bool:
@@ -199,6 +240,38 @@ _STRUCTURED_EXTRACT_JS = """
     };
 })()
 """
+
+
+class _Stopwatch:
+    """Per-stage timings for one booking, emitted as one structured line.
+
+    ADDED 2026-09-21. Neon: "i am actually running the process right now
+    and it is heavy". Nothing measured where a booking's seconds actually
+    went, so every performance discussion was guesswork - and ESPRESSO in
+    particular does TWO full navigations and TWO login checks per booking,
+    which may or may not be the dominant cost. Now the log says.
+
+    Cheap by construction: a monotonic clock read per stage and a single
+    log line per booking.
+    """
+
+    __slots__ = ("_t0", "_last", "stages")
+
+    def __init__(self):
+        import time as _time
+        self._t0 = self._last = _time.monotonic()
+        self.stages: dict[str, int] = {}
+
+    def mark(self, name: str) -> None:
+        import time as _time
+        now = _time.monotonic()
+        self.stages[name] = int((now - self._last) * 1000)
+        self._last = now
+
+    @property
+    def total_ms(self) -> int:
+        import time as _time
+        return int((_time.monotonic() - self._t0) * 1000)
 
 
 class BaseScraper(ABC):
@@ -581,6 +654,17 @@ class BaseScraper(ABC):
             and self._browser.is_connected()
         )
 
+    #: When the page last actually navigated. Used by ESPRESSO's
+    #: keep_session_alive to tell an idle session from a busy one - the
+    #: portal arms a 30.5-minute client-side auto-logout on every load.
+    _last_navigation_at: float | None = None
+
+    #: Price-driver fields captured by the scraper WHILE ON the booking
+    #: page, for core.booking_features. Declared here so every scraper has
+    #: the attribute and BookingService never has to guess whether it
+    #: exists; a line that captures nothing simply leaves it empty.
+    last_feature_fields: dict | None = None
+
     async def navigate(self, url: str, wait_until: str = "domcontentloaded", attempts: int = 3) -> None:
         """Navigate to a URL and wait for load, retrying a transient hang.
 
@@ -608,6 +692,10 @@ class BaseScraper(ABC):
             try:
                 logger.debug("navigate", url=url, attempt=attempt)
                 await self.page.goto(url, wait_until=wait_until)
+                # Every load re-arms ESPRESSO's 30.5-minute client-side
+                # auto-logout, so this stamp is what tells an idle session
+                # from a busy one. See EspressoScraper.keep_session_alive.
+                self._last_navigation_at = time.monotonic()
                 if attempt > 1:
                     logger.info("browser.navigate_recovered", url=url, attempt=attempt)
                 return

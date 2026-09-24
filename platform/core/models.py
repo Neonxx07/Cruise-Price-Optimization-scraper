@@ -47,6 +47,20 @@ class BookingStatus(str, Enum):
     # upgrade, never a downgrade or sideways move. Always human-reviewed
     # before acting, same as WLT/PAID_IN_FULL — never auto-selected.
     UPGRADE_AVAILABLE = "UPGRADE_AVAILABLE"
+    # ADDED 2026-09-22, at Neon's explicit insistence: "IF THE SCANNER OR
+    # SCRIPT CATCHES THIS IT MEANS THAT THE BOOKING IS CANCELED AND IT IS
+    # VERY MADNATORY TO REPORT IT AS IT SOMETHING VERY CRITICAL".
+    #
+    # ESPRESSO marks a cancelled reservation with sb.reservation.status ==
+    # 'CX' and renders "N/A" in place of every price. Its payment panel
+    # still shows Total Price 0.00 and Final Payment Due 0.00 - which
+    # is_paid_in_full() reads as TRUE, so booking 3001005 was reported as
+    # "Fully paid - repricing unavailable" on four separate days. 87 results
+    # across 27 distinct bookings carry that same zero-total signature.
+    #
+    # A cancellation is not a pricing outcome and must never be filed as
+    # one: it is an account fact the agency has to act on.
+    CANCELLED = "CANCELLED"
 
 
 class ScanJobStatus(str, Enum):
@@ -422,5 +436,14 @@ class ScanJob(BaseModel):
     # out, or a restart failed. _run_batch's pre-flight session check sets
     # this to an actionable sentence; the GUI renders it verbatim.
     error: Optional[str] = None
+
+    # ADDED 2026-09-21. A job can COMPLETE successfully and still have
+    # something the operator must act on - the case that prompted it: the
+    # portal signed us out mid-scan, the batch logged back in and carried
+    # on, but the one booking that was in flight at the time still failed.
+    # That is not a job failure (the other 400 are fine) so it must not go
+    # in `error`, and it is not visible in any single row either. Kept
+    # separate so a COMPLETED job can still say "re-run these two".
+    warning: Optional[str] = None
 
     model_config = {"from_attributes": True}

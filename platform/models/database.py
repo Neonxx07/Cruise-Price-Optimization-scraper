@@ -106,6 +106,36 @@ class PriceHistory(Base):
     category = Column(String(20))
     checked_at = Column(DateTime, default=datetime.utcnow)
 
+    # ── what actually moves a cruise price ──────────────────────────────
+    #
+    # ADDED 2026-09-21. A drop-prediction model trained on this table's
+    # first 5,067 rows scored AUC 0.686 on a temporal split - and only
+    # 0.549 once scan-cadence features were removed, i.e. barely better
+    # than a coin flip. The reason was not the amount of data: the table
+    # recorded price, category and a timestamp, and NONE of the drivers.
+    # DAYS TO SAILING is the dominant one in cruise pricing and was stored
+    # nowhere at all (0 of 5,407 market_data payloads carried it either).
+    #
+    # Every field below was located in REAL captured data for each line -
+    # see core/booking_features.py, which does the extraction. They are all
+    # NULLABLE on purpose: a booking whose sail date could not be read must
+    # read back as NULL, never as a 0 that a model would treat as "sails
+    # today". Existing rows keep NULL, which is the truth about them.
+    sail_date = Column(String(10), index=True)        # ISO, unknown -> NULL
+    days_to_sailing = Column(Integer, index=True)     # negative = already sailed
+    ship_code = Column(String(10))
+    ship_name = Column(String(60))
+    nights = Column(Integer)
+    fare_code = Column(String(20))                    # the REAL offer code
+    stateroom_type = Column(String(30))
+    guests_count = Column(Integer)
+    final_payment_date = Column(String(10))
+    net_balance_due = Column(Float)
+    currency = Column(String(8))
+    region = Column(String(60))
+    itinerary_code = Column(String(20))
+    embark_port = Column(String(60))
+
 
 class ScanJobRecord(Base):
     """Tracks batch scan jobs."""

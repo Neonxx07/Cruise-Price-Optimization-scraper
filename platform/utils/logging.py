@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import pathlib
 import sys
 
 import structlog
@@ -56,7 +57,19 @@ def setup_logging(level: str = "INFO", log_file: str = "") -> None:
 
     # Optional file handler
     if log_file:
-        file_handler = logging.FileHandler(log_file)
+        # ROTATING, not plain FileHandler. Added 2026-09-21: nothing was
+        # ever written to disk (every caller passed no log_file), so a
+        # failure mid-scan scrolled past in the GUI and was gone - which is
+        # why the recurring ESPRESSO login/logout faults kept having to be
+        # re-diagnosed from scratch. A plain FileHandler would have swapped
+        # that for a different problem: this project's data directory is
+        # already 3.1 GB, and an unbounded JSON log of every scan would just
+        # add to it. 10 MB x 5 keeps roughly the last few full runs.
+        from logging.handlers import RotatingFileHandler
+
+        pathlib.Path(log_file).parent.mkdir(parents=True, exist_ok=True)
+        file_handler = RotatingFileHandler(
+            log_file, maxBytes=10 * 1024 * 1024, backupCount=5, encoding="utf-8")
         file_formatter = structlog.stdlib.ProcessorFormatter(
             processor=structlog.processors.JSONRenderer(),
             foreign_pre_chain=processors,

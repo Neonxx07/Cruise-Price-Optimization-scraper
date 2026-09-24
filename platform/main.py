@@ -103,7 +103,7 @@ async def _run_login_check(args):
     from core.models import CruiseLine
     from utils.logging import setup_logging
 
-    setup_logging(settings.log_level)
+    setup_logging(settings.log_level, settings.log_file)
     # Login is the one step a human must complete by hand (MFA etc.), so
     # it must always show a real window — no CLI flag exposes an override,
     # and none should: a hidden login window can't be logged into.
@@ -277,7 +277,7 @@ async def _run_scan(args):
     from services.excel_export import export_results_excel
     from utils.logging import setup_logging
 
-    setup_logging(settings.log_level)
+    setup_logging(settings.log_level, settings.log_file)
     await init_db()
 
     booking_ids: list[str] = []
@@ -428,7 +428,7 @@ async def _run_watch(args):
     from services.excel_export import export_results_excel
     from utils.logging import setup_logging
 
-    setup_logging(settings.log_level)
+    setup_logging(settings.log_level, settings.log_file)
     await init_db()
 
     booking_ids: list[str] = []

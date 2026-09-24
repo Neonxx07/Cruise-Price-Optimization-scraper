@@ -21,14 +21,17 @@ separate, human-triggered path that confirms one candidate at a time.
 
 from __future__ import annotations
 
+import asyncio
 import re
+import time
 from dataclasses import dataclass, field
 
 from glom import Coalesce, glom
+from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
 from config.settings import settings
 from core.calculator import calculate_goccl, make_error_result
-from core.models import BookingResult, CruiseLine
+from core.models import BookingResult, BookingStatus, CruiseLine
 from utils.logging import get_logger
 
 from .base import BaseScraper, is_dead_browser_error
@@ -143,23 +146,546 @@ class GoCCLScraper(BaseScraper):
         # instead of presenting an unverified guest count as settled fact.
         self.guests_count = guests_count if guests_count is not None else settings.goccl_default_guests_count
         self.guests_count_verified = guests_count is not None
+        # The signed-in portal tab, once the booking engine has been opened
+        # in its popup and self.page has moved there. Kept because closing
+        # it would tear the popup down with it.
+        self.portal_page = None
+        # Advisories the booking engine's own API returned for the booking
+        # currently being checked. See _attach_advisory_listener.
+        self.last_advisories: list[dict] = []
+        #: Raw window.initialData from the most recent booking read.
+        self.last_initial_data: dict | None = None
+        self._advisory_listener_attached = False
+
+    # ── login and the booking-engine popup ──────────────────────────────
+    #
+    # THE STRUCTURAL BUG, found 2026-09-18 from a Playwright CRX recording
+    # of a real session. GoCCL does not serve the booking engine in the tab
+    # you sign into. The real flow is:
+    #
+    #     goccl.com/accounts/login  ->  fill username + password, Sign In
+    #       ->  click "Individual/Groups Staterooms"
+    #       ->  the booking engine opens in a POPUP WINDOW
+    #       ->  every later step happens in that popup
+    #
+    # This scraper deep-linked straight to goccl_search_url and had no
+    # popup handling anywhere - no expect_popup, no expect_page, nothing.
+    # That works only while a session is already authenticated in the
+    # current tab; otherwise the deep link lands on a login page and every
+    # wait_for_selector("#booked-root") sits there until it times out. It
+    # is the most likely cause of the 8 Locator.wait_for / Page.inner_text
+    # timeouts in the recorded Carnival run.
+
+    SEARCH_INPUT = "#ctl00_DefaultContent_txtBookingNumber"
+
+    # ── THE POINT OF NO RETURN ──────────────────────────────────────────
+    #
+    # Enumerated 2026-09-18 from every button on all five wizard pages of a
+    # real session. The wizard is read-only right up until ONE control:
+    #
+    #   /rate      Continue              data-comp="goto-next-page"
+    #              Discard Changes       data-comp="cancel"
+    #   /category  Select $1,391         (picks a category, still reversible)
+    #              Keep Same Stateroom   data-comp="continue-to-review"
+    #              Continue              data-comp="goto-next-page"
+    #   /review    Discard All Changes   (reversible)
+    #              Confirm Changes       <-- COMMITS THE REFARE
+    #
+    # "Confirm Changes" carries NO data-comp attribute, so it can only be
+    # matched on its text - which is exactly why it is listed explicitly
+    # here rather than left to a convention. This mirrors the standing rule
+    # in scraper/espresso.py about #repriceModalAcceptBtn1/2.
+    #
+    # This scraper discovers prices. It must never commit one.
+    FORBIDDEN_CLICK_TEXT = (
+        "confirm changes",
+        "confirm my changes",
+        "complete booking",
+        "submit payment",
+        "make a payment",
+        "pay with funship pay",
+    )
+
+    def _assert_safe_click(self, label: str | None) -> None:
+        """Raise rather than click anything that commits a change.
+
+        A guard, not a convention: a future edit that wires up a new click
+        path gets stopped here instead of silently repricing a live
+        booking. Deliberately matches on substring and case-insensitively,
+        because the failure this prevents is irreversible and a near-miss
+        on capitalisation is not a reason to let it through.
+        """
+        text = (label or "").strip().lower()
+        if not text:
+            return
+        for banned in self.FORBIDDEN_CLICK_TEXT:
+            if banned in text:
+                raise RuntimeError(
+                    f"REFUSING to click {label!r}: this control commits a "
+                    f"change to a live booking. This scraper is read-only - "
+                    f"it discovers prices and never applies them."
+                )
+
+    def _switch_to_page(self, page) -> None:
+        """Make `page` the one this scraper operates on.
+
+        Writes to _page, NOT to `page`: BaseScraper exposes `page` as a
+        read-only property that raises if the scraper has not started, so
+        `self.page = popup` fails with
+            AttributeError: property 'page' of 'GoCCLScraper' object has no setter
+        Caught 2026-09-18 by a test before this ever ran against the portal -
+        all three popup-following paths would have crashed on the first
+        window GoCCL opened.
+        """
+        self._page = page
+
+    async def auto_login(self) -> str:
+        """Sign in with the credential saved by save_login.py (option 5).
+
+        NEVER RAISES - returns a status string, matching NclScraper.auto_login
+        and msc_commands.auto_login so a caller can fall back to a manual
+        login rather than crashing a whole run. Returns "OK",
+        "ALREADY_LOGGED_IN", "NO_CREDENTIALS_SAVED", "INVALID_CREDENTIALS",
+        "TIMEOUT_WAITING_FOR_LOGIN" or "ERROR: ...".
+
+        Selectors are matched by ROLE and visible label, exactly as the CRX
+        recording captured them ("Username:" textbox, "Sign In" button),
+        because no saved copy of the login page exists to read ids off. The
+        password field is located relative to the form rather than guessed
+        at by id - see _fill_password below.
+        """
+        import keyring
+
+        try:
+            service = settings.goccl_credential_service
+            username = keyring.get_password(service, "username")
+            password = keyring.get_password(service, "password")
+            if not username or not password:
+                return "NO_CREDENTIALS_SAVED"
+
+            await self.navigate(settings.goccl_login_url, wait_until="domcontentloaded")
+
+            # WAIT FOR THE SPA BEFORE DECIDING ANYTHING. The login page is a
+            # client-rendered app: the served HTML is a 13KB shell with an
+            # empty <title>, an empty <div id="accounts-root"> and a single
+            # hidden input, and the form is drawn later by
+            # /accounts/gocclr-accounts/assets/index-*.js. Confirmed
+            # 2026-09-18 by capturing the real page.
+            #
+            # Deciding before that lands is the ESPRESSO SSO race again: an
+            # unhydrated page has no form AND no booking-tool link, so a
+            # count() on either returns 0 and the code concludes something
+            # false about a page that simply had not drawn yet.
+            state = await self._wait_for_accounts_spa()
+            if state == "LOGGED_IN":
+                return "ALREADY_LOGGED_IN"
+            if state == "NOTHING_RENDERED":
+                return "TIMEOUT_WAITING_FOR_LOGIN"
+
+            # Clear the consent overlay BEFORE touching the form, or it
+            # intercepts the submit click.
+            await self._dismiss_cookie_banner()
+
+            user_box = self._username_box()
+            await user_box.wait_for(state="visible", timeout=15000)
+            await user_box.fill(username)
+
+            if not await self._fill_password(password):
+                return "ERROR: no password field found on the GoCCL login page"
+
+            submit = self.page.locator(self.LOGIN_SUBMIT)
+            if await submit.count():
+                await submit.first.click()
+            else:
+                await self.page.get_by_role(
+                    "button", name=re.compile(r"Sign\s*In", re.I)).click()
+
+            # Success is the booking-tool link appearing; failure is an error
+            # message or simply still being on the login form.
+            # Login lands on /accounts/post-login and then redirects to the
+            # dashboard at goccl.com/, where the booking-tool link lives.
+            # Waited on as ATTACHED rather than VISIBLE: it sits in a
+            # dashboard panel that need not be scrolled into view for the
+            # session to be good.
+            try:
+                await self._booking_tool_link().first.wait_for(state="attached", timeout=25000)
+            except Exception:
+                body = ""
+                try:
+                    body = (await self.page.inner_text("body"))[:4000]
+                except Exception:
+                    pass
+                if re.search(r"invalid|incorrect|not recogni|try again|locked", body, re.I):
+                    return "INVALID_CREDENTIALS"
+                return "TIMEOUT_WAITING_FOR_LOGIN"
+
+            self.log_action("auto_login", status="OK")
+            return "OK"
+        except Exception as exc:  # never raise out of a login helper
+            return f"ERROR: {str(exc)[:200]}"
+
+    # Real ids, CONFIRMED 2026-09-18 by capturing the rendered login page in
+    # a live watched session. The element CLASSES are hashed
+    # styled-components ("sc-FRoXv hUGVKw") and must never be selected on,
+    # but the ids are clean and semantic, and each is tied to its own
+    # <label for=...> ("Username:" / "Password:") exactly as the CRX
+    # recording showed.
+    LOGIN_USERNAME = "#username"
+    LOGIN_PASSWORD = "#password"
+    LOGIN_SUBMIT = "#loginButton"
+    # OneTrust consent banner. It renders over the page and will happily
+    # swallow the Sign In click - a silent, intermittent login failure that
+    # would look exactly like bad credentials.
+    COOKIE_ACCEPT = "#onetrust-accept-btn-handler"
+
+    async def _dismiss_cookie_banner(self) -> None:
+        try:
+            btn = self.page.locator(self.COOKIE_ACCEPT)
+            if await btn.count() and await btn.first.is_visible():
+                await btn.first.click(timeout=3000)
+                self.log_action("cookie_banner_dismissed")
+                await asyncio.sleep(0.4)
+        except Exception:
+            pass  # never let consent handling break a login
+
+    def _username_box(self):
+        """The username field: confirmed id first, accessible name as backup."""
+        box = self.page.locator(self.LOGIN_USERNAME)
+        return box if box else self.page.get_by_role(
+            "textbox", name=re.compile("Username", re.I))
+
+    async def _wait_for_accounts_spa(self, timeout: float = 30.0) -> str:
+        """Wait until the accounts SPA has actually drawn something.
+
+        Returns "LOGGED_IN" (the booking-tool link is on screen),
+        "LOGIN_FORM" (a password field is on screen) or "NOTHING_RENDERED".
+        Polls rather than racing a single wait_for, because either outcome
+        is legitimate and whichever arrives first is the answer.
+        """
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            try:
+                if await self._booking_tool_link().count():
+                    return "LOGGED_IN"
+                if await self.page.locator("input[type='password']:visible").count():
+                    return "LOGIN_FORM"
+            except Exception:
+                pass  # mid-navigation; try again
+            await asyncio.sleep(0.5)
+        return "NOTHING_RENDERED"
+
+    async def _fill_password(self, password: str) -> bool:
+        """Fill the password box without guessing at an id.
+
+        The recording never captured the password field (CRX deliberately
+        omits it), so this finds it structurally: the one visible
+        input[type=password] on the page. If there isn't exactly one, it
+        reports failure rather than typing a password into whatever it
+        found first.
+        """
+        box = self.page.locator(self.LOGIN_PASSWORD)
+        if await box.count() == 1:
+            await box.first.fill(password)
+            return True
+        boxes = self.page.locator("input[type='password']:visible")
+        if await boxes.count() != 1:
+            return False
+        await boxes.first.fill(password)
+        return True
+
+    def _booking_tool_link(self):
+        """The dashboard link that opens the booking engine.
+
+        Selected by HREF. The dashboard carries three different links to
+        the same booking-engine URL, and their text disagrees:
+
+            "Individual/Group Staterooms"    data-gtm-event=individual_group_staterooms
+            "Individual/Groups Staterooms"   data-gtm-event=group_staterooms
+            "The Fun Shops"                  data-gtm-event=the_fun_shops
+
+        Both spellings of Group(s) are genuine - they are simply different
+        links - so a text match picks whichever happens to be found first
+        and silently depends on which one that is. The href is the same on
+        all three and is the stable identity.
+
+        Also why this is not a get_by_role(name=regex) lookup: Playwright
+        serialises a compiled regex into its own /.../flags selector
+        syntax, and the "/" inside "Individual/Group..." closes the literal
+        early -
+            InvalidSelectorError: unexpected symbol "G" at position 22
+        """
+        return self.page.locator(settings.goccl_booking_tool_selector)
+
+    async def open_booking_tool(self) -> None:
+        """Click through to the booking engine, following it into its popup.
+
+        Sets self.page to the popup so every later step in this class
+        operates on the window that actually holds the booking tool. The
+        original portal tab is kept on self.portal_page - it is still a
+        live, signed-in session and closing it would end the popup's too.
+        """
+        if await self.page.locator(self.SEARCH_INPUT).count():
+            return  # already in the booking engine
+
+        # The dashboard link is a PLAIN href opened with target="_blank":
+        #   <a href="/BookingEngine/BookingSearch/SearchForReservations.aspx"
+        #      target="_blank" data-gtm-event="individual_group_staterooms">
+        # So the new window is the browser honouring target="_blank", not a
+        # scripted popup, and the same URL can simply be navigated to in
+        # place. That is strictly more robust: no window to lose track of,
+        # no popup timeout to tune.
+        #
+        # This also explains the original failure precisely. The old code's
+        # deep link to this URL was the RIGHT url - it just had no login
+        # step, so an expired session served a login page instead, and
+        # wait_for_selector("#booked-root") sat there until it timed out.
+        # Being signed in is the part that was missing.
+        self.log_action("open_booking_tool", url=settings.goccl_search_url)
+        await self.navigate(settings.goccl_search_url, wait_until="domcontentloaded")
+        try:
+            await self.page.wait_for_selector(self.SEARCH_INPUT, timeout=20000)
+            return
+        except PlaywrightTimeoutError:
+            pass
+
+        # Fallback: drive it the way a human does, and follow the window
+        # that opens. Kept because a portal that starts requiring the click
+        # (or bounces the deep link) must not take the scraper down with it.
+        self.log_action("open_booking_tool_fallback_click")
+        await self.navigate(settings.goccl_dashboard_url, wait_until="domcontentloaded")
+        link = self._booking_tool_link().first
+        await link.wait_for(state="attached", timeout=20000)
+        popup = await self._click_following_popup(link)
+        if popup is not None:
+            self.portal_page = self.page
+            self._switch_to_page(popup)
+        await self.page.wait_for_load_state("domcontentloaded")
+        await self.page.wait_for_selector(self.SEARCH_INPUT, timeout=30000)
+
+    async def _click_following_popup(self, locator, timeout: int = 15000):
+        """Click something that may open a popup, and return the popup.
+
+        Returns None when the click navigated in place instead. GoCCL opens
+        the booking engine in a popup, and some of its later controls open
+        further windows, so this is used wherever a click could go either
+        way - the alternative is what this scraper did before: keep waiting
+        on the old page for content that moved to a window it never knew
+        about.
+        """
+        try:
+            async with self.page.expect_popup(timeout=timeout) as popup_info:
+                await locator.click()
+            popup = await popup_info.value
+            await popup.wait_for_load_state("domcontentloaded")
+            self.log_action("followed_popup", url=popup.url)
+            return popup
+        except PlaywrightTimeoutError:
+            return None
+
+    # ── RULE ADV-001: the portal refuses, and says why ──────────────────
+    #
+    # Found 2026-09-18 by capturing API RESPONSE BODIES during the forensic
+    # sweep. Four bookings (DEMO09, CQ7X35, CQ7W42, CH7M42) reached /guest
+    # and then sat there until open_change_offer_rate timed out after 30
+    # seconds with "waiting for section.rate__container". Nothing in the DOM
+    # explained it - the Change Offer/Rate control is byte-identical to a
+    # working booking's, and is not disabled.
+    #
+    # The answer was never in the page. availability/rate returned:
+    #
+    #     HTTP 409  {"code":"999999","message":"Advisories were received",
+    #                "details":[{"code":"5108",
+    #                            "message":"The VIFP number is incorrect."}]}
+    #
+    # while a working booking returns HTTP 200 with rates=list[5]. The same
+    # advisory appeared on all four, and reproduced exactly on a re-run, so
+    # it is deterministic and booking-specific: Carnival will not quote a
+    # booking whose loyalty (VIFP) number is invalid.
+    #
+    # That is a DATA-QUALITY problem on the booking, fixable by a human -
+    # but only if it is reported. Reporting it as a 30-second timeout hid a
+    # fixable defect behind an infrastructure-shaped error.
+    _ADVISORY_PATH_RE = re.compile(r"/app/bookingengine/api/", re.I)
+
+    def _attach_advisory_listener(self) -> None:
+        """Record advisories the booking engine's API returns.
+
+        Attached once per page. Never raises and never blocks the response:
+        the body is read on a background task, because a response handler
+        that awaits inside Playwright's event loop can deadlock the page.
+        """
+        if self._advisory_listener_attached:
+            return
+
+        def on_response(resp):
+            try:
+                if not self._ADVISORY_PATH_RE.search(resp.url):
+                    return
+
+                async def read():
+                    try:
+                        body = await resp.json()
+                    except Exception:
+                        return
+                    if not isinstance(body, dict):
+                        return
+
+                    # TWO CHANNELS, both real.
+                    #
+                    # 1) The 409 error envelope:
+                    #      {"code":"999999","message":"Advisories were
+                    #       received","details":[{"code":"5108", ...}]}
+                    # 2) advisorySummary on a SUCCESS response, found
+                    #    2026-09-18 on a 200 from availability/stateroom:
+                    #      {"advisories": [], "hasError": false,
+                    #       "hasInformational": false}
+                    #
+                    # The second is the portal's own first-class advisory
+                    # field and can carry a problem while the HTTP status
+                    # is 200 - so keying only on status >= 400 would miss
+                    # it. "200 is not automatically valid" (brief s.30).
+                    candidates: list[tuple[dict, bool]] = []
+                    if resp.status >= 400:
+                        # The 409 envelope is always a refusal.
+                        candidates += [(d, True)
+                                       for d in ((body.get("details") or []) or [body])]
+
+                    summary = body.get("advisorySummary")
+                    if isinstance(summary, dict):
+                        # hasError SEPARATES A REFUSAL FROM A REMARK, and
+                        # getting this wrong is not academic. A first cut
+                        # treated every advisorySummary entry as a problem;
+                        # replayed over the evidence it condemned ~20
+                        # perfectly good bookings on the strength of
+                        #   {"code": 1241,
+                        #    "description": "Option extension is not
+                        #                    applicable to deposited bookings.",
+                        #    hasError: false, hasInformational: true}
+                        # which is a note about an unrelated feature, on a
+                        # 200, on bookings that quoted 3-11 rates fine.
+                        #
+                        # Note also the field name: this channel says
+                        # DESCRIPTION where the 409 envelope says MESSAGE.
+                        # Reading only "message" produced advisories whose
+                        # text was the literal string "None".
+                        blocking = bool(summary.get("hasError"))
+                        candidates += [(a, blocking)
+                                       for a in (summary.get("advisories") or [])]
+
+                    for detail, blocking in candidates:
+                        if not isinstance(detail, dict):
+                            continue
+                        code = str(detail.get("code") or "").strip()
+                        msg = str(detail.get("message")
+                                  or detail.get("description") or "").strip()
+                        if not msg:
+                            continue
+                        entry = {"code": code, "message": msg,
+                                 "blocking": blocking,
+                                 "status": resp.status,
+                                 "path": resp.url.split("?")[0]}
+                        if entry not in self.last_advisories:
+                            self.last_advisories.append(entry)
+                            log = logger.warning if blocking else logger.info
+                            log("goccl.advisory", code=code, message=msg,
+                                blocking=blocking, status=resp.status)
+
+                asyncio.ensure_future(read())
+            except Exception:
+                pass
+
+        self.page.on("response", on_response)
+        self._advisory_listener_attached = True
+
+    def advisory_summary(self) -> str:
+        """BLOCKING advisories only, as one human-readable string, or "".
+
+        Informational advisories are recorded (they are useful evidence and
+        may matter later) but deliberately excluded here: this string is
+        what turns into "GoCCL will not quote this booking", and a remark
+        like 1241 "Option extension is not applicable to deposited
+        bookings." must never produce that verdict.
+        """
+        real = [a for a in self.last_advisories
+                if a.get("blocking", True)            # 409 details default to blocking
+                and a["code"] not in ("999999",)]     # the envelope, not a reason
+        return "; ".join(f"{a['code']}: {a['message']}" for a in real)
+
+    def informational_advisories(self) -> list[dict]:
+        """Non-blocking advisories, kept for evidence and schema-drift watch."""
+        return [a for a in self.last_advisories if not a.get("blocking", True)]
 
     async def search_booking(self, booking_number: str) -> None:
-        self.log_action("navigate", booking_id=booking_number, url=settings.goccl_search_url)
-        await self.navigate(settings.goccl_search_url, wait_until="networkidle")
-        booking_input = self.page.locator("#ctl00_DefaultContent_txtBookingNumber")
+        # Reach the booking engine through the real flow (popup and all)
+        # rather than deep-linking into it.
+        await self.open_booking_tool()
+        # Advisories are per booking - clear them, then listen. Attached
+        # here rather than in start() so the listener is bound to the page
+        # the wizard actually runs on (the booking engine, not the portal).
+        self.last_advisories = []
+        self._attach_advisory_listener()
+
+        booking_input = self.page.locator(self.SEARCH_INPUT)
         await booking_input.click()
         await booking_input.fill(booking_number)
         self.log_action("search_booking", booking_id=booking_number)
-        # Try the explicit search button first; fall back to Enter if it's not
-        # present/clickable — matches the resilient pattern from the reference
-        # Playwright test, since the exact submit mechanism can vary by page state.
-        try:
-            await self.page.click("#ctl00_DefaultContent_btnSearchBookingNumber", timeout=3000)
-        except Exception:
-            await booking_input.press("Enter")
-        await self.page.wait_for_selector("#booked-root")
+        # "Search" is a LINK, not a button - confirmed by the CRX recording
+        # (getByRole('link', {name: 'Search'}).first()). The old code clicked
+        # a #btnSearchBookingNumber button id that the recording never shows,
+        # then silently fell back to pressing Enter, so a wrong selector here
+        # never surfaced as an error.
+        #
+        # EACH ATTEMPT IS CHECKED BEFORE THE NEXT ONE RUNS. The previous
+        # version chained the three blindly on exception, which produced a
+        # real failure on booking DEMO09 (2026-09-18 batch, 1 of 4 bookings):
+        #
+        #   Locator.press: Timeout 30000ms exceeded.
+        #   waiting for locator("#ctl00_DefaultContent_txtBookingNumber")
+        #
+        # The click had ALREADY submitted the search - the booking page
+        # loaded fine, its initialData was readable afterwards - but the
+        # click call still raised, because the navigation it triggered
+        # detached the element mid-click. The chain then pressed Enter on an
+        # input that no longer existed and spent 30s timing out on it.
+        #
+        # So a raised exception is not evidence of failure here; the only
+        # evidence that counts is whether the booking page arrived.
+        submitted_by = None
+        attempts = (
+            ("search_link", lambda: self.page.get_by_role(
+                "link", name=re.compile(r"^\s*Search\s*$", re.I)).first.click(timeout=5000)),
+            ("search_button", lambda: self.page.click(
+                "#ctl00_DefaultContent_btnSearchBookingNumber", timeout=3000)),
+            ("enter_key", lambda: booking_input.press("Enter", timeout=5000)),
+        )
+        for name, action in attempts:
+            if await self._search_landed(timeout=1000):
+                submitted_by = submitted_by or "already_landed"
+                break
+            try:
+                await action()
+            except Exception:
+                pass          # the check below decides, not the exception
+            if await self._search_landed(timeout=15000):
+                submitted_by = name
+                break
+
+        if submitted_by is None:
+            raise RuntimeError(
+                f"GoCCL search for {booking_number} never reached the booking "
+                f"page (#booked-root) after trying the Search link, the "
+                f"Search button and the Enter key"
+            )
+        self.log_action("search_submitted", booking_id=booking_number, via=submitted_by)
         await self.dump_page_snapshot(booking_number, "after_search")
+
+    async def _search_landed(self, timeout: int = 15000) -> bool:
+        """Has the booking page arrived? The only trustworthy success signal."""
+        try:
+            await self.page.wait_for_selector("#booked-root", timeout=timeout)
+            return True
+        except Exception:
+            return False
 
     async def read_current_price_and_selection(self) -> dict:
         """Reads the current booking's price, offer/rate code, category, and
@@ -177,6 +703,12 @@ class GoCCLScraper(BaseScraper):
         if not data:
             raise RuntimeError("window.initialData not found on page — booking summary may not have loaded")
 
+        invoice = data.get("invoiceSummary") or {}
+        payment = data.get("paymentSchedule") or {}
+        # Kept for core.booking_features, which reads sail date, region,
+        # nights and ship from itinerary/ship - fields this method does not
+        # itself return. No extra page load: this is the blob already read.
+        self.last_initial_data = data
         gross = ((data.get("invoiceSummary") or {}).get("grossAmount") or {}).get("amount")
         rate = data.get("rate") or {}
         category = data.get("category") or {}
@@ -193,9 +725,81 @@ class GoCCLScraper(BaseScraper):
                 "— refusing to treat this booking's total as $0"
             )
 
+        # THE OFFER CODE IS NOT rate.code. Confirmed 2026-09-18 on a live
+        # signed-in session (booking DEMO08): rate.code is the literal
+        # constant "BKGRTE" - it appeared on all five wizard pages, and is
+        # plainly a sentinel ("booking rate"), not an offer code. The real
+        # code lives in rate.virtualCode / rate.gbrCode ("O7O" here), and
+        # gbrCode is exactly what the comparison tiles publish as
+        # data-rate-gbrcode.
+        #
+        # This mattered: read_offer_code_comparison returns codes like GO2 /
+        # OB7 / PB4 / PNS / PSV, so a current code of "BKGRTE" could never
+        # match any of them, and "is the booking already on this offer?"
+        # was unanswerable - every offer looked like a different one.
+        offer_code = rate.get("virtualCode") or rate.get("gbrCode") or ""
+        if not offer_code and rate.get("code") not in (None, "", "BKGRTE"):
+            offer_code = rate["code"]
+
         return {
             "current_price_gross": float(gross),
-            "current_offer_code": rate.get("code") or "",
+            "current_offer_code": offer_code,
+            # Kept separately so the sentinel is visible rather than silently
+            # swapped out, and so a future capture can prove whether
+            # "BKGRTE" really is constant across different bookings (only
+            # one booking has been observed so far).
+            "current_rate_code_raw": rate.get("code") or "",
+            "current_offer_name": rate.get("name") or "",
+            "current_rate_is_group": bool(rate.get("isGroupRate")),
+            # The current fare's own terms, as the booking states them.
+            # rate.rules is a list of sentences, and it is where the CURRENT
+            # onboard credit is declared - DEMO08's read "Offer includes
+            # non-refundable and non-transferable onboard credit of USD
+            # $50.00 per cabin." The comparison tiles never include the
+            # booking's existing fare, so this is the only place on the
+            # /rate screen that says whether OBC is being given up at all.
+            "current_rate_disclaimer": " ".join(
+                str(r) for r in (rate.get("rules") or []) if r),
+            "current_rate_rules": rate.get("rules") or [],
+            # THE REAL GUEST COUNT. Confirmed 2026-09-18 on booking DEMO08
+            # against the live portal, closing the gap that
+            # _probe_guest_count_candidates was written to detect - it fired
+            # on exactly this path ("guests (count)": 1).
+            #
+            # Two independent confirmations on the same booking:
+            #   * data.guests is the real guest list - one full record with
+            #     name, date of birth, age, gratuities flag.
+            #   * the engine's own request carried amountOfGuests=1.
+            #
+            # This matters because the /rate and /category prices are quoted
+            # per guest: calculate_goccl multiplies by the guest count, and
+            # with the old assumed default of 2 it turned a 1,392.00 quote
+            # into a 2,784.00 "new total" on a single-guest booking. A wrong
+            # occupancy does not produce a slightly-off number, it doubles
+            # or halves every figure.
+            "guests_count_actual": len(data.get("guests") or []) or None,
+            # RULE PAY-001 / PAY-002. Payment state, read from the booking's
+            # own paymentSchedule. GoCCL did no payment gating at all -
+            # scraper/ncl.py has 8 references to final_payment_date and
+            # core/calculator_msc.py 6, GoCCL had zero - and 6 of the 14
+            # bookings surveyed on 2026-09-18 were already SETTLED
+            # (netBalanceDue == 0), two of them past their final payment
+            # date (MW24H6 8/23/2026, TM66H0 8/11/2026). Every one had a
+            # working rate screen, so the scanner would have reported a
+            # confident saving on a booking that is fully paid.
+            #
+            # netBalanceDue is the field to trust, NOT gross - paid. On
+            # PR40T9 gross 1,987.31 - paid 1,766.81 = 220.50 while
+            # balanceDue read 51.00; netBalanceDue was 0.00 and reconciled
+            # exactly against net - paid. What balanceDue represents when
+            # the two disagree is UNKNOWN and is deliberately not guessed at
+            # here - it is captured so the question stays answerable.
+            "net_balance_due": ((payment.get("netBalanceDue") or {}) or {}).get("amount"),
+            "balance_due": ((payment.get("balanceDue") or {}) or {}).get("amount"),
+            "has_debt": payment.get("hasDebt"),
+            "final_payment_due_date": (
+                (payment.get("finalPaymentDueDate") or {}) or {}).get("rawValue"),
+            "payment_received": ((invoice.get("paymentReceivedAmount") or {}) or {}).get("amount"),
             "current_category": category.get("code") or "",
             "current_stateroom_type": stateroom_type.get("name") or "",
             # Diagnostic only, see _probe_guest_count_candidates above -- not
@@ -217,7 +821,12 @@ class GoCCLScraper(BaseScraper):
         # is implemented under the hood.
         modify_btn = self.page.get_by_text("Modify Booking", exact=True)
         await modify_btn.wait_for(state="visible")
-        await modify_btn.click()
+        # Popup-aware (2026-09-18): GoCCL already moves the booking engine
+        # into a popup once, so a click here that opens another window must
+        # be followed rather than waited out on the page being left behind.
+        popup = await self._click_following_popup(modify_btn, timeout=5000)
+        if popup is not None:
+            self._switch_to_page(popup)
         await self.page.wait_for_load_state("networkidle")
 
     async def open_change_offer_rate(self) -> None:
@@ -230,8 +839,27 @@ class GoCCLScraper(BaseScraper):
         except Exception:
             change_rate_btn = self.page.get_by_text(re.compile("Change Offer/Rate", re.IGNORECASE))
             await change_rate_btn.wait_for(state="visible")
-        await change_rate_btn.click()
-        await self.page.wait_for_selector("section.rate__container, div[class*='rate']")
+        popup = await self._click_following_popup(change_rate_btn, timeout=5000)
+        if popup is not None:
+            self._switch_to_page(popup)
+        try:
+            await self.page.wait_for_selector(
+                "section.rate__container, div[class*='rate']", timeout=30000)
+        except PlaywrightTimeoutError:
+            # RULE ADV-001. Before calling this a timeout, ask whether the
+            # portal actually refused. Give any in-flight response body a
+            # moment to be read, then report the portal's own words.
+            await asyncio.sleep(1.5)
+            advisory = self.advisory_summary()
+            if advisory:
+                raise RuntimeError(
+                    f"GoCCL will not quote this booking — {advisory}. "
+                    f"The rate screen never loads because "
+                    f"availability/rate returned an advisory, not rates. "
+                    f"This is a fixable problem on the booking itself, not a "
+                    f"scraper fault."
+                ) from None
+            raise
 
     async def read_offer_code_comparison(self) -> list[OfferCodeOption]:
         """Reads the offer-code comparison screen.
@@ -274,6 +902,103 @@ class GoCCLScraper(BaseScraper):
                 ))
         return results
 
+    async def read_category_prices(self) -> list[dict]:
+        """Read the per-category price table on the /category wizard step.
+
+        CONFIRMED 2026-09-18 against a live session (booking DEMO08). The
+        booking engine is a SPA with a four-step wizard:
+
+            /app/bookingengine/<REF>           booking summary
+              -> /guest  -> /rate  -> /category  -> /review
+
+        and the two screens carry DIFFERENT numbers:
+
+          /rate      div.rate-code-tile[data-rate-code] with a price per
+                     stateroom TYPE in data-rate-meta-price. These are the
+                     "From $X" teasers.
+          /category  one <tr data-cat="4A" data-cat-price="1391"> per
+                     CATEGORY - the actual bookable price.
+
+        The teaser and the real price are not the same: the OB7 tile
+        advertised "From $1,392" while category 4A actually priced at
+        1,391. So the tiles are for shortlisting only; a saving must never
+        be computed from them.
+
+        TRUNCATION - data-cat-price is a WHOLE NUMBER. The review step for
+        that same 4A selection totalled $1,391.39, so this attribute is the
+        gross truncated to dollars and carries up to $1 of error. Fine for
+        ranking candidates, never for a reported saving: confirm the exact
+        figure on /review.
+
+        WHAT THE PRICE INCLUDES - taxes and fees, yes: the page states "All
+        prices are in USD. Taxes & fees are included." and the review
+        breakdown bears that out:
+            Cruise Rate            410.00
+            Non-Comm Cruise Amount 458.00   -> Guest Subtotal 868.00
+            Required Cruise Fees   376.78
+            Government Taxes & Fees 146.61  -> TOTAL 1,391.39
+
+        BUT IT IS PER PERSON, NOT PER BOOKING. Corrected 2026-09-18. An
+        earlier version of this docstring called these "gross figures,
+        directly comparable to invoiceSummary.grossAmount" - true only by
+        accident, because the single booking it was written from (DEMO08)
+        had ONE guest, where per-person and total are the same number.
+
+        The 3-guest booking DEMO10 separates them cleanly:
+            PHY BALCONY tile = 514.00, category 8A = 514,
+            and the booking total = 1,542.00 = 514 x 3.
+        The page says so too: "Cruise rates are in US Dollars, average per
+        person and based on single occupancy."
+
+        So a comparison is:
+            current invoiceSummary.grossAmount   (whole booking)
+          vs  this price x guests_count          (per person x occupancy)
+        which is what calculate_goccl does. Generalising from a one-guest
+        booking is precisely the like-for-like mistake core/price_scope.py
+        exists to catch - it just happened to be made in a comment rather
+        than in the arithmetic.
+        """
+        return await self.page.evaluate("""
+            () => Array.from(document.querySelectorAll('tr[data-cat]')).map(tr => ({
+                category: tr.getAttribute('data-cat'),
+                price_whole: tr.getAttribute('data-cat-price'),
+                currency: tr.getAttribute('data-cat-price-currency'),
+                is_guarantee: tr.getAttribute('data-cat-gtee') === 'true',
+                selected: tr.getAttribute('data-cat-selected') === 'true',
+                index: tr.getAttribute('data-index'),
+            }))
+        """)
+
+    async def discard_changes(self) -> bool:
+        """Back out of the refare wizard, leaving the booking untouched.
+
+        Every wizard step offers a reversible exit - "Discard Changes"
+        (data-comp="cancel") on /rate and /category, "Discard All Changes"
+        on /review. Walking away without clicking one leaves the booking
+        parked mid-edit, the same hazard ESPRESSO has with a reservation
+        left retrieved (release_booking, 15-minute lock).
+
+        Returns True if an exit control was found and clicked. Never
+        raises: this runs on the error path, where the original failure is
+        the thing worth reporting.
+        """
+        for selector in ('button[data-comp="cancel"]',
+                         'button:has-text("Discard All Changes")',
+                         'button:has-text("Discard Changes")'):
+            try:
+                btn = self.page.locator(selector).first
+                if await btn.count() and await btn.is_visible():
+                    # Cheap insurance: prove what is about to be clicked is
+                    # a discard, not a commit that happens to sit nearby.
+                    self._assert_safe_click(await btn.inner_text())
+                    await btn.click(timeout=5000)
+                    self.log_action("discard_changes", selector=selector)
+                    await self.page.wait_for_load_state("networkidle", timeout=10000)
+                    return True
+            except Exception:
+                continue
+        return False
+
     async def read_obc_breakdown(self) -> dict:
         """Reads the PERKS section of the price breakdown on the review screen —
         confirmed structure from real Inspect element data. Returns a dict of
@@ -308,6 +1033,41 @@ class GoCCLScraper(BaseScraper):
             current = await self.read_current_price_and_selection()
             current_category = current["current_category"]
             current_obc = await self.read_obc_breakdown()
+
+            # RULE PAY-001: a settled booking is not an opportunity.
+            # Checked BEFORE entering the wizard, so a fully-paid booking is
+            # never parked mid-refare just to be rejected afterwards.
+            #
+            # netBalanceDue is the agency's outstanding amount. 0 means the
+            # booking is paid; repricing it is a different, manual
+            # conversation (refund/credit) rather than the automatic
+            # price-drop this scan looks for - the same reasoning as
+            # ESPRESSO's and NCL's paid-in-full handling, which GoCCL simply
+            # never had.
+            net_balance = current.get("net_balance_due")
+            if net_balance is not None and net_balance <= 0.01:
+                paid = current.get("payment_received")
+                logger.info("goccl.paid_in_full", booking_id=booking_id,
+                            net_balance_due=net_balance, paid=paid)
+                self.log_action("paid_in_full", booking_id=booking_id,
+                                net_balance_due=net_balance)
+                await self.discard_changes()
+                return BookingResult(
+                    cruise_line=CruiseLine.GOCCL,
+                    status=BookingStatus.PAID_IN_FULL,
+                    booking_id=booking_id,
+                    price_category=current_category,
+                    old_total=round(float(current["current_price_gross"]), 2),
+                    new_total=round(float(current["current_price_gross"]), 2),
+                    currency=current.get("currency") or "UNKNOWN",
+                    note=(
+                        f"paid in full — net balance due "
+                        f"{net_balance:,.2f}"
+                        + (f", {paid:,.2f} received" if paid is not None else "")
+                        + ". Repricing a settled booking is a refund/credit "
+                          "conversation, not an automatic price drop."
+                    ),
+                )
 
             await self.open_modify_booking()
             await self.open_change_offer_rate()
@@ -367,17 +1127,49 @@ class GoCCLScraper(BaseScraper):
                 current_offer_code=current["current_offer_code"],
                 current_price_gross=current["current_price_gross"],
                 available_offer_codes=[o.__dict__ for o in offer_codes],
-                guests_count=self.guests_count,
-                guests_count_verified=self.guests_count_verified,
+                # Prefer the booking's OWN guest list over the global default.
+                # An explicit count passed to the constructor still wins - a
+                # caller who states the occupancy knows something this does
+                # not - but otherwise the portal's own data beats a guess.
+                guests_count=(
+                    self.guests_count if self.guests_count_verified
+                    else (current.get("guests_count_actual") or self.guests_count)
+                ),
+                guests_count_verified=(
+                    self.guests_count_verified
+                    or current.get("guests_count_actual") is not None
+                ),
+                # The booking's CURRENT fare, so a candidate can be judged on
+                # what it does to the customer's terms and not only on price
+                # (core/goccl_fare_types.py). The NAME carries the fare type
+                # in plain words; the 3-letter code does not.
+                current_offer_name=current.get("current_offer_name"),
+                current_disclaimer=current.get("current_rate_disclaimer"),
             )
             logger.info("goccl.result", booking_id=booking_id, status=result.status.value, net=result.net_saving)
             self.log_action("result", booking_id=booking_id, status=result.status.value, net_saving=result.net_saving)
+            # BACK OUT OF THE WIZARD. Added 2026-09-18 after driving the real
+            # flow: open_change_offer_rate leaves the booking sitting inside
+            # the refare wizard at /rate. Walking away from there parks a
+            # pending change on a live booking - the same hazard as an
+            # ESPRESSO reservation left retrieved under a 15-minute lock
+            # (see espresso.release_booking). Verified against booking
+            # DEMO08: discard_changes() returned True and the booking was
+            # left untouched.
+            await self.discard_changes()
             return result
 
         except Exception as e:
             logger.error("goccl.error", booking_id=booking_id, error=str(e))
             self.log_action("error", booking_id=booking_id, error=str(e))
             await self.dump_failure_snapshot(booking_id, "check_booking_failed", str(e))
+            # Back out on the failure path too, BEFORE deciding what to
+            # return: a booking abandoned mid-wizard by an error is exactly
+            # the case that would otherwise stay parked.
+            try:
+                await self.discard_changes()
+            except Exception:
+                pass
             # CONFIRMED REAL RISK, fixed 2026-08-13: same defect as NCL's
             # check_booking (see scraper/ncl.py) — swallowing every
             # exception here, including a dead browser/page/crash,

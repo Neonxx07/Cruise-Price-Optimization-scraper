@@ -231,12 +231,29 @@ class BookingQueueManager:
             on_state_change(self.get_snapshot())
 
         seen_booking_ids: set[str] = set()
+        # Whether the stop has already been relayed to BookingService for
+        # this run - see the loop below.
+        stop_sent = False
         try:
             while self._job.status.value in ("PENDING", "RUNNING"):
                 self._sync_completed_results(on_result, on_state_change, seen_booking_ids)
                 await asyncio.sleep(0.5)
-                if self._stop_requested and self._current_job_id:
+                # RELAY THE STOP ONCE, not on every poll.
+                #
+                # CONFIRMED BUG, fixed 2026-09-22 and caught by the log file
+                # added the day before. `_stop_requested` stays set until the
+                # `finally` below runs, so this condition was true on EVERY
+                # 0.5s tick for as long as the batch took to wind down -
+                # re-calling stop_scan and emitting "batch.stop_requested"
+                # twice a second. A real run logged 28 identical lines in 14
+                # seconds before the process exited.
+                #
+                # The batch deliberately finishes its current booking before
+                # stopping, so that window is normal and can be long. The
+                # flag is a request; once relayed, the service owns it.
+                if self._stop_requested and self._current_job_id and not stop_sent:
                     await self._service.stop_scan(self._current_job_id)
+                    stop_sent = True
             self._sync_completed_results(on_result, on_state_change, seen_booking_ids)
         finally:
             self._running = False
