@@ -395,6 +395,63 @@ class BaseScraper(ABC):
         self._pool = pool
         self._owns_browser = False
 
+    # Where Windows itself parks a minimized window. A real, fully-rendering
+    # window lives here, off every monitor.
+    _OFFSCREEN_XY = (-32000, -32000)
+
+    async def set_window_offscreen(self, offscreen: bool = True) -> bool:
+        """Move the browser window off the desktop, or bring it back.
+
+        ESPRESSO_BACKGROUND_BROWSER. True headless is refused at the CDN edge
+        (headed 200, every headless mode 404), so the desktop benefit has to
+        come from moving the WINDOW rather than changing the browser. The
+        browser stays headed and identical from the site's perspective; this
+        is an ordinary window position, not a disguise.
+
+        MEASURED 2026-09-23, off-screen against visible:
+
+            visibilityState  visible   vs  visible
+            document.hidden  False     vs  False
+            rAF              61 fps    vs  61 fps
+            viewport         1280x720  vs  1280x720
+
+        No throttling, no hidden state, page fully responsive.
+
+        WHY THIS IS RUNTIME AND NOT A LAUNCH FLAG. Two reasons, both found
+        by measuring rather than assuming. `--start-minimized` is silently
+        IGNORED by Playwright's Chromium - the window lands at
+        (10, 10, 1306, 818), fully on screen, and only a Win32 query reveals
+        it. And ESPRESSO's login needs MFA typed into a VISIBLE window, so
+        the browser must start visible and move afterwards, and must come
+        BACK whenever a login is required again.
+
+        Returns True only if the move was actually issued. NEVER raises: a
+        window that will not move is a cosmetic problem, and must never take
+        down a scan.
+        """
+        page = self._page
+        if page is None:
+            return False
+        try:
+            session = await page.context.new_cdp_session(page)
+            window_id = (await session.send("Browser.getWindowForTarget"))["windowId"]
+            if offscreen:
+                left, top = self._OFFSCREEN_XY
+            else:
+                left, top = 40, 40
+            await session.send("Browser.setWindowBounds", {
+                "windowId": window_id,
+                "bounds": {"left": left, "top": top, "width": 1296, "height": 808},
+            })
+            logger.info("browser.window_moved", cruise_line=self.cruise_line.value,
+                        offscreen=offscreen)
+            return True
+        except Exception as exc:
+            logger.warning("browser.window_move_failed",
+                           cruise_line=self.cruise_line.value,
+                           offscreen=offscreen, error=str(exc)[:160])
+            return False
+
     async def start(self, headless: Optional[bool] = None) -> None:
         """Launch the browser and create a page.
 
@@ -450,15 +507,38 @@ class BaseScraper(ABC):
         try:
             resolved_headless = settings.browser_headless if headless is None else headless
 
-            # PINNED, confirmed 2026-08-14: ESPRESSO (secure.cruisingpower.com)
-            # never works headless — its Akamai bot-detection reliably blocks
-            # or breaks headless sessions. This used to be a bug reachable
-            # from every entry point (CLI --headless, easy_menu.py's default
-            # "just press Enter" answer, and any GUI scan that didn't
-            # explicitly pop a visible window) — any of those would silently
-            # launch ESPRESSO headless and produce broken/failed scans.
+            # PINNED 2026-08-14, RE-TESTED AND CONFIRMED 2026-09-23.
+            # ESPRESSO (secure.cruisingpower.com) never works headless. This
+            # used to be a bug reachable from every entry point (CLI
+            # --headless, easy_menu.py's default "just press Enter" answer,
+            # and any GUI scan that didn't explicitly pop a visible window).
             # Enforced here, in the one place every scraper subclass launches
-            # its browser through, so no caller can accidentally bypass it.
+            # its browser through, so no caller can bypass it.
+            #
+            # THE 2026-09-23 RE-TEST, because the original rule predates
+            # Chromium's new headless mode and deserved re-checking rather
+            # than trusting. Unauthenticated GET of the home URL, same
+            # machine, same minute, browser mode the only variable:
+            #
+            #   A headed                     HTTP 200 -> /login, real page
+            #   B headless (no channel)      HTTP 404 -> "Not found"
+            #   C headless channel=chromium  HTTP 404 -> "Not found"
+            #   D headless channel=chrome    HTTP 404 -> "Not found"
+            #
+            # Re-run in REVERSE order to rule out rate limiting: identical,
+            # 8/8 trials. The block is at the CDN edge, before any
+            # application code runs - a bland 404 rather than a 403, which
+            # is how Akamai denies without telling a scraper it was caught.
+            #
+            # The new headless modes do NOT help even though their
+            # fingerprints match headed exactly (plugins 5, languages
+            # en-US,en, real Intel WebGL - the headless SHELL has 0 plugins
+            # and software WebGL, C and D do not). navigator.webdriver is
+            # True in HEADED PRODUCTION TOO, so it is not the discriminator.
+            # The only remaining measurable difference is the
+            # "HeadlessChrome" user-agent token, and masking that is anti-bot
+            # evasion, which is out of scope. See
+            # tests/test_espresso_headless_blocked_2026_09_23.py.
             if self.cruise_line == CruiseLine.ESPRESSO and resolved_headless:
                 logger.warning(
                     "browser.espresso_headless_forced_visible",
@@ -664,6 +744,14 @@ class BaseScraper(ABC):
     #: the attribute and BookingService never has to guess whether it
     #: exists; a line that captures nothing simply leaves it empty.
     last_feature_fields: dict | None = None
+    #: The payment panel exactly as it was READ on the last booking, or None
+    #: if this line does not read one. BookingService needs the raw figures
+    #: to decide whether a PAID_IN_FULL is solid enough to exclude the
+    #: booking from every future scan - an exclusion is permanent, so it is
+    #: made on the portal's own numbers rather than on a status label.
+    #: Crucially it carries `payment_state_readable`, which separates "owes
+    #: nothing" from "we could not see what it owes".
+    last_payment_status: dict | None = None
 
     async def navigate(self, url: str, wait_until: str = "domcontentloaded", attempts: int = 3) -> None:
         """Navigate to a URL and wait for load, retrying a transient hang.

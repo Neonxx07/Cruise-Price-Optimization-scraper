@@ -172,6 +172,52 @@ class CacheEntry(Base):
     expires_at = Column(DateTime, nullable=False)
 
 
+class PermanentExclusion(Base):
+    """Bookings that must NEVER be scanned again.
+
+    Neon 2026-09-29, non-negotiable: "IF THE BOOKING SURELY FOR 100% SURE
+    IS PAID IN FULL THIS MUST BE STORED IN THE DATA BASE AND NEVER EVER BE
+    RESCANNED AGAIN EVEN IF THE USER PASTES OR ADDS IT IN THE LIST".
+
+    A paid-in-full booking cannot be repriced, so re-opening it is pure
+    waste. Measured over 24 hours: 439 of 565 redundant scans were
+    PAID_IN_FULL bookings being checked again and again, because the
+    existing TTL cache only ever stored NO_SAVING.
+
+    WHY THIS IS NOT JUST A LONGER TTL. An exclusion here is permanent, so a
+    WRONG one is unrecoverable - the booking silently disappears from every
+    future scan. That is the opposite failure to a redundant scan, and far
+    worse. So:
+
+      * `reason` and `evidence` record WHY, in the portal's own figures, so
+        any entry can be audited rather than taken on trust.
+      * `cleared_at` makes it reversible. An exclusion is never deleted -
+        clearing it leaves the history intact.
+      * The service that writes these refuses unless the payment panel was
+        actually READ (see ExclusionService.record_paid_in_full). "We could
+        not see the balance" must never become "it owes nothing", which is
+        exactly the confusion that produced the false $400 on booking
+        3001001.
+
+    Cancelled bookings are safe from this by construction: EspressoScraper
+    checks is_cancelled() BEFORE reading the payment panel, so a CX booking
+    - which displays Final Payment Due 0.00 - returns CANCELLED and never
+    reaches the paid-in-full test.
+    """
+
+    __tablename__ = "permanent_exclusions"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    booking_id = Column(String(50), nullable=False, index=True)
+    cruise_line = Column(String(20), nullable=False, index=True)
+    reason = Column(String(40), nullable=False)          # e.g. PAID_IN_FULL
+    evidence = Column(Text, default="")                  # the figures, as read
+    excluded_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    # Set when an exclusion is lifted. Non-NULL means it no longer applies;
+    # the row stays so the decision remains auditable.
+    cleared_at = Column(DateTime, nullable=True)
+
+
 class MarketDataRecord(Base):
     """Read-only market/category table captures from ESPRESSO scans."""
 

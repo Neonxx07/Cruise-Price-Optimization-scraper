@@ -29,13 +29,13 @@ from services.booking_service import BookingService
 
 def test_features_are_captured_inside_check_booking():
     """On the booking page, while it is still on screen."""
-    src = inspect.getsource(EspressoScraper.check_booking)
+    src = inspect.getsource(EspressoScraper._check_booking_inner)
     assert "self.last_feature_fields = await self.read_feature_fields()" in src
 
 
 def test_the_capture_happens_before_the_booking_is_released():
     """release_booking() navigates away; reading after it is the bug."""
-    src = inspect.getsource(EspressoScraper.check_booking)
+    src = inspect.getsource(EspressoScraper._check_booking_inner)
     assert src.index("last_feature_fields") < src.index("release_booking")
 
 
@@ -55,17 +55,34 @@ def test_every_scraper_has_the_attribute():
 def test_it_is_cleared_per_booking():
     """A stale value would silently attribute the PREVIOUS booking's ship
     and sail date to this one - worse than a NULL, because it looks real."""
-    src = inspect.getsource(EspressoScraper.check_booking)
+    src = inspect.getsource(EspressoScraper._check_booking_inner)
     assert "self.last_feature_fields = None" in src
     assert src.index("self.last_feature_fields = None") < src.index(
         "self.last_feature_fields = await self.read_feature_fields()")
 
 
 def test_a_failed_capture_does_not_break_the_booking():
-    """A feature is a nice-to-have; a booking result is not."""
-    src = inspect.getsource(EspressoScraper.check_booking)
-    idx = src.index("last_feature_fields = await")
-    assert "except Exception" in src[idx:idx + 400]
+    """A feature is a nice-to-have; a booking result is not.
+
+    STRUCTURAL, not a character window. The original version asserted that
+    "except Exception" appeared within 400 characters of the assignment,
+    which broke on 2026-09-28 the moment an explanatory comment was added
+    between them - the handler was still there and still correct. Distance
+    in a source file is not a property worth testing; being inside a try
+    block is.
+    """
+    import ast
+    import textwrap
+    tree = ast.parse(textwrap.dedent(
+        inspect.getsource(EspressoScraper._check_booking_inner)))
+    guarded = [
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.Try)
+        and "last_feature_fields" in ast.dump(ast.Module(body=node.body,
+                                                         type_ignores=[]))
+        and node.handlers
+    ]
+    assert guarded, "the feature capture is not inside a try/except"
 
 
 def test_the_extractor_reads_the_real_espresso_shape():
