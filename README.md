@@ -246,6 +246,65 @@ Full policy, plus the incident record that produced these rules:
 
 ## What's New
 
+### Scan awareness — stop rescanning what the database already knows
+
+Measured over 24 hours: **565 of 1,393 scans (41%) were redundant**, about 148
+minutes of browser time. Of 55 repeats where totals could be compared, **55 were
+identical and 0 had changed**.
+
+The old cache had a single writer gated on `NO_SAVING`, so every other outcome was
+re-scanned every run — `PAID_IN_FULL` alone accounted for 439 repeats. It also stored
+only a timestamp, so skipped rows rendered with every price column blank.
+
+- **Per-line freshness windows** (`settings.freshness_hours`) rather than one global TTL
+- **`never_cache_statuses`** keeps `OPTIMIZATION`, `ERROR`, `CANCELLED` and `UNKNOWN` out:
+  a live saving must always be re-confirmed, and a failure is not an outcome
+- **Bulk lookup** replaces 723 round trips before the first page
+- Figures travel with the cache entry, so a skipped row displays like a scanned one
+
+### Permanent exclusions — paid-in-full and cancelled bookings
+
+[`services/exclusion_service.py`](platform/services/exclusion_service.py) checks
+**before the TTL cache and before any browser action**, and is not bypassable by
+"Force live recheck".
+
+The guard that matters: a booking is only recorded as paid-in-full if the payment panel
+was actually *read*, a real final-payment figure exists, and the total is positive.
+"Couldn't see the balance" must never become "owes nothing" — that mistake produced a
+false result on a booking with two cents outstanding. Every entry stores its evidence
+and is reversible, and **cancellations are still reported every run** — only the
+scraping stops.
+
+### Price-change detection
+
+[`core/price_change.py`](platform/core/price_change.py) compares each scan against the
+previous `price_history` row and surfaces drop / increase / unchanged. 6,606 history
+rows existed and nothing had ever compared two of them.
+
+### ESPRESSO session and reliability work
+
+- **Bookings are no longer left locked.** The portal holds a 15-minute lock on every
+  retrieved reservation; `release_booking` had one call site on the happy path while the
+  flow had 15 returns and 6 raises, so most exits skipped it. The release now runs in a
+  `finally`, idempotently. A structural test asserts it stays there.
+- **A self-inflicted navigation race** produced hundreds of `ERR_ABORTED` retries and
+  phantom "logged out" flashes: the flow left `/home` after ~136ms while its session
+  bootstrap redirect was still in flight. `_settle_navigation()` now waits for the URL to
+  settle before the login check.
+- **Crashes now reach the log.** They were `print()`ed to stdout, so a `RuntimeError` that
+  killed an overnight 721-booking scan appeared four times on screen and zero times in the
+  log. `log_crash()` plus sys/threading/asyncio handlers record them with tracebacks.
+- **Session recovery** moved from one-shot to rate-limited — the portal drops a session
+  roughly hourly, so the old rule guaranteed every long scan died partway. The interrupted
+  booking is retried instead of silently producing no row.
+- **No `print()` on the GUI thread** — Windows console QuickEdit pauses output on a click,
+  which blocked the writer and hung the app. An AST test enforces it.
+- **GUI update cost 352.8ms → 0.002ms per row**, roughly 12.7 minutes of frozen window
+  per run, by updating items in place instead of rebuilding the list.
+
+<details>
+<summary><strong>Earlier releases</strong></summary>
+
 ### Scan watchdog — a third eye on a running scan
 
 [`scan_watchdog.py`](platform/scan_watchdog.py) watches a scan *while it runs* rather than
@@ -274,9 +333,6 @@ cancellations and advisories.
 ESPRESSO auto-logout and SSO-race handling, session recovery, cancelled-booking detection,
 currency-aware paid-in-full, and a GUI Start re-entrancy guard (a second Start click during a
 modal could destroy the running batch).
-
-<details>
-<summary><strong>Earlier releases</strong></summary>
 
 ### NCL headless toggle — and why only NCL
 
@@ -432,6 +488,10 @@ logged-in session.
   enforce it, and the incident record behind each rule
 - [`platform/docs/MSC_DISCOUNT_RULES.md`](platform/docs/MSC_DISCOUNT_RULES.md) — which MSC
   discounts combine, which are agency-side, and which never apply
+- [`platform/docs/ESPRESSO_SESSION_BUGS_2026_09.md`](platform/docs/ESPRESSO_SESSION_BUGS_2026_09.md)
+  — the measured session/navigation failures and what fixed them
+- [`platform/docs/HANDOFF_2026_09_23.md`](platform/docs/HANDOFF_2026_09_23.md) — working
+  context and the hard rules for anyone picking the project up
 - [`CONTRIBUTING.md`](CONTRIBUTING.md) — guidelines for adding a new cruise line
 - [`HOW_TO_CHECK_A_BOOKING.md`](HOW_TO_CHECK_A_BOOKING.md) — the plain-English manual process
   the ESPRESSO automation is based on

@@ -58,6 +58,25 @@ class Settings(BaseSettings):
     # regardless of this setting or any caller-supplied `headless` argument
     # — do not try to "fix" that by making ESPRESSO respect this flag again.
     browser_headless: bool = True
+    # ESPRESSO_BACKGROUND_BROWSER, 2026-09-23. True headless is refused at
+    # the CDN edge (headed 200, every headless mode 404 - see
+    # BaseScraper.start). This gets the desktop benefit WITHOUT touching the
+    # browser's identity: the browser stays headed and byte-identical from
+    # the site's perspective, and only its WINDOW is moved off-screen. That
+    # is an ordinary OS window position, not a disguise.
+    #
+    # MEASURED: off-screen is indistinguishable from visible to the page -
+    # visibilityState "visible", document.hidden False, 61 fps rAF against
+    # 61 visible, full viewport. No throttling.
+    #
+    # OFF by default, and deliberately so: ESPRESSO's login needs MFA typed
+    # into a VISIBLE window, so anything enabling this must restore the
+    # window whenever a login is required. See BaseScraper.set_window_offscreen.
+    #
+    # Do NOT expect a resource win. Measured 672 MB visible against 666 MB
+    # off-screen - about 1%, inside the noise. The benefit is an uncluttered
+    # desktop and unattended operation, not CPU or RAM.
+    browser_background_window: bool = False
     scraper_timeout_ms: int = 30000
     scraper_retry_attempts: int = 3
     scraper_retry_delay_ms: int = 3000
@@ -84,8 +103,47 @@ class Settings(BaseSettings):
     proxy_username: str = ""
     proxy_password: str = ""
 
-    # ── Cache ───────────────────────────────────────────────────
+    # ── Scan freshness ──────────────────────────────────────────
+    # The DEFAULT window for any line without its own entry below.
     cache_ttl_hours: int = 12
+
+    # PER-LINE FRESHNESS WINDOWS, added 2026-09-29.
+    #
+    # Neon: "the price usually changes every 24 hours for example or 12
+    # hours or 6 hours ... if it was scanned already we need a information
+    # about this ... so it does not open the booking and scans over again".
+    #
+    # One global TTL could not express that. Measured over 24 hours of real
+    # scans: 565 of 1393 rows (41%) were re-scans of a booking already done
+    # that day, about 148 minutes of portal time - and of 55 repeats where
+    # the price could be compared across both scans, 55 were identical and
+    # 0 had changed.
+    #
+    # Hours per cruise line. Edit here or via CRUISEINTEL_FRESHNESS_HOURS in
+    # .env; anything not listed falls back to cache_ttl_hours.
+    freshness_hours: dict[str, int] = {
+        "ESPRESSO": 12,
+        "NCL": 6,
+        "GOCCL": 24,
+        "MSC": 12,
+    }
+
+    # Outcomes that are NOT worth caching, whatever the window says.
+    #
+    # OPTIMIZATION is the whole point of the product - a live saving must be
+    # re-confirmed, never served from a cache. ERROR and the unreadable
+    # states are not outcomes at all: caching a failure would turn one bad
+    # page load into a booking nobody looks at again until the window
+    # expires. CANCELLED is excluded because Neon requires every
+    # cancellation reported on every run.
+    never_cache_statuses: list[str] = [
+        "OPTIMIZATION", "ERROR", "CANCELLED", "UNKNOWN",
+    ]
+
+    def freshness_for(self, cruise_line: str) -> int:
+        """Freshness window in hours for one line, falling back to default."""
+        return int(self.freshness_hours.get(
+            (cruise_line or "").upper(), self.cache_ttl_hours))
 
     # ── URLs ────────────────────────────────────────────────────
     espresso_home_url: str = "https://secure.cruisingpower.com/home"

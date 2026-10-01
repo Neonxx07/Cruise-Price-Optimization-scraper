@@ -105,3 +105,15 @@ psutil>=7.0.0
 # permanently. Raw O_EXCL + PID checks are unreliable on Windows because
 # PIDs get reused.
 filelock>=3.29.0
+
+# ── operations tooling, added 2026-09-28/29 ──────────────────────────────
+# py-spy: dumps the stack of a HUNG process without restarting it. Found the
+#   GUI freeze of 2026-09-28 (a blocking print() on the UI thread) in about
+#   ten seconds, after "the GUI is not responding" had been unfalsifiable.
+py-spy>=0.4.0
+# apprise + pywin32: put ALARMs on the operator's screen. `windows://` is a
+#   LOCAL toast - no API key, no account, no internet, nothing leaves the
+#   machine. Every alert used to land in a terminal nobody was watching,
+#   which is how a crashed overnight scan sat dead from 01:19 to 14:14.
+apprise>=2.0.0
+pywin32>=306; sys_platform == "win32"

@@ -90,7 +90,7 @@ def test_espresso_refuses_to_report_a_saving_when_the_panel_is_unreadable():
     balance."""
     import inspect
 
-    src = inspect.getsource(EspressoScraper.check_booking)
+    src = inspect.getsource(EspressoScraper._check_booking_inner)
     assert "payment_state_readable" in src
     assert "_paymentUnreadable" in src
 

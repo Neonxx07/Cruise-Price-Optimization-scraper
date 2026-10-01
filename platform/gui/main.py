@@ -17,15 +17,27 @@ from PySide6.QtCore import Qt, QCoreApplication
 
 from config.settings import settings
 from gui.windows import MainWindow
-from utils.logging import get_logger, setup_logging
+from utils.logging import (
+    asyncio_exception_handler,
+    get_logger,
+    install_crash_handlers,
+    setup_logging,
+)
 
 
 def _handle_async_exception(loop, context):
-    print("ASYNC EXCEPTION:", context)
-    exc = context.get("exception")
-    if exc:
-        import traceback
-        traceback.print_exception(type(exc), exc, exc.__traceback__)
+    """Async failures go to the LOG, not just to stdout.
+
+    This used to be print() plus traceback.print_exception(), both to
+    stdout. On 2026-09-22 a RuntimeError killed a running 721-booking scan
+    and appeared four times in the terminal and zero times in
+    data/cruiseintel.log - so scan_watchdog, which reads the log, was blind
+    to it and the dead scan went unnoticed for thirteen hours.
+
+    utils.logging.asyncio_exception_handler still calls the loop's default
+    handler, so the stderr output that was there before is unchanged.
+    """
+    asyncio_exception_handler(loop, context)
 
 
 logger = get_logger(__name__)
@@ -37,6 +49,10 @@ def main() -> int:
     # (including ones that would explain a failed session save) is
     # silently dropped instead of reaching stderr.
     setup_logging(settings.log_level, settings.log_file)
+    # Main-thread and per-thread crashes reach the log too, not only
+    # the asyncio ones - a thread dying silently is how a keepalive
+    # stops running with nothing appearing to be wrong.
+    install_crash_handlers("gui")
     QCoreApplication.setAttribute(Qt.ApplicationAttribute.AA_EnableHighDpiScaling, True)
 
     app = QApplication(sys.argv)

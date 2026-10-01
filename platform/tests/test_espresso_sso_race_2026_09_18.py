@@ -79,6 +79,6 @@ def test_the_wait_is_bounded():
 def test_check_booking_still_refuses_to_scan_when_logged_out():
     """The caller's contract is unchanged - this fix makes the DETECTION
     accurate, it does not remove the gate."""
-    src = inspect.getsource(EspressoScraper.check_booking)
+    src = inspect.getsource(EspressoScraper._check_booking_inner)
     assert "Not logged in" in src
     assert "raise RuntimeError" in src

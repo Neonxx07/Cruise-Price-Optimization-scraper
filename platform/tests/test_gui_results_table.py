@@ -150,12 +150,15 @@ def test_savings_column_sorts_numerically_in_the_real_table(window):
 # ── results table: defect 2 ───────────────────────────────────────
 
 
-def test_table_has_the_nine_reporting_columns(window):
-    assert window.results_table.columnCount() == 9
+def test_table_has_the_ten_reporting_columns(window):
+    """"Last scanned" added 2026-09-29 - the column that tells you a result
+    is two hours old rather than live."""
+    assert window.results_table.columnCount() == 10
     headers = [window.results_table.horizontalHeaderItem(i).text()
-               for i in range(9)]
+               for i in range(10)]
     assert headers[0] == "Booking ID"
-    assert "Note" in headers[8]
+    assert headers[8] == "Last scanned"
+    assert "Note" in headers[9]
 
 
 def test_error_row_shows_its_cause(window):
@@ -166,7 +169,7 @@ def test_error_row_shows_its_cause(window):
         status=BookingStatus.ERROR,
         error="category IT not reachable: slick-viewport rendered 23 of 41 rows",
     ))
-    assert "slick-viewport" in _cell(window, "11112222", 8)
+    assert "slick-viewport" in _cell(window, "11112222", 9)
     # ...and must not invent totals it never read
     assert _cell(window, "11112222", 5) == "—"
     assert _cell(window, "11112222", 6) == "—"
@@ -179,7 +182,7 @@ def test_error_field_wins_over_note(window):
         booking_id="ERR1", cruise_line=CruiseLine.NCL, status=BookingStatus.ERROR,
         error="the real cause", note="a vaguer note",
     ))
-    assert _cell(window, "ERR1", 8) == "the real cause"
+    assert _cell(window, "ERR1", 9) == "the real cause"
 
 
 def test_trap_row_surfaces_the_lost_promo_note(window):
@@ -191,7 +194,7 @@ def test_trap_row_surfaces_the_lost_promo_note(window):
         price_category="IT", note="LOST PROTECTED PROMO: LATRIPLE. Do NOT reprice.",
         old_promos="LATRIPLE,FREESRVC", new_promos="FREESRVC",
     ))
-    assert "LATRIPLE" in _cell(window, "87654321", 8)
+    assert "LATRIPLE" in _cell(window, "87654321", 9)
     # and must never call it a "saving"
     assert "saved" not in _cell(window, "87654321", 3)
     assert "not recommended" in _cell(window, "87654321", 3)
@@ -224,7 +227,7 @@ def test_note_gets_a_tooltip_because_it_never_fits(window):
         status=BookingStatus.OPTIMIZATION, net_saving=60.0, confidence=95,
         note=long_note,
     ))
-    item = window.results_table.item(_row_of(window, "TIP1"), 8)
+    item = window.results_table.item(_row_of(window, "TIP1"), 9)
     assert item.toolTip() == long_note.strip()
 
 
@@ -251,7 +254,7 @@ def test_msc_row_shows_per_check_detail(window):
     """Previously only a "1/2 checks" count survived — the per-check notes
     naming the specific discount and its rationale were dropped."""
     window._append_msc_result_row(_msc_outcome())
-    detail = _cell(window, "3000030", 8)
+    detail = _cell(window, "3000030", 9)
     assert "PRICE_MATCH:OPPORTUNITY" in detail
     assert "fare dropped $180" in detail
     assert "VOYAGERS_SELECTION" in detail
@@ -275,7 +278,7 @@ def test_msc_short_circuit_outcome_still_names_its_reason(window):
         note="booking not found in MSC portal",
     ))
     assert _cell(window, "3000024", 2) == "NOT_FOUND"
-    assert "not found" in _cell(window, "3000024", 8)
+    assert "not found" in _cell(window, "3000024", 9)
 
 
 def test_mixed_msc_and_standard_rows_sort_without_error(window):
@@ -379,7 +382,7 @@ def test_queue_list_is_rebuilt_when_an_item_is_added(window):
     assert window.queue_list.count() == 2
 
 
-def test_populate_results_table_uses_the_nine_column_layout(window):
+def test_populate_results_table_uses_the_full_column_layout(window):
     """_populate_results_table was a duplicate row writer still hard-coded
     to the old 4 columns, writing status into "Line" and confidence into
     "Net Saving". Unreachable today, but a landmine for the next caller."""
@@ -397,7 +400,7 @@ def test_populate_results_table_uses_the_nine_column_layout(window):
     assert _cell(window, "RP1", 2) == "OPTIMIZATION"   # Status
     assert _cell(window, "RP1", 4) == "95"             # Confidence
     assert _cell(window, "RP1", 5) == "$1,000.00"
-    assert _cell(window, "RP1", 8) == "safe to optimize"
+    assert _cell(window, "RP1", 9) == "safe to optimize"
     assert _cell(window, "3000030", 1) == "MSC"
 
 
@@ -410,3 +413,49 @@ def test_populate_results_table_is_idempotent(window):
     window._populate_results_table()
     window._populate_results_table()
     assert window.results_table.rowCount() == 1
+
+
+# ── queue list performance, 2026-09-28 ───────────────────────────────────
+#
+# Neon: "the gui is really heavy and it is not resposnive very will".
+# Measured at a real 721-booking watchlist:
+#
+#     widget per row (the old way)   352.8 ms
+#     plain text item                 32.0 ms
+#     in-place status update           0.002 ms
+#
+# The old code built a QWidget + QHBoxLayout + QLabel (+ QPushButton) per
+# row and rebuilt the whole list whenever ANY booking changed state -
+# roughly 2,163 times per 721-booking run, on the UI thread. About twelve
+# minutes of frozen window per scan.
+
+
+def test_a_status_change_updates_in_place_without_rebuilding(window):
+    """The scan-time path. Rebuilding here is what froze the window."""
+    window._update_queue_view(_snapshot(items=[QueueItem("A"), QueueItem("B")],
+                                        queued=2))
+    first = window.queue_list.item(0)
+    window._update_queue_view(_snapshot(
+        items=[QueueItem("A", QueueStatus.RUNNING), QueueItem("B")],
+        queued=1, running=1))
+    assert window.queue_list.item(0) is first, "the row was rebuilt, not updated"
+    assert "RUNNING" in window.queue_list.item(0).text()
+
+
+def test_rows_carry_no_per_row_widgets(window):
+    """The per-row 'x' button was the cost. 'Remove selected' sits above the
+    list and already works off the same Qt.UserRole booking id."""
+    window._update_queue_view(_snapshot(items=[QueueItem("A")], queued=1))
+    item = window.queue_list.item(0)
+    assert window.queue_list.itemWidget(item) is None
+    assert item.data(Qt.UserRole) == "A", "removal still needs the booking id"
+
+
+def test_the_list_recovers_if_it_is_cleared_behind_our_back(window):
+    """A desynced list would send in-place updates into the wrong rows. A
+    silently wrong queue display is worse than a slower correct one."""
+    window._update_queue_view(_snapshot(items=[QueueItem("A")], queued=1))
+    window.queue_list.clear()
+    window._update_queue_view(_snapshot(
+        items=[QueueItem("A", QueueStatus.RUNNING)], running=1))
+    assert window.queue_list.count() == 1

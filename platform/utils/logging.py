@@ -83,6 +83,114 @@ def get_logger(name: str) -> structlog.stdlib.BoundLogger:
     return structlog.get_logger(name)
 
 
+# ── crashes ──────────────────────────────────────────────────────────────
+#
+# THE INCIDENT, 2026-09-22/23. A RuntimeError killed a running 721-booking
+# ESPRESSO scan overnight:
+#
+#     RuntimeError: Cannot enter into task Task-17 <_on_start at :961>
+#     while another task Task-546 <_on_start at :898> is being executed
+#     Task was destroyed but it is pending!
+#
+# Counted afterwards:
+#
+#     "Cannot enter into task" in terminal stdout   : 4
+#     "Cannot enter into task" in data/cruiseintel.log: 0
+#
+# gui.main._handle_async_exception did `print(...)` plus
+# traceback.print_exception(...), both to stdout. Nothing reached the log,
+# so scan_watchdog - which parses JSON lines - could not see the one error
+# that mattered, and the dead scan sat unnoticed from 01:19 until 14:14.
+#
+# Everything downstream depends on this: a monitor cannot alert on an error
+# that was never recorded. track_background_task above already got this
+# right (`exc_info=exc`); these are the paths that did not.
+
+CRASH_EVENT = "crash.unhandled"
+
+
+def log_crash(source: str, exc: BaseException | None, **context) -> None:
+    """Record an unhandled exception as a structured, greppable log line.
+
+    `exc_info` is what carries the traceback - structlog's format_exc_info
+    processor (see setup_logging) renders it into the JSON record, so the
+    stack survives to disk instead of scrolling past in a terminal.
+
+    NEVER RAISES. This runs from excepthooks and asyncio error handlers,
+    where raising would replace a diagnosable failure with an undiagnosable
+    one.
+    """
+    try:
+        get_logger("crash").error(
+            CRASH_EVENT,
+            source=source,
+            error=str(exc) if exc is not None else None,
+            error_type=type(exc).__name__ if exc is not None else None,
+            exc_info=exc,
+            **context,
+        )
+    except Exception:  # noqa: BLE001 - a crash logger must not crash
+        try:
+            print(f"CRASH ({source}): {exc!r}", file=sys.stderr)
+        except Exception:
+            pass
+
+
+def install_crash_handlers(source_prefix: str = "app") -> None:
+    """Send otherwise-lost exceptions to the log.
+
+    Covers the two hooks that are silent by default:
+      - sys.excepthook        uncaught exception on the main thread
+      - threading.excepthook  uncaught exception in any other thread
+
+    The asyncio path is separate because it needs a loop - callers pass
+    :func:`asyncio_exception_handler` to ``loop.set_exception_handler``.
+
+    Chains to the previous hook so nothing that already worked stops
+    working (the interpreter still prints to stderr as well).
+    """
+    import threading
+
+    previous_excepthook = sys.excepthook
+
+    def _hook(exc_type, exc, tb) -> None:
+        log_crash(f"{source_prefix}.main_thread", exc)
+        previous_excepthook(exc_type, exc, tb)
+
+    sys.excepthook = _hook
+
+    previous_thread_hook = threading.excepthook
+
+    def _thread_hook(args) -> None:
+        # A thread dying silently is how a keepalive or a watchdog timer
+        # stops running without anything appearing to be wrong.
+        log_crash(f"{source_prefix}.thread", args.exc_value,
+                  thread=getattr(args.thread, "name", None))
+        previous_thread_hook(args)
+
+    threading.excepthook = _thread_hook
+
+
+def asyncio_exception_handler(loop, context: dict) -> None:
+    """For ``loop.set_exception_handler``. Logs, then falls back to default.
+
+    The context dict carries more than the exception - the failing handle,
+    task, or future - and that is what identified the re-entrant _on_start
+    above, so it is recorded rather than dropped.
+    """
+    exc = context.get("exception")
+    log_crash(
+        "asyncio",
+        exc,
+        message=str(context.get("message") or ""),
+        task=str(context.get("task") or context.get("handle") or "") or None,
+    )
+    try:
+        loop.default_exception_handler(context)
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def track_background_task(task_set: set, task) -> None:
     """Retain a strong reference to a fire-and-forget `asyncio.Task`
     until it completes, and log (rather than silently lose) any

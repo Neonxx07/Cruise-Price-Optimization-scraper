@@ -42,10 +42,22 @@ def test_the_scraper_can_release_a_booking():
 
 
 def test_check_booking_releases_on_the_success_path():
-    """Placed after every branch - WLT, paid-in-full, skip-reprice,
-    no-price-change, the calculated result and the upgrade override - so
-    no successful outcome can leave a booking retrieved."""
-    src = inspect.getsource(EspressoScraper.check_booking)
+    """The happy path releases before returning.
+
+    CORRECTED 2026-09-23. This docstring used to claim the call was "placed
+    after every branch - WLT, paid-in-full, skip-reprice, no-price-change,
+    the calculated result and the upgrade override - so no successful
+    outcome can leave a booking retrieved". That was false, and so was the
+    matching comment in espresso.py. Those sentinel branches return EARLIER
+    in the flow and every one of them skipped the release: 389 of 624
+    bookings were left locked on the live log.
+
+    What this test actually covers is the happy path only. The guarantee
+    for all the others is the `finally` in check_booking - see
+    tests/test_espresso_release_always_2026_09_23.py, which is the file
+    that would have caught this.
+    """
+    src = inspect.getsource(EspressoScraper._check_booking_inner)
     assert "await self.release_booking(booking_id)" in src
     assert src.index("await self.release_booking(booking_id)") < src.rindex("return result")
 

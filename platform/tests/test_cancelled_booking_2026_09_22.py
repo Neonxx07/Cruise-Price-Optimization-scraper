@@ -47,7 +47,7 @@ def _check_booking_code() -> str:
     substring search reads prose and gets the ordering wrong - which is
     exactly how this test first failed.
     """
-    src = inspect.getsource(EspressoScraper.check_booking)
+    src = inspect.getsource(EspressoScraper._check_booking_inner)
     return chr(10).join(
         line for line in src.splitlines() if not line.strip().startswith("#"))
 

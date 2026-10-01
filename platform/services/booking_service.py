@@ -17,8 +17,14 @@ from sqlalchemy import select
 
 from config.settings import settings
 from core.booking_features import extract as extract_booking_features
-from core.calculator import make_error_result, make_skipped_result
+from core.calculator import (
+    make_cancelled_result,
+    make_error_result,
+    make_paid_in_full_result,
+    make_skipped_result,
+)
 from core.models import BookingResult, BookingStatus, CruiseLine, ScanJob, ScanJobStatus
+from core.price_change import compare as compare_price
 from models.database import BookingRecord, MarketDataRecord, PriceHistory, ScanJobRecord, async_session
 from scraper.base import (
     BaseScraper,
@@ -29,6 +35,7 @@ from scraper.espresso import EspressoScraper
 from scraper.goccl import GoCCLScraper
 from scraper.ncl import NclScraper
 from services.cache_service import CacheService
+from services.exclusion_service import ExclusionService
 from utils.logging import get_logger, track_background_task
 
 logger = get_logger(__name__)
@@ -40,8 +47,22 @@ class BookingService:
     result persistence, and progress tracking.
     """
 
+    # MID-SCAN SESSION RECOVERY LIMITS. Tuned to the measured behaviour of
+    # the portal, not guessed: ESPRESSO drops a session roughly HOURLY, so a
+    # long watchlist must be able to recover repeatedly. What must NOT
+    # happen is a hot loop against a portal that will not keep us in.
+    #
+    # A recovery is allowed unless the last one was BOTH very recent AND
+    # only a booking or two ago - that combination is a loop; an hourly
+    # drop is not.
+    _RECOVERY_MIN_GAP_S = 180        # under 3 minutes apart...
+    _RECOVERY_MIN_BOOKINGS = 3       # ...and within 3 bookings = a loop
+    _RECOVERY_MAX = 12               # a full working day of hourly drops
+
+
     def __init__(self):
         self.cache = CacheService()
+        self.exclusions = ExclusionService()
         self._active_jobs: dict[str, ScanJob] = {}
         self._stop_flags: dict[str, bool] = {}
         # A single long-lived scraper/browser, reused across "Check login"
@@ -535,8 +556,66 @@ class BookingService:
             # row (it failed to the SESSION, not to anything about itself)
             # and is named in the job warning so it can be re-run; the
             # REMAINING bookings are what recovery is really for.
-            session_recovery_used = False
+            # RECOVERIES ARE NO LONGER ONE-SHOT. See the block that uses
+            # these: ESPRESSO drops a session roughly HOURLY, and a
+            # 723-booking watchlist runs for many hours, so "once per batch"
+            # guaranteed the scan died partway through every single time.
+            session_recoveries = 0
+            last_recovery_at: float | None = None
+            last_recovery_index = -1
             interrupted_by_logout: list[str] = []
+
+            # PERMANENTLY EXCLUDED BOOKINGS, LOOKED UP ONCE FOR THE WHOLE
+            # LIST, BEFORE ANY BROWSER ACTION.
+            #
+            # Neon 2026-09-29, non-negotiable: a booking confirmed paid in
+            # full must NEVER be rescanned, "EVEN IF THE USER PASTES OR ADDS
+            # IT IN THE LIST". It cannot be repriced, so opening it is pure
+            # waste - 439 of 565 redundant scans in one measured day.
+            #
+            # ONE query for the entire watchlist, not one per booking: the
+            # TTL cache below still does the latter, which on a 723-booking
+            # list is 723 round trips before the first page loads.
+            #
+            # Deliberately NOT bypassed by "Force live recheck". That toggle
+            # is for a stale TTL, and this is a standing fact about the
+            # booking rather than a cached opinion about its price. Lifting
+            # one is an explicit act - ExclusionService.clear().
+            excluded: dict[str, dict] = {}
+            try:
+                excluded = await self.exclusions.active_for(
+                    job.cruise_line.value, list(job.booking_ids))
+                if excluded:
+                    logger.info("batch.exclusions_loaded",
+                                job_id=job.job_id, count=len(excluded),
+                                of=len(job.booking_ids))
+            except Exception as exc:
+                # Fails OPEN: a redundant scan costs a page load, a wrongly
+                # skipped booking costs a real client's price drop.
+                logger.warning("batch.exclusion_lookup_failed",
+                               error=str(exc)[:200])
+
+            # FRESHNESS, ALSO LOOKED UP ONCE FOR THE WHOLE LIST.
+            #
+            # The per-booking CacheService.get() this replaces issued a
+            # SELECT (and on an expired row a DELETE + commit) from inside
+            # the loop - 723 round trips on a full watchlist, each one a
+            # chance to hit the SQLite lock that once marked an entire job
+            # FAILED.
+            fresh: dict[str, dict] = {}
+            if not bypass_cache:
+                try:
+                    fresh = await self.cache.get_many(
+                        job.cruise_line.value, list(job.booking_ids))
+                    if fresh:
+                        logger.info(
+                            "batch.freshness_loaded", job_id=job.job_id,
+                            fresh=len(fresh), of=len(job.booking_ids),
+                            window_hours=settings.freshness_for(
+                                job.cruise_line.value))
+                except Exception as exc:
+                    logger.warning("batch.freshness_lookup_failed",
+                                   error=str(exc)[:200])
 
             for i, booking_id in enumerate(job.booking_ids):
                 if self._stop_flags.get(job.job_id):
@@ -546,6 +625,53 @@ class BookingService:
 
                 job.current_booking_id = booking_id
                 job.progress_done = i
+
+                # NEVER RESCAN A CONFIRMED PAID-IN-FULL BOOKING.
+                #
+                # Checked before the TTL cache and before any browser
+                # action. Not subject to bypass_cache - see the lookup
+                # above for why.
+                if booking_id in excluded:
+                    entry = excluded[booking_id]
+                    when = entry.get("excluded_at")
+                    logger.info("batch.permanently_excluded",
+                                booking_id=booking_id,
+                                reason=entry.get("reason"),
+                                excluded_at=str(when))
+                    # REPORT THE RIGHT STATUS, NOT A GENERIC SKIP.
+                    #
+                    # A cancellation is "VERY MADNATORY ... something very
+                    # critical" to report (Neon 2026-09-22), and adding it
+                    # to this register must not quietly demote it. An
+                    # excluded booking is still REPORTED every run - it just
+                    # comes back from the database instead of the portal.
+                    # What stops is the scraping, not the reporting.
+                    reason = entry.get("reason")
+                    if reason == "CANCELLED":
+                        result = make_cancelled_result(
+                            booking_id, None, job.cruise_line)
+                        explain = ("A cancelled reservation does not "
+                                   "un-cancel.")
+                    else:
+                        result = make_paid_in_full_result(
+                            booking_id, None, job.cruise_line, 0.0)
+                        explain = ("A paid-in-full booking cannot be "
+                                   "repriced.")
+                    result.note = (
+                        f"{result.note or ''} Not rescanned - confirmed "
+                        f"{reason} and permanently excluded"
+                        + (f" on {when:%Y-%m-%d}" if when else "")
+                        + f". {explain}"
+                    ).strip()
+                    if when is not None:
+                        # "Last scanned" must show when it was CONFIRMED,
+                        # not now - checked_at defaults to utcnow().
+                        result.checked_at = when
+                    job.results.append(result)
+                    job.progress_done = i + 1
+                    if on_progress:
+                        on_progress(job)
+                    continue
 
                 # Smart cache check.
                 #
@@ -561,17 +687,44 @@ class BookingService:
                 # booking. Fails OPEN (cached=None → check it live), which is
                 # the safe direction: a redundant live check costs a page load,
                 # a skipped one costs a real client's price drop.
-                cached = None
-                if not bypass_cache:
-                    try:
-                        cached = await self.cache.get(job.cruise_line.value, booking_id)
-                    except Exception as e:
-                        logger.warning("batch.cache_read_failed", booking_id=booking_id, error=str(e))
+                cached = fresh.get(booking_id)
                 if cached:
-                    logger.info("batch.cached", booking_id=booking_id, hours_ago=cached["hours_ago"])
+                    logger.info("batch.cached", booking_id=booking_id,
+                                hours_ago=cached["hours_ago"],
+                                status=cached.get("status"))
                     result = make_skipped_result(
                         booking_id, None, job.cruise_line, cached["hours_ago"],
                     )
+                    # CARRY THE STORED FIGURES ONTO THE SKIPPED ROW.
+                    #
+                    # Neon's requirement: "Show the stored price data for
+                    # skipped bookings just like freshly scanned ones." The
+                    # old cache stored only a timestamp - value_json existed
+                    # and was never written - so a skipped booking read
+                    # "scanned 1.4h ago" with every price column blank, and
+                    # the row looked like nothing had happened.
+                    data = cached.get("data") or {}
+                    for field in ("old_total", "new_total", "net_saving",
+                                  "price_category", "currency"):
+                        value = data.get(field)
+                        if value is not None:
+                            setattr(result, field, value)
+                    # THE TIME SHOWN MUST BE THE ORIGINAL SCAN, NOT NOW.
+                    #
+                    # BookingResult.checked_at defaults to utcnow(), so a
+                    # skipped row would otherwise claim it had just been
+                    # scanned - the exact opposite of what this feature is
+                    # for. The GUI's "Last scanned" column reads this field.
+                    if cached.get("scanned_at") is not None:
+                        result.checked_at = cached["scanned_at"]
+                    prior = cached.get("status")
+                    if prior:
+                        result.note = (
+                            f"Not rescanned - {prior} {cached['hours_ago']}h ago"
+                            f" (within the "
+                            f"{settings.freshness_for(job.cruise_line.value)}h "
+                            f"window for {job.cruise_line.value})"
+                        )
                     job.results.append(result)
                     job.progress_done = i + 1
                     if on_progress:
@@ -625,18 +778,67 @@ class BookingService:
                     # and on a bot-sensitive account, hammering a login wall
                     # is itself a risk.
                     if is_session_expired_error(e):
-                        if session_recovery_used:
+                        # A LOOP IS THE DANGER, NOT A SECOND LOGOUT.
+                        #
+                        # Neon 2026-09-29: "make a bug fix for mid scan
+                        # that if this happens the script just loges in and
+                        # continue where it stopped".
+                        #
+                        # The old rule was ONE recovery per batch, on the
+                        # reasoning that "a session that dies again right
+                        # after a successful re-login is not a transient
+                        # blip". True - but the real interval is not "right
+                        # after". Measured on the 723-booking run of
+                        # 2026-09-29:
+                        #
+                        #   13:40:31  session_expired_recovering
+                        #   13:40:43  session_recovered      <- worked
+                        #   14:41:20  session_expired_again  <- 61 min later
+                        #                                      batch STOPPED
+                        #                                      399 unchecked
+                        #
+                        # ESPRESSO drops a session roughly hourly, so a
+                        # long watchlist is GUARANTEED to hit a second
+                        # logout. One-shot recovery meant every long scan
+                        # died partway through and Neon pressed Start again
+                        # by hand.
+                        #
+                        # What actually needs preventing is a hot loop -
+                        # re-logging-in over and over against a portal that
+                        # will not keep us in. So the guard is now about
+                        # RATE, not count: recover freely when the logouts
+                        # are far apart, stop when they are not.
+                        now = time.monotonic()
+                        too_soon = (
+                            last_recovery_at is not None
+                            and (now - last_recovery_at) < self._RECOVERY_MIN_GAP_S
+                            and (i - last_recovery_index) < self._RECOVERY_MIN_BOOKINGS
+                        )
+                        if too_soon or session_recoveries >= self._RECOVERY_MAX:
                             logger.error(
                                 "batch.session_expired_again",
-                                booking_id=booking_id, job_id=job.job_id)
+                                booking_id=booking_id, job_id=job.job_id,
+                                recoveries=session_recoveries,
+                                seconds_since_last=(
+                                    None if last_recovery_at is None
+                                    else int(now - last_recovery_at)),
+                                reason="too_soon" if too_soon else "max_recoveries")
                             job.error = (
                                 f"{job.cruise_line.value} signed out again at "
-                                f"booking {booking_id} after a successful "
-                                f"re-login. Stopped with {len(job.results)} of "
+                                f"booking {booking_id} "
+                                + ("immediately after a re-login - the portal "
+                                   "is refusing to keep this session, so the "
+                                   "scan stopped rather than hammering the "
+                                   "login wall."
+                                   if too_soon else
+                                   f"after {session_recoveries} recoveries.")
+                                + f" Stopped with {len(job.results)} of "
                                 f"{len(job.booking_ids)} bookings checked."
                             )
                             break
-                        session_recovery_used = True
+                        session_recoveries += 1
+                        last_recovery_at = now
+                        last_recovery_index = i
                         logger.warning("batch.session_expired_recovering",
                                        booking_id=booking_id, job_id=job.job_id)
                         status = None
@@ -650,10 +852,38 @@ class BookingService:
                                          job_id=job.job_id,
                                          error=str(relogin_error)[:200])
 
+                        # LET THE LOGIN LAND BEFORE ASKING IF IT WORKED.
+                        #
+                        # THE BUG, from Neon's run of 2026-09-28: "the
+                        # esspresso login issue still exists and i needed to
+                        # login twice". The log showed the contradiction
+                        # plainly:
+                        #
+                        #   15:00:30 espresso.auto_login result=OK
+                        #   15:00:30 batch.session_recovery_gave_up
+                        #
+                        # auto_login SUCCEEDED and the batch stopped anyway.
+                        # _check_login ran in the same second, while the SSO
+                        # redirect chain (login -> auth -> oauth/callback ->
+                        # app) was still in flight, so it sampled a page
+                        # mid-hop and said "not logged in". The scan then
+                        # died on a session that was actually fine.
+                        #
+                        # Same race as the one fixed in check_booking on the
+                        # 23rd; the recovery path never got the treatment.
+                        # Settle first, then poll - an SSO chain takes
+                        # seconds, and asking once is asking too early.
                         recovered = False
                         try:
+                            if hasattr(scraper, "_settle_navigation"):
+                                await scraper._settle_navigation(
+                                    timeout_ms=20000, quiet_ms=1500)
                             if "_check_login" in type(scraper).__dict__:
-                                recovered = await scraper._check_login()
+                                for attempt in range(6):        # ~15s
+                                    recovered = await scraper._check_login()
+                                    if recovered:
+                                        break
+                                    await asyncio.sleep(2.5)
                             else:
                                 recovered = status in ("OK", "ALREADY_LOGGED_IN")
                         except Exception:
@@ -662,37 +892,101 @@ class BookingService:
                         if recovered:
                             logger.info("batch.session_recovered",
                                         job_id=job.job_id, booking_id=booking_id)
-                            interrupted_by_logout.append(booking_id)
-                            job.warning = (
-                                f"{job.cruise_line.value} signed out during the "
-                                f"scan and was logged back in automatically. "
-                                f"Re-run "
-                                f"{', '.join(interrupted_by_logout)} - "
-                                f"{'it' if len(interrupted_by_logout) == 1 else 'they'} "
-                                f"failed to the logout, not to the booking."
-                            )
-                            # Fall through: this booking keeps its ERROR row,
-                            # and the rest of the batch continues on a good
-                            # session instead of failing one at a time.
 
-                        # Could not get back in. ESPRESSO's auto_login can
-                        # only return FILLED_AWAITING_MFA when the account
-                        # demands MFA - there is no unattended way past that,
-                        # and pretending otherwise would just produce a
-                        # louder failure.
-                        job.error = (
-                            f"{job.cruise_line.value} signed out during the scan "
-                            f"at booking {booking_id} and could not be logged "
-                            f"back in automatically"
-                            + (f" (auto-login said {status})" if status else "")
-                            + f". Stopped with {len(job.results)} of "
-                            f"{len(job.booking_ids)} bookings checked - click "
-                            f"\"Check login\", complete the login, then Start "
-                            f"again to do the rest."
-                        )
-                        logger.error("batch.session_recovery_gave_up",
-                                     job_id=job.job_id, status=status)
-                        break
+                            # RETRY THE BOOKING THAT WAS INTERRUPTED.
+                            #
+                            # Neon 2026-09-29: "if this happens the script
+                            # just loges in and continue where it stopped".
+                            #
+                            # It used to keep its ERROR row and move on, so
+                            # every logout cost one real booking and the
+                            # operator had to re-run it by hand. The booking
+                            # never failed on its merits - it failed to a
+                            # logout, which is exactly what we have just
+                            # fixed. On the run of 2026-09-29, booking
+                            # 3001010 got an ERROR row at 13:40 and came
+                            # back NO_SAVING when re-checked by hand an hour
+                            # later; nothing was wrong with it.
+                            #
+                            # One attempt only. If it fails again the
+                            # original ERROR row stands and the batch
+                            # continues - a booking that fails twice is a
+                            # booking problem, not a session problem.
+                            retried = None
+                            try:
+                                retried = await scraper.check_booking(
+                                    booking_id,
+                                    capture_market_data=capture_market_data)
+                            except Exception as retry_error:
+                                logger.warning(
+                                    "batch.retry_after_recovery_failed",
+                                    booking_id=booking_id,
+                                    error=str(retry_error)[:200])
+                            if retried is not None:
+                                logger.info("batch.retry_after_recovery_ok",
+                                            booking_id=booking_id,
+                                            status=getattr(retried.status,
+                                                           "value", None))
+                                result = retried
+                                # Fall through to the normal recording path
+                                # so it is stored, cached and counted like
+                                # any other result.
+                            else:
+                                interrupted_by_logout.append(booking_id)
+                                job.warning = (
+                                    f"{job.cruise_line.value} signed out during "
+                                    f"the scan and was logged back in "
+                                    f"automatically. Re-run "
+                                    f"{', '.join(interrupted_by_logout)} - "
+                                    f"{'it' if len(interrupted_by_logout) == 1 else 'they'} "
+                                    f"failed to the logout, not to the booking."
+                                )
+                                # NOTHING TO RECORD, so skip the rest of the
+                                # loop body for this booking.
+                                #
+                                # The comment here used to claim "THIS
+                                # BOOKING keeps its ERROR row". It does not,
+                                # and never did: `continue` jumps over
+                                # job.results.append() further down, so an
+                                # interrupted booking vanished from the run
+                                # with no row of any kind. Confirmed in the
+                                # database on 2026-09-29 - bookings 3001010
+                                # and 3001008 were interrupted by logouts
+                                # and their ONLY rows came from Neon
+                                # re-running them by hand afterwards.
+                                #
+                                # That is now the fallback rather than the
+                                # normal case: the retry above usually gets
+                                # a real result, and only a booking that
+                                # fails twice ends up deferred to
+                                # job.warning.
+                                continue
+
+                        else:
+                            # Could not get back in. ESPRESSO's auto_login can
+                            # only return FILLED_AWAITING_MFA when the account
+                            # demands MFA - there is no unattended way past
+                            # that, and pretending otherwise would just
+                            # produce a louder failure.
+                            #
+                            # THIS IS AN `else` DELIBERATELY. It used to be a
+                            # bare fall-through after the recovered branch's
+                            # `continue`, which meant a successful retry
+                            # could not reach the recording code without
+                            # landing in here and breaking the batch.
+                            job.error = (
+                                f"{job.cruise_line.value} signed out during the "
+                                f"scan at booking {booking_id} and could not be "
+                                f"logged back in automatically"
+                                + (f" (auto-login said {status})" if status else "")
+                                + f". Stopped with {len(job.results)} of "
+                                f"{len(job.booking_ids)} bookings checked - click "
+                                f"\"Check login\", complete the login, then Start "
+                                f"again to do the rest."
+                            )
+                            logger.error("batch.session_recovery_gave_up",
+                                         job_id=job.job_id, status=status)
+                            break
 
                     if self._is_dead_browser_error(e):
                         logger.warning("batch.browser_dead_restarting", booking_id=booking_id)
@@ -819,6 +1113,33 @@ class BookingService:
                                    booking_id=booking_id,
                                    error=str(feat_error)[:200])
 
+                # DID THE PRICE MOVE SINCE LAST TIME?
+                #
+                # Read BEFORE this scan's row is written, or the "previous"
+                # total would be the one we just captured.
+                #
+                # price_history has kept a row per scan all along - 6,606 of
+                # them - and nothing ever compared two consecutive rows. The
+                # whole product exists to catch a price going down.
+                try:
+                    change = compare_price(
+                        await self._previous_total(result), result.old_total)
+                    if change.direction != "UNKNOWN":
+                        logger.info("price_change", booking_id=booking_id,
+                                    direction=change.direction,
+                                    delta=change.delta,
+                                    previous=change.previous,
+                                    current=change.current)
+                    if change.is_drop:
+                        # Surfaced on the row itself so it stands out
+                        # without anyone reading the log.
+                        result.note = (f"PRICE DROP {abs(change.delta):,.2f} "
+                                       f"since the last scan. "
+                                       + (result.note or "")).strip()
+                except Exception as exc:
+                    logger.warning("price_change.failed", booking_id=booking_id,
+                                   error=str(exc)[:200])
+
                 # Persist result
                 try:
                     await self._save_result_to_db(result)
@@ -857,16 +1178,76 @@ class BookingService:
                 # suppressed a booking for 12h on the basis of a comparison
                 # that never happened. A real NO_SAVING always has a real
                 # old_total to compare against.
-                if (
-                    not bypass_cache
-                    and result.status == BookingStatus.NO_SAVING
-                    and persisted
-                    and result.old_total > 0
-                ):
+                # A CONFIRMED PAID-IN-FULL BOOKING IS EXCLUDED FOR GOOD.
+                #
+                # Written only when the scraper actually READ the payment
+                # panel. ExclusionService refuses otherwise, and that guard
+                # is the whole safety story: "we could not see the balance"
+                # must never become "it owes nothing". That confusion is
+                # what reported a $400 saving on booking 3001001, which had
+                # two cents outstanding.
+                #
+                # Cancelled bookings cannot reach here - is_cancelled() runs
+                # BEFORE the payment panel is read, so a CX reservation
+                # (which displays Final Payment Due 0.00) returns CANCELLED.
+                if result.status == BookingStatus.CANCELLED and persisted:
+                    # Same rule as paid in full, added on Neon's
+                    # instruction 2026-09-29: "add canceled as the same rule
+                    # case as paid in full ... to save resoursces and not
+                    # doing useless scans".
                     try:
-                        await self.cache.set_no_saving(job.cruise_line.value, booking_id)
+                        await self.exclusions.record_cancelled(
+                            job.cruise_line.value, booking_id,
+                            detail=(result.note or "")[:200])
+                    except Exception as exc:
+                        logger.warning("batch.exclusion_record_failed",
+                                       booking_id=booking_id,
+                                       error=str(exc)[:200])
+
+                if result.status == BookingStatus.PAID_IN_FULL and persisted:
+                    payment = getattr(scraper, "last_payment_status", None) or {}
+                    try:
+                        await self.exclusions.record_paid_in_full(
+                            job.cruise_line.value, booking_id,
+                            total_price=payment.get("total_price")
+                            or (result.old_total or None),
+                            final_payment_due=payment.get("final_payment_due"),
+                            payment_state_readable=bool(
+                                payment.get("payment_state_readable")),
+                            currency=payment.get("currency") or result.currency,
+                        )
+                    except Exception as exc:
+                        logger.warning("batch.exclusion_record_failed",
+                                       booking_id=booking_id,
+                                       error=str(exc)[:200])
+
+                # REMEMBER EVERY CACHEABLE OUTCOME, NOT JUST NO_SAVING.
+                #
+                # The old gate was `status == NO_SAVING`, which is why 41%
+                # of a day's scanning was redundant: PAID_IN_FULL (439
+                # repeats), WLT (133), TRAP and NOT_ON_THIS_ACCOUNT were
+                # never remembered and got re-opened every single run.
+                #
+                # CacheService.is_cacheable keeps OPTIMIZATION, ERROR,
+                # CANCELLED and UNKNOWN out - a live saving must always be
+                # re-confirmed, a failure is not an outcome, and every
+                # cancellation must be reported on every run.
+                if not bypass_cache and persisted:
+                    try:
+                        await self.cache.set_result(
+                            job.cruise_line.value, booking_id,
+                            status=result.status.value,
+                            payload={
+                                "old_total": result.old_total,
+                                "new_total": result.new_total,
+                                "net_saving": result.net_saving,
+                                "price_category": result.price_category,
+                                "currency": result.currency,
+                            },
+                        )
                     except Exception as e:
-                        logger.error("batch.cache_save_failed", booking_id=booking_id, error=str(e))
+                        logger.error("batch.cache_save_failed",
+                                     booking_id=booking_id, error=str(e))
 
                 if on_progress:
                     try:
@@ -1076,6 +1457,28 @@ class BookingService:
             )
             session.add(record)
             await session.commit()
+
+    async def _previous_total(self, result: BookingResult) -> float | None:
+        """This booking's total at the PREVIOUS scan, or None if first seen.
+
+        One indexed lookup on (booking_id, cruise_line) ordered by
+        checked_at. Returns None rather than 0.0 when there is no history -
+        "never scanned" and "cost nothing" are different facts.
+        """
+        try:
+            async with async_session() as session:
+                rows = await session.execute(
+                    select(PriceHistory.total)
+                    .where(PriceHistory.booking_id == result.booking_id,
+                           PriceHistory.cruise_line == result.cruise_line.value)
+                    .order_by(PriceHistory.checked_at.desc())
+                    .limit(1))
+                value = rows.scalar_one_or_none()
+                return float(value) if value is not None else None
+        except Exception as exc:
+            logger.warning("price_change.lookup_failed",
+                           booking_id=result.booking_id, error=str(exc)[:200])
+            return None
 
     async def _save_price_history(self, result: BookingResult,
                                   features=None) -> None:

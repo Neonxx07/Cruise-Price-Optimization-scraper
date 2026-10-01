@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Callable
 
+from config.settings import settings
 from core.models import BookingResult, BookingStatus, CruiseLine
 from services.booking_service import BookingService
 from models.database import init_db
@@ -187,6 +188,54 @@ class BookingQueueManager:
     async def close_live_session(self) -> None:
         """Close the shared browser session, if one is open. Call on app exit."""
         await self._service.close_live_scraper()
+
+    async def preview_freshness(self, cruise_line: CruiseLine) -> dict:
+        """What a run would actually do, BEFORE it opens a browser.
+
+        Neon 2026-09-29 asked for this directly: "Before a run starts, show
+        a summary: 42 bookings: 30 fresh (will skip), 12 to scan."
+
+        Answers in TWO bulk queries for the whole watchlist, not one per
+        booking. Never raises - a preview that fails must not stop a scan,
+        so on error it reports everything as "to scan", which is simply
+        today's behaviour.
+        """
+        queued = [i.booking_id for i in self._queue
+                  if i.status == QueueStatus.QUEUED]
+        summary = {"total": len(queued), "fresh": 0, "excluded": 0,
+                   "to_scan": len(queued), "window_hours": 0, "detail": {}}
+        if not queued:
+            return summary
+        try:
+            await self.initialize()
+            summary["window_hours"] = settings.freshness_for(cruise_line.value)
+            excluded = await self._service.exclusions.active_for(
+                cruise_line.value, queued)
+            fresh = await self._service.cache.get_many(cruise_line.value, queued)
+            # An excluded booking is never merely "fresh" - it is never
+            # scanned again at all, so it must not be counted twice.
+            fresh = {k: v for k, v in fresh.items() if k not in excluded}
+            summary["excluded"] = len(excluded)
+            summary["fresh"] = len(fresh)
+            summary["to_scan"] = len(queued) - len(excluded) - len(fresh)
+            summary["detail"] = {
+                **{b: {"state": "excluded", **e} for b, e in excluded.items()},
+                **{b: {"state": "fresh", **f} for b, f in fresh.items()},
+            }
+        except Exception as exc:
+            logger.warning("queue.freshness_preview_failed", error=str(exc)[:200])
+        return summary
+
+    async def force_rescan(self, cruise_line: CruiseLine,
+                           booking_id: str) -> bool:
+        """Drop one booking's freshness entry so the next run scans it live.
+
+        Deliberately does NOT lift a permanent exclusion. A paid-in-full
+        booking stays excluded until someone clears it explicitly - that is
+        a different, deliberate act.
+        """
+        await self.initialize()
+        return await self._service.cache.clear_one(cruise_line.value, booking_id)
 
     async def start_processing(
         self,

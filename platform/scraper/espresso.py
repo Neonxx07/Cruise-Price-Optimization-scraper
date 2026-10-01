@@ -200,6 +200,12 @@ class EspressoScraper(BaseScraper):
 
     cruise_line = CruiseLine.ESPRESSO
 
+    # Booking whose lock has been CONFIRMED released. check_booking's
+    # finally consults it so a booking released by the normal flow is not
+    # released a second time. Class-level default so release_booking still
+    # works when called on its own, before check_booking has set anything.
+    _released_for: str | None = None
+
     # Auth HOSTS (matched on the hostname) and auth PATH segments (matched
     # on the path). Split deliberately, and never as a bare substring of the
     # whole URL.
@@ -251,6 +257,29 @@ class EspressoScraper(BaseScraper):
             # A restored session may already be valid. Re-submitting a
             # login over a live one is pointless and, on this portal,
             # risky - ESPRESSO allows a single active session per account.
+            #
+            # BUT SETTLE FIRST. THE BUG, 2026-09-28: Neon saved his
+            # credentials, opened ESPRESSO, and the project never logged in.
+            # The log showed why:
+            #
+            #   18:05:33 browser.started      restored_session=True
+            #   18:05:35 espresso.auto_login  result=ALREADY_LOGGED_IN
+            #   18:14:12 login.required       url=.../login
+            #
+            # _check_login ran TWO SECONDS after the browser started, while
+            # a restored-but-dead session was still redirecting itself to
+            # /login. It sampled a half-loaded page, reported authenticated,
+            # and auto_login returned without ever filling the credential -
+            # so the GUI sat polling for a human that did not need to be
+            # there.
+            #
+            # This was identified on 2026-09-23 ("_check_login trusts a
+            # stale DOM after a failed navigation") and left open. It is the
+            # same race as the aborted navigations and the failed session
+            # recovery: asking a page a question before it has stopped
+            # moving. A false ALREADY_LOGGED_IN is the worst version of it,
+            # because it makes auto_login do nothing at all.
+            await self._settle_navigation(timeout_ms=15000, quiet_ms=1500)
             if await self._check_login():
                 logger.info("espresso.auto_login", result="ALREADY_LOGGED_IN")
                 return "ALREADY_LOGGED_IN"
@@ -824,6 +853,23 @@ class EspressoScraper(BaseScraper):
     _FINAL_PAYMENT_AMOUNT_RE = re.compile(
         r"Final Payment:\s*(-?[\d,]+\.?\d*)", re.IGNORECASE)
 
+    # THE DATE ON THAT SAME LINE. Added 2026-09-28 because price_history's
+    # final_payment_date column was 0% filled for ESPRESSO while this panel
+    # was displaying the value all along - it was read for the paid-in-full
+    # gate and discarded.
+    #
+    # The layout is the one already documented above:
+    #
+    #   Final Payment Due (CAD):  Due: 10JUL2026
+    #
+    # "Due:" is matched rather than the currency line alone, because the
+    # amount form ("Final Payment Due (CAD): 1234.00") uses the same label
+    # and must NOT be read as a date. The date format is ESPRESSO's usual
+    # DDMMMYYYY, which core.booking_features.parse_date already handles.
+    _FINAL_PAYMENT_DATE_RE = re.compile(
+        r"Final Payment Due\s*\([A-Z]{3}\)\s*:\s*Due:\s*(\d{1,2}[A-Z]{3}\d{4})",
+        re.IGNORECASE)
+
     # ADDED 2026-08-13 (Phase 0 correctness audit): the amount patterns
     # above are deliberately UNCHANGED (still require the literal "(USD)"
     # label) — this only adds detection of whatever currency code the page
@@ -916,6 +962,13 @@ class EspressoScraper(BaseScraper):
             if m:
                 values["final_payment_due"] = float(m.group(1).replace(",", ""))
                 values["final_payment_due_source"] = "final_payment_label"
+
+        # The DATE on the "Final Payment Due (XXX): Due: 10JUL2026" layout.
+        # Read here because the panel is already in hand; price_history's
+        # final_payment_date column sat 0% filled for ESPRESSO while this
+        # text was on screen for every booking.
+        date_match = self._FINAL_PAYMENT_DATE_RE.search(body_text)
+        values["final_payment_date"] = date_match.group(1) if date_match else None
 
         currency_match = self._CURRENCY_LABEL_RE.search(body_text)
         values["currency"] = currency_match.group(1).upper() if currency_match else None
@@ -1265,6 +1318,10 @@ class EspressoScraper(BaseScraper):
                             via="ignoreReservationLink", confirmed=clicked)
                 self.log_action("release_booking", booking_id=booking_id,
                                 via="ignoreReservationLink", confirmed=clicked)
+                # Lets check_booking's finally skip a second, pointless
+                # release. Only set on a CONFIRMED release - an unconfirmed
+                # one must be retried, not remembered as done.
+                self._released_for = booking_id
                 return True
 
             # 2) Fallback: the navigation the page's own handler performs.
@@ -1285,6 +1342,7 @@ class EspressoScraper(BaseScraper):
                             via="flowExecutionURL")
                 self.log_action("release_booking", booking_id=booking_id,
                                 via="flowExecutionURL")
+                self._released_for = booking_id
                 return True
 
             logger.info("espresso.booking_release_skipped", booking_id=booking_id,
@@ -1296,12 +1354,131 @@ class EspressoScraper(BaseScraper):
                            booking_id=booking_id, error=str(exc)[:200])
             return False
 
-    async def check_booking(self, booking_id: str, capture_market_data: bool = False) -> BookingResult:
+    async def _settle_navigation(self, timeout_ms: int = 5000,
+                                 quiet_ms: int = 500) -> bool:
+        """Wait until the page stops navigating itself. Never raises.
+
+        THE RACE THIS ENDS, measured on the live run of 2026-09-23.
+
+        `navigate()` waits for `domcontentloaded`, which fires long before
+        ESPRESSO's /home has finished its own session bootstrap. The flow
+        then spent a median 136ms in `_check_login` and immediately
+        navigated to reservations.do - while /home's JS redirect was still
+        in flight. That redirect then cancelled our navigation:
+
+            navigate_retry in the run : 271
+            net::ERR_ABORTED          : 268   (all on reservations.do)
+
+        The correlation is unambiguous. Time spent on /home before leaving:
+
+            aborted (270 bookings)  median  668ms
+            clean   (374 bookings)  median 1068ms
+
+        The bookings that left /home FASTEST are the ones whose next
+        navigation died. `navigate_reservations` then cost 3130ms on the
+        aborted ones against 1015ms on the clean ones - the retry penalty,
+        paid on 42% of bookings.
+
+        The same race explains the login-form flashes Neon kept seeing:
+        `_check_login` was sampling /home mid-bootstrap, finding the login
+        form that /home briefly renders, and declaring a logout on a
+        perfectly good session. Settling BEFORE the login check fixes both.
+
+        Polls the URL rather than using `networkidle`, which never settles
+        on a portal that long-polls. Bounded, and a timeout is not an
+        error - the caller carries on exactly as it did before.
+        """
+        loop = asyncio.get_event_loop()
+        deadline = loop.time() + timeout_ms / 1000
+        try:
+            last_url = self.page.url
+        except Exception:
+            return False
+        stable_since = loop.time()
+        while loop.time() < deadline:
+            await asyncio.sleep(0.1)
+            try:
+                url = self.page.url
+            except Exception:
+                return False
+            if url != last_url:
+                last_url, stable_since = url, loop.time()
+                continue
+            if (loop.time() - stable_since) * 1000 >= quiet_ms:
+                return True
+        logger.debug("espresso.settle_timeout", url=last_url)
+        return False
+
+    async def check_booking(self, booking_id: str,
+                            capture_market_data: bool = False) -> BookingResult:
+        """Check one booking, and ALWAYS release it afterwards.
+
+        THE BUG THIS EXISTS TO KILL, Neon 2026-09-23: "sometimes the script
+        does not exit ESPRESSO booking and it keeps get blocked and we
+        cannot open it ... solve this bug forever".
+
+        Measured on the live log before this fix:
+
+            ESPRESSO bookings opened : 624
+              released               : 235
+              LEFT LOCKED            : 389    (62%)
+
+        Every one of those 389 sat locked for fifteen minutes, blocking both
+        a human opening it and any re-scan.
+
+        The cause was not a flaky release. `release_booking` had ONE call
+        site, on the happy path at the very end of the flow, while the
+        function had FIFTEEN return statements and SIX raises. Nineteen of
+        the twenty ways out skipped it entirely - WLT, paid-in-full,
+        cancelled, skip-reprice, no-price-change, unreadable payment, and
+        every error. The comment above that call even claimed it ran "for
+        every branch above"; it did not, and nobody had checked.
+
+        Release is a `finally` now. There is no exit from this method -
+        return, raise, or cancellation - that does not go through it, and no
+        future branch can reintroduce the bug by adding another `return`.
+
+        Zero release FAILURES appear in that same log (0 failed, 1 skipped
+        against 293 released), so the mechanism itself was never the
+        problem and is unchanged.
+        """
+        # Reset per booking: a booking checked twice in one run must be
+        # released twice.
+        self._released_for = None
+        try:
+            return await self._check_booking_inner(booking_id, capture_market_data)
+        finally:
+            await self._ensure_released(booking_id)
+
+    async def _ensure_released(self, booking_id: str) -> None:
+        """Release the lock unless the normal flow already did.
+
+        NEVER raises, and never awaits anything that can raise past it: this
+        runs in a `finally`, where an exception would replace the real
+        result - or worse, the real exception - with a misleading one.
+        """
+        if self._released_for == booking_id:
+            return              # the happy path already released it
+        try:
+            released = await self.release_booking(booking_id)
+            if not released:
+                # Not an error: the page may simply have had no booking
+                # open (a login failure, say). Recorded so a rising count
+                # is visible rather than silent.
+                logger.info("espresso.release_not_needed", booking_id=booking_id)
+        except BaseException as exc:      # noqa: BLE001 - a finally must not raise
+            logger.warning("espresso.release_in_finally_failed",
+                           booking_id=booking_id, error=str(exc)[:200])
+
+    async def _check_booking_inner(self, booking_id: str, capture_market_data: bool = False) -> BookingResult:
         """
         Full ESPRESSO booking check flow.
 
         Steps: navigate → login check → search → read category →
         load categories → WLT check → execute API → calculate result.
+
+        Called only by check_booking, which guarantees the release. Do not
+        call this directly - doing so leaves the booking locked.
         """
         price_category: str | None = None
         # ADDED 2026-08-13 (Phase 0 correctness audit): the real currency
@@ -1337,6 +1514,12 @@ class EspressoScraper(BaseScraper):
             logger.info("espresso.navigate_home", booking_id=booking_id)
             self.log_action("navigate", booking_id=booking_id, url=settings.espresso_home_url)
             await self.navigate(settings.espresso_home_url)
+            # LET /home FINISH BEFORE TOUCHING IT. See _settle_navigation:
+            # leaving here early is what aborted 268 navigations and made
+            # _check_login sample a half-built login form. Costs a few
+            # hundred ms; the retry it replaces cost ~2.1s on 42% of
+            # bookings.
+            await self._settle_navigation()
             watch.mark("navigate_home")
             if not await self._check_login():
                 raise RuntimeError("Not logged in — please log into ESPRESSO first")
@@ -1391,6 +1574,10 @@ class EspressoScraper(BaseScraper):
                 return {"_cancelled": True}
 
             payment_status = await self._read_payment_status()
+            # Hand the RAW figures to BookingService. A permanent exclusion
+            # is decided on these, not on the status label - see
+            # ExclusionService.record_paid_in_full.
+            self.last_payment_status = payment_status
             detected_currency = payment_status.get("currency")
 
             # PRICE-DRIVER FIELDS, CAPTURED HERE - ON THE BOOKING PAGE.
@@ -1411,6 +1598,31 @@ class EspressoScraper(BaseScraper):
             try:
                 watch.mark("payment_status")
                 self.last_feature_fields = await self.read_feature_fields()
+                # FOLD IN WHAT THE PAYMENT PANEL ALREADY TOLD US.
+                #
+                # Measured 2026-09-28: price_history had 8 of 20 columns
+                # NULL on every ESPRESSO row, including final_payment_date
+                # and net_balance_due - while _read_payment_status was
+                # parsing both out of the same panel, using them for the
+                # paid-in-full gate, and throwing them away.
+                #
+                # The panel's own layout is documented at
+                # _PAYMENT_FIELD_PATTERNS:
+                #
+                #   Final Payment Due (CAD):  Due: 10JUL2026
+                #   Final Payment:            0.02
+                #
+                # Nothing new is scraped here - this is data already in
+                # hand, being written down instead of discarded.
+                if isinstance(payment_status, dict):
+                    due_date = payment_status.get("final_payment_date")
+                    if due_date:
+                        self.last_feature_fields["finalPaymentDate"] = due_date
+                    balance = payment_status.get("final_payment_due")
+                    if balance is None:
+                        balance = payment_status.get("final_payment_amount")
+                    if balance is not None:
+                        self.last_feature_fields["netBalanceDue"] = balance
             except Exception:
                 self.last_feature_fields = {}
             watch.mark("feature_fields")
@@ -1627,10 +1839,21 @@ class EspressoScraper(BaseScraper):
         # second, unevaluated rate-program column exists on this booking.
         result.note = _append_dual_rate_note(result.note, self.last_market_data)
 
-        # RELEASE THE LOCK before moving on. Placed here so it runs for
-        # every branch above - WLT, paid-in-full, skip-reprice,
-        # no-price-change, the calculated result and the upgrade override
-        # alike. A booking left retrieved stays locked for 15 minutes.
+        # RELEASE THE LOCK on the happy path. A booking left retrieved stays
+        # locked for 15 minutes.
+        #
+        # THIS COMMENT USED TO LIE, and the lie cost 389 locked bookings out
+        # of 624. It read: "Placed here so it runs for every branch above -
+        # WLT, paid-in-full, skip-reprice, no-price-change, the calculated
+        # result and the upgrade override alike." Every one of those
+        # branches returns EARLIER in this function and reached this line
+        # only in the comment's imagination.
+        #
+        # The real guarantee for all of them is the `finally` in
+        # check_booking. This call stays because it releases at the right
+        # MOMENT on the common path - before the timing marks, while the
+        # page is still the booking page - and check_booking's finally then
+        # sees _released_for and does not repeat it.
         _release_watch = getattr(self, "_last_stage_timings", None)
         await self.release_booking(booking_id)
         if _release_watch is not None:

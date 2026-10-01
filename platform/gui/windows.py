@@ -95,6 +95,38 @@ def _status_rank(status_text: str) -> float:
     return float(_STATUS_RANK.get((status_text or "").upper().strip(), 7))
 
 
+def _relative_scan_time(when) -> str:
+    """"1h 23m ago", "Never" - how long since this booking was last scanned.
+
+    Neon 2026-09-29: "it states that this booking was scanned 1 or 2 hours
+    ago". A relative time is what tells you at a glance whether a result is
+    worth acting on; the exact timestamp goes on the tooltip.
+
+    Timestamps are stored in UTC and displayed relative, so no timezone
+    conversion is needed to read this correctly - the arithmetic is between
+    two UTC instants either way.
+    """
+    if when is None:
+        return "Never"
+    try:
+        delta = datetime.utcnow() - when
+    except TypeError:
+        return "—"
+    seconds = delta.total_seconds()
+    if seconds < 0:
+        return "just now"
+    if seconds < 60:
+        return "just now"
+    minutes = int(seconds // 60)
+    if minutes < 60:
+        return f"{minutes}m ago"
+    hours, minutes = divmod(minutes, 60)
+    if hours < 24:
+        return f"{hours}h {minutes}m ago" if minutes else f"{hours}h ago"
+    days, hours = divmod(hours, 24)
+    return f"{days}d {hours}h ago" if hours else f"{days}d ago"
+
+
 def _booking_id_sort_value(booking_id: str) -> float:
     """Booking ids sort NUMERICALLY when they are numbers.
 
@@ -543,16 +575,19 @@ class CruiseLinePanel(QWidget):
         results_box = QGroupBox("Results")
         results_v = QVBoxLayout(results_box)
         results_v.setContentsMargins(10, 8, 10, 10)
-        self.results_table = QTableWidget(0, 9)
+        # "Last scanned" added 2026-09-29. Neon: "it states that this
+        # booking was scanned 1 or 2 hours ago". Relative time reads at a
+        # glance; the exact timestamp is on the tooltip.
+        self.results_table = QTableWidget(0, 10)
         self.results_table.setHorizontalHeaderLabels([
             "Booking ID", "Line", "Status", "Net Saving / Summary",
             "Conf / Checks", "Old Total", "New Total", "Category",
-            "Note / Reason",
+            "Last scanned", "Note / Reason",
         ])
         header = self.results_table.horizontalHeader()
         header.setSectionResizeMode(QHeaderView.Interactive)
         header.setStretchLastSection(True)
-        for col, width in enumerate((95, 80, 120, 165, 85, 95, 95, 90)):
+        for col, width in enumerate((95, 80, 120, 165, 85, 95, 95, 90, 105)):
             self.results_table.setColumnWidth(col, width)
         self.results_table.setSortingEnabled(True)
         # Arrive already arranged, and STAY arranged as rows stream in:
@@ -654,7 +689,25 @@ class CruiseLinePanel(QWidget):
     @Slot()
     @asyncSlot()
     async def _on_login_check(self) -> None:
-        print("GUI: _on_login_check entered")
+        # NO print() ON THE UI THREAD. EVER.
+        #
+        # THE HANG, 2026-09-28. Neon: "the gui is not responding". py-spy
+        # dumped the frozen process and the main thread was sitting inside
+        #
+        #     print("GUI: _on_login_check entered")   windows.py:657
+        #
+        # at 0% CPU, stack identical across dumps, no child processes - the
+        # browser had never even launched. The GUI is started from a .bat
+        # via cmd.exe, so it owns a console window, and Windows QuickEdit
+        # PAUSES console output the moment anyone clicks or selects in it.
+        # A paused console blocks the writer. One stray click froze the
+        # entire application, and Windows reported the window as hung.
+        #
+        # There were EIGHT of these debug prints on UI-thread paths - eight
+        # places a click in a black window could freeze the app. They are
+        # all logger calls now: the log goes to a rotating FILE, which
+        # cannot be paused by a mouse.
+        logger.info("gui.login_check_entered")
         # CONFIRMED REAL RISK, fixed 2026-08-13 (Phase 0 correctness audit):
         # QApplication.processEvents() synchronously dispatches any already-
         # queued Qt events — including a queued second click on this same
@@ -669,7 +722,7 @@ class CruiseLinePanel(QWidget):
 
         cruise_line = self.cruise_line
         try:
-            print("GUI: calling check_login")
+            logger.info("gui.calling_check_login", cruise_line=cruise_line.value)
             if cruise_line == CruiseLine.MSC:
                 # MscLiveService tries Windows-Credential-Manager auto-login
                 # first (same as msc_session_controller.py's phase 1) and
@@ -882,7 +935,7 @@ class CruiseLinePanel(QWidget):
     @Slot()
     @asyncSlot()
     async def _on_start(self) -> None:
-        print("GUI: _on_start entered")
+        logger.info("gui.start_entered")
         # RE-ENTRANCY GUARD, added 2026-09-23 after a real scan was killed
         # by one. From the overnight run's log:
         #
@@ -913,7 +966,9 @@ class CruiseLinePanel(QWidget):
 
     async def _on_start_guarded(self) -> None:
         snapshot = self.queue_manager.get_snapshot()
-        print(f"GUI: start snapshot queued={snapshot.queued} running={snapshot.running} done={snapshot.done} error={snapshot.error}")
+        logger.info("gui.start_snapshot", queued=snapshot.queued,
+                    running=snapshot.running, done=snapshot.done,
+                    error=snapshot.error)
         if snapshot.queued == 0:
             QMessageBox.warning(self, "No bookings", "Add at least one booking ID before starting the queue.")
             return
@@ -982,8 +1037,37 @@ class CruiseLinePanel(QWidget):
         self.login_button.setEnabled(False)
         self.status_label.setText("Starting queue processing...")
 
+
+
         cruise_line = self.cruise_line
         force_live_recheck = self.force_recheck_checkbox.isChecked()
+
+        # WHAT THIS RUN WILL ACTUALLY DO, BEFORE IT OPENS A BROWSER.
+        #
+        # Neon 2026-09-29: "Before a run starts, show a summary: 42
+        # bookings: 30 fresh (will skip), 12 to scan."
+        #
+        # Two bulk queries for the whole watchlist. Never fatal - a preview
+        # that fails must not stop a scan, so a failure simply reports
+        # everything as "to scan", which is the old behaviour.
+        if not force_live_recheck:
+            try:
+                preview = await self.queue_manager.preview_freshness(cruise_line)
+                if preview["total"] and (preview["fresh"] or preview["excluded"]):
+                    parts = [f"{preview['total']} bookings"]
+                    if preview["excluded"]:
+                        parts.append(f"{preview['excluded']} paid in full "
+                                     f"(never rescanned)")
+                    if preview["fresh"]:
+                        parts.append(f"{preview['fresh']} fresh within "
+                                     f"{preview['window_hours']}h (will skip)")
+                    parts.append(f"{preview['to_scan']} to scan")
+                    self.status_label.setText(" · ".join(parts))
+                    logger.info("gui.freshness_preview", **{
+                        k: v for k, v in preview.items() if k != "detail"})
+            except Exception as exc:
+                logger.warning("gui.freshness_preview_failed",
+                               error=str(exc)[:200])
         capture_market_data = self.capture_market_data_checkbox.isChecked()
         capture_everything = self.capture_everything_checkbox.isChecked()
 
@@ -995,7 +1079,7 @@ class CruiseLinePanel(QWidget):
                     cruise_line, force_live_recheck, capture_market_data, capture_everything,
                 )
         except Exception as exc:
-            print("GUI: _on_start exception:", exc)
+            logger.error("gui.start_exception", error=str(exc)[:300])
             traceback.print_exc()
             self.status_label.setText("Queue processing failed")
             QMessageBox.critical(self, "Processing failed", str(exc))
@@ -1057,7 +1141,7 @@ class CruiseLinePanel(QWidget):
             self._append_result_row(result)
             self._refresh_summary()
 
-        print("GUI: invoking queue_manager.start_processing")
+        logger.info("gui.invoking_start_processing")
         await self.queue_manager.start_processing(
             cruise_line=cruise_line,
             on_state_change=on_state_change,
@@ -1127,9 +1211,9 @@ class CruiseLinePanel(QWidget):
             self._refresh_summary()
             self._update_queue_view(self.queue_manager.get_snapshot())
 
-        print("GUI: invoking msc_service.run_batch")
+        logger.info("gui.invoking_msc_run_batch")
         await self.msc_service.run_batch(booking_ids, on_result=on_result, on_progress=on_progress)
-        print("GUI: msc_service.run_batch completed")
+        logger.info("gui.msc_run_batch_completed")
         self.status_label.setText(
             "MSC queue processing complete. Remember: this only FINDS opportunities — "
             "MSC must be called to actually apply any of them (the agent can't reprice MSC directly)."
@@ -1252,6 +1336,7 @@ class CruiseLinePanel(QWidget):
             + (f" → {result.new_price_category}"
                if result.new_price_category and result.new_price_category != result.price_category
                else ""),
+            _relative_scan_time(getattr(result, "checked_at", None)),
             reason,
         ]
         # Numeric columns sort as text otherwise ("$9.00" > "$85.00"),
@@ -1272,8 +1357,13 @@ class CruiseLinePanel(QWidget):
                 item = QTableWidgetItem(text)
             # The full note is usually wider than the column — make it
             # readable on hover rather than truncated and lost.
-            if col == 8 and reason:
+            if col == 9 and reason:
                 item.setToolTip(reason)
+            # Exact timestamp behind the relative time.
+            if col == 8:
+                stamp = getattr(result, "checked_at", None)
+                if stamp is not None:
+                    item.setToolTip(str(stamp))
             self.results_table.setItem(row, col, item)
 
         color = self._color_for_status(result.status.value)
@@ -1355,6 +1445,10 @@ class CruiseLinePanel(QWidget):
             "—",          # MSC has no single old_total
             "—",          # ...nor a single new_total
             category,
+            # MSC runs outside the freshness cache (its own subsystem), so
+            # it has no "last scanned" to report. A dash is honest; "Never"
+            # would imply it is eligible and simply has not been done.
+            "—",
             detail,
         ]
         # Keep columns 3-6 numeric on MSC rows too, so a mixed table (an
@@ -1423,24 +1517,52 @@ class CruiseLinePanel(QWidget):
             return
         self._queue_view_signature = signature
 
-        self.queue_list.clear()
-        for item in snapshot.items:
-            widget = QWidget()
-            widget_layout = QHBoxLayout(widget)
-            widget_layout.setContentsMargins(4, 2, 4, 2)
-            label = QLabel(f"{item.booking_id} [{item.status.value}]")
-            label.setMinimumWidth(320)
-            widget_layout.addWidget(label)
-            if item.status == QueueStatus.QUEUED:
-                remove_button = QPushButton("x")
-                remove_button.setFixedSize(24, 24)
-                remove_button.clicked.connect(lambda _, bid=item.booking_id: self._remove_queue_item(bid))
-                widget_layout.addWidget(remove_button)
-            list_item = QListWidgetItem(self.queue_list)
-            list_item.setData(Qt.UserRole, item.booking_id)
-            list_item.setSizeHint(widget.sizeHint())
-            self.queue_list.addItem(list_item)
-            self.queue_list.setItemWidget(list_item, widget)
+        # PLAIN ITEMS, UPDATED IN PLACE. Measured 2026-09-28 at a real
+        # 721-booking watchlist size:
+        #
+        #     widget per row (the old way)   352.8 ms
+        #     plain text item                 32.0 ms
+        #
+        # The old code built a QWidget + QHBoxLayout + QLabel (+ QPushButton)
+        # for EVERY row and rebuilt the whole list whenever ANY booking
+        # changed state. The signature guard above stops idle rebuilds, but
+        # during a scan the signature changes constantly - each booking goes
+        # QUEUED -> RUNNING -> DONE - so it fired roughly 2,163 times per
+        # 721-booking run. At 353 ms each, ON THE UI THREAD, that is about
+        # twelve minutes of frozen window per scan. That is the "heavy and
+        # not responsive" Neon reported.
+        #
+        # The per-row "x" button was redundant: "Remove selected" sits above
+        # the list and already works off the same Qt.UserRole booking id.
+        #
+        # Rows are now updated IN PLACE when only statuses changed, which is
+        # the common case during a scan, and rebuilt only when the set of
+        # bookings itself changes.
+        # Rebuild when the BOOKINGS change, or whenever the widget has got
+        # out of step with what we think is in it. The count check is not
+        # defensive padding: anything that clears the list behind our back
+        # would otherwise leave in-place updates writing into the wrong
+        # rows, or into nothing at all - a silently wrong queue display is
+        # worse than a slower correct one.
+        ids = [item.booking_id for item in snapshot.items]
+        if (ids != getattr(self, "_queue_view_ids", None)
+                or self.queue_list.count() != len(ids)):
+            self._queue_view_ids = ids
+            self.queue_list.clear()
+            for item in snapshot.items:
+                list_item = QListWidgetItem(
+                    f"{item.booking_id} [{item.status.value}]")
+                list_item.setData(Qt.UserRole, item.booking_id)
+                self.queue_list.addItem(list_item)
+            return
+
+        for row, item in enumerate(snapshot.items):
+            list_item = self.queue_list.item(row)
+            if list_item is None:
+                break
+            text = f"{item.booking_id} [{item.status.value}]"
+            if list_item.text() != text:
+                list_item.setText(text)
 
     async def refresh_last_scan_label(self) -> None:
         """Show the most recent COMPLETED scan per cruise line.

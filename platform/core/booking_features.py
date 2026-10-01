@@ -173,6 +173,21 @@ def from_espresso(page_text: str | None = None, observed: date | None = None,
     f.currency = grab("currency")
     f.stateroom_type = grab("stateroomType")
 
+    # FROM THE PAYMENT PANEL, folded in by check_booking. Added 2026-09-28:
+    # price_history had these two 0% filled for ESPRESSO while
+    # _read_payment_status was parsing both out of the panel for the
+    # paid-in-full gate and discarding them. Nothing extra is scraped - this
+    # is data already in hand being written down.
+    f.final_payment_date = parse_date(grab("finalPaymentDate"))
+    balance = grab("netBalanceDue")
+    if balance is not None:
+        try:
+            f.net_balance_due = float(str(balance).replace(",", ""))
+        except (TypeError, ValueError):
+            # Unreadable is NOT zero. A fabricated 0.00 balance would read
+            # as "paid in full" to anything downstream.
+            f.net_balance_due = None
+
     # DELIBERATELY NOT MAPPED: "occupancy". It is present and it varies
     # (2 and 4 across those same 12 pages), so it is tempting - but nothing
     # observed says whether it is the BOOKING'S GUEST COUNT or the CABIN'S
@@ -182,6 +197,19 @@ def from_espresso(page_text: str | None = None, observed: date | None = None,
     # which is precisely the class of error the whole features module exists
     # to avoid. It stays unmapped until a booking with a KNOWN guest count
     # settles which one it is.
+    #
+    # RE-CHECKED 2026-09-28 against 6 more captured pages, while chasing
+    # price_history's 0%-filled columns. The refusal holds, and there is no
+    # alternative source either:
+    #
+    #     occupancy    = 4 (x6), 0 (x2)   still ambiguous, and now 0 as well
+    #     totalGuests  = "(Pending)"      still the unrendered template
+    #     duration     = 0                not the sailing length
+    #
+    # So ESPRESSO's `nights` and `guests_count` are NOT available from what
+    # the page currently gives us. They stay NULL on purpose. A NULL column
+    # costs a model some signal; a fabricated one teaches it something
+    # false, and only the second kind is unrecoverable.
     f.days_to_sailing = _days_between(f.sail_date, observed)
     return f
 
@@ -205,6 +233,20 @@ def from_ncl(market_data: dict | None, observed: date | None = None) -> BookingF
     f.final_payment_date = parse_date(
         _dig(market_data or {}, "payment", "finalPaymentDate")
         or _dig(market_data or {}, "derived", "final_payment_date"))
+
+    # REGION, from bookingFacts["Destination"]. Added 2026-09-28 after
+    # measuring price_history's fill rate: `region` was 0% for EVERY line,
+    # while NCL had been reporting it on 20 of 20 captures all along -
+    # "ALASKA", "CARIBBEAN" and so on, right next to fields already read.
+    #
+    # NOT mapped from the same source, because the captures do not support
+    # it: there is no ship CODE (only "Ship" = "Norwegian Bliss"), no
+    # currency, and no stateroom TYPE. "Stateroom" is a cabin NUMBER
+    # ("9232"), which is not the same thing and must not be written into
+    # stateroom_type.
+    dest = facts.get("Destination")
+    f.region = str(dest).strip().title() if dest not in (None, "") else None
+
     f.days_to_sailing = _days_between(f.sail_date, observed)
     return f
 

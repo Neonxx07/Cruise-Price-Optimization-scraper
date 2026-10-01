@@ -85,17 +85,53 @@ def test_the_loop_recovers_before_it_checks_for_a_dead_browser():
     assert src.index("is_session_expired_error(e)") < src.index("self._is_dead_browser_error(e)")
 
 
-def test_recovery_is_attempted_only_once_per_batch():
+def test_recovery_is_rate_limited_not_count_limited():
     """A portal that signs us out repeatedly is not something to keep
-    hammering - on a bot-sensitive account that is its own risk. The second
-    logout stops the batch with a count of what was completed."""
+    hammering - on a bot-sensitive account that is its own risk.
+
+    CHANGED 2026-09-29. The rule used to be ONE recovery per batch, which
+    measurement showed was far too strict: ESPRESSO drops a session roughly
+    HOURLY, so a 723-booking run is guaranteed to hit a second logout and
+    used to die there with 399 bookings unchecked:
+
+        13:40:31  session_expired_recovering
+        13:40:43  session_recovered       <- worked
+        14:41:20  session_expired_again   <- 61 min later, batch STOPPED
+
+    What actually needs preventing is a hot LOOP, so the guard is now about
+    RATE: recover freely when logouts are far apart, stop when they arrive
+    back to back.
+    """
     import inspect
 
     from services.booking_service import BookingService
 
     src = inspect.getsource(BookingService._run_batch)
-    assert "session_recovery_used" in src
+    assert "session_recoveries" in src
     assert "batch.session_expired_again" in src
+    # the loop guard must still exist
+    assert "_RECOVERY_MIN_GAP_S" in src and "_RECOVERY_MIN_BOOKINGS" in src
+
+
+def test_an_hourly_logout_is_not_treated_as_a_loop():
+    """The measured real interval was 61 minutes."""
+    from services.booking_service import BookingService as B
+    assert B._RECOVERY_MIN_GAP_S < 3600, (
+        "an hourly session drop must be recoverable, not classed as a loop")
+
+
+def test_back_to_back_logouts_are_still_treated_as_a_loop():
+    """Two logouts seconds apart, on adjacent bookings, means the portal is
+    refusing to keep us in. Hammering a login wall is its own risk."""
+    from services.booking_service import BookingService as B
+    assert B._RECOVERY_MIN_GAP_S >= 60
+    assert B._RECOVERY_MIN_BOOKINGS >= 2
+
+
+def test_recoveries_are_capped_even_when_well_spaced():
+    """A cap that still allows a full working day of hourly drops."""
+    from services.booking_service import BookingService as B
+    assert 5 <= B._RECOVERY_MAX <= 50
 
 
 def test_a_failed_relogin_stops_the_batch_rather_than_failing_every_booking():
