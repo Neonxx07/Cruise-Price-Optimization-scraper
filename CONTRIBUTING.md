@@ -14,6 +14,25 @@ Thank you for considering contributing! This project is open source and we welco
 > **this is needed once per clone**. Read [`SECURITY.md`](SECURITY.md) before your first
 > commit; use placeholder booking references (`3000xxx`, `DEMOnn`), never real ones.
 
+## Versioning
+
+The project uses `1.0`, `1.1`, `1.2` … Record every change under
+`## [Unreleased]` in [`CHANGELOG.md`](CHANGELOG.md) as you make it, under
+**Added** (what's new) or **Fixed** (what was broken).
+
+On release: rename that heading to the version, bump `app_version` in
+`platform/config/settings.py`, then tag it:
+
+```bash
+git tag -a v1.1 -m "v1.1"
+git push origin v1.1
+```
+
+The Chrome extension has its own version line in `extension/manifest.json`
+(currently `6.x`) and is deliberately not renumbered to match — Chrome rejects
+an update whose version decreases. Bump it only when the extension changes,
+and note the bump inside the release entry.
+
 ## Project Structure
 
 This is a **monorepo** containing two projects:

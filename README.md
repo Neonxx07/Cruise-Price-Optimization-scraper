@@ -4,6 +4,7 @@
 
 **Automated repricing intelligence for Royal Caribbean, Celebrity, Norwegian, Carnival & MSC Cruises**
 
+[![Version](https://img.shields.io/badge/version-1.0-blue.svg)](CHANGELOG.md)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](CONTRIBUTING.md)
 [![Chrome Extension](https://img.shields.io/badge/Chrome-Extension-4285F4?logo=googlechrome&logoColor=white)]()
@@ -484,6 +485,7 @@ logged-in session.
   and the MSC-specific reference
 - [`RECREATE_PROMPT.md`](RECREATE_PROMPT.md) — a self-contained prompt that can rebuild the
   whole system from scratch
+- [`CHANGELOG.md`](CHANGELOG.md) — what's new and what was fixed, per version
 - [`SECURITY.md`](SECURITY.md) — what must never be committed, the three defences that
   enforce it, and the incident record behind each rule
 - [`platform/docs/MSC_DISCOUNT_RULES.md`](platform/docs/MSC_DISCOUNT_RULES.md) — which MSC
