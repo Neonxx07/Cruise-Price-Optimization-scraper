@@ -51,6 +51,12 @@ def crash_log(tmp_path):
     setup_logging("INFO", str(path))
 
     def read():
+        # Logging is ASYNCHRONOUS since 2026-09-30 (a QueueListener thread
+        # owns the handlers, so a paused console can never freeze the UI).
+        # The file therefore lags the call by milliseconds - drain it first
+        # rather than racing it and failing intermittently.
+        from utils.logging import flush_logs
+        flush_logs()
         if not path.exists():
             return []
         out = []

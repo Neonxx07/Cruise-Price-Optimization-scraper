@@ -209,7 +209,21 @@ async def test_a_rescan_refreshes_rather_than_duplicating(cache):
 
 @pytest.mark.asyncio
 async def test_unreadable_stored_json_does_not_break_the_lookup(cache):
-    """A corrupt row must cost that booking a rescan, not the whole batch."""
+    """A corrupt row must cost that booking a rescan, not the whole batch.
+
+    CORRECTED 2026-10-01. The assertion used to be
+    `entry is not None and entry["data"] == {}` - which contradicted this
+    docstring. Returning an entry means the booking is SKIPPED, served from
+    a row whose contents could not be read, and displayed with every price
+    column blank. That is the exact "scanned 1.4h ago, no figures" symptom
+    the freshness work set out to remove.
+
+    The calculator fingerprint added for roadmap P1.2 made the behaviour
+    match the intent: an unparseable row carries no fingerprint, so it is a
+    miss and the booking is scanned again. The lookup still does not throw,
+    which is what the test name is about, and the rest of the batch is
+    unaffected.
+    """
     import services.cache_service as mod
     from sqlalchemy import update
 
@@ -218,5 +232,6 @@ async def test_unreadable_stored_json_does_not_break_the_lookup(cache):
     async with mod.async_session() as s:
         await s.execute(update(CacheEntry).values(value_json="{not json"))
         await s.commit()
-    entry = await cache.get("ESPRESSO", "J")
-    assert entry is not None and entry["data"] == {}
+
+    # No exception, and the booking is re-scanned rather than skipped blank.
+    assert await cache.get("ESPRESSO", "J") is None

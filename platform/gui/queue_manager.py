@@ -185,9 +185,31 @@ class BookingQueueManager:
         return await self._service.check_login(
             cruise_line, timeout_minutes=timeout_minutes, headless=headless)
 
+    async def session_is_logged_in(self, cruise_line: CruiseLine) -> bool:
+        """Whether the open session is really logged in right now.
+
+        Distinct from `has_live_session`, which only says a browser is
+        alive - and an alive browser sitting on a login wall is exactly
+        what an expired ESPRESSO session looks like.
+        """
+        return await self._service.session_is_logged_in(cruise_line)
+
     async def close_live_session(self) -> None:
         """Close the shared browser session, if one is open. Call on app exit."""
         await self._service.close_live_scraper()
+
+    async def scan_plan(self, cruise_line: CruiseLine,
+                        bypass_cache: bool = False) -> dict:
+        """What pressing Start would do with the CURRENT queue.
+
+        `{"action": "reuse", ...}` when the same list was scanned inside
+        settings.scan_suppression_hours, `{"action": "scan", ...}`
+        otherwise. See BookingService.scan_plan.
+        """
+        # The queue holds QueueItem objects, not bare ids.
+        return await self._service.scan_plan(
+            cruise_line.value, [i.booking_id for i in self._queue],
+            bypass_cache=bypass_cache)
 
     async def preview_freshness(self, cruise_line: CruiseLine) -> dict:
         """What a run would actually do, BEFORE it opens a browser.

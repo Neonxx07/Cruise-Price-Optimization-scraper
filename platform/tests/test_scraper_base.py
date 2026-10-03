@@ -87,7 +87,11 @@ class _FakeLocator:
     def first(self):
         return _FakeLocator(self._snapshot, match_count=1)
 
-    async def aria_snapshot(self):
+    async def aria_snapshot(self, timeout=None):
+        # `timeout` added 2026-09-30: check_structure_drift now passes an
+        # explicit small budget instead of inheriting the 30-second action
+        # timeout, which cost 61 seconds of every real session. The double
+        # must accept it or every drift test reports capture_failed.
         if self._match_count > 1:
             raise RuntimeError(
                 f"strict mode violation: locator resolved to "

@@ -205,8 +205,9 @@ def claim_single_instance() -> bool:
     THE PROBLEM, 2026-09-29. Stopping a backgrounded watchdog kills the task
     wrapper but can leave the Python process alive, so restarts quietly
     stacked up - at one point four processes matched, and working out which
-    were real cost more time than the fix. The same trap took four logins to
-    spot in espresso_live_headless_test.py.
+    were real cost more time than the fix. The same trap took four logins
+    to spot during the 2026-09-23 headless investigation (recorded in
+    docs/ESPRESSO_SESSION_BUGS_2026_09.md).
 
     Duplicates are not merely untidy now that ALARMs reach the screen: two
     watchdogs mean two toasts for every alert, and an alert that arrives

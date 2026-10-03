@@ -1240,9 +1240,28 @@ class EspressoScraper(BaseScraper):
         try:
             # 1) The real control, as captured: the Exit link, then the
             # confirm button inside the dialog it opens.
+            # INSTRUMENTED 2026-10-01, before optimising rather than after.
+            #
+            # Measured over 1,369 real bookings, release_booking is a median
+            # 10.20s of a 16.39s booking - **62% of ESPRESSO scan time**,
+            # and it now runs on every booking rather than the 38% that used
+            # to reach it. It is the single biggest speed lever in the
+            # project.
+            #
+            # But the 10s is spread across four steps (open the dialog, wait
+            # for it, click Exit, wait for the page) and nothing said which
+            # one costs it. Optimising on a guess here is how a release gets
+            # broken, and a missed release means a booking locked for 15
+            # minutes - the V-VIP bug. So: measure first, in its own log
+            # line, deliberately NOT folded into the existing
+            # `release_booking` stage so the 1,369 historical records stay
+            # comparable.
+            release_watch = _Stopwatch()
             link = self.page.locator("#ignoreReservationLink")
             if await link.count() > 0:
+                release_watch.mark("find_link")
                 await link.first.click()
+                release_watch.mark("open_dialog")
 
                 # THE CONFIRM STEP IS NOT OPTIONAL. Neon 2026-09-18: "the
                 # script is not pressong on exit i have to press it
@@ -1281,7 +1300,9 @@ class EspressoScraper(BaseScraper):
                 clicked = False
                 try:
                     await confirm.first.wait_for(state="visible", timeout=15000)
+                    release_watch.mark("await_dialog")
                     await confirm.first.click(timeout=5000)
+                    release_watch.mark("click_exit")
                     clicked = True
                 except Exception:
                     # A real overlay can swallow a synthetic click; the
@@ -1296,6 +1317,7 @@ class EspressoScraper(BaseScraper):
                         pass
 
                 await self.page.wait_for_load_state("domcontentloaded", timeout=10000)
+                release_watch.mark("page_settle")
 
                 # Still showing the confirm dialog? Then nothing was released.
                 try:
@@ -1303,6 +1325,12 @@ class EspressoScraper(BaseScraper):
                                   and await confirm.first.is_visible())
                 except Exception:
                     still_open = False
+                release_watch.mark("verify")
+                # The breakdown this whole exercise is for. One line per
+                # release; the next real run says which step owns the 10s.
+                logger.info("espresso.release_timings", booking_id=booking_id,
+                            total_ms=release_watch.total_ms,
+                            **release_watch.stages)
                 if still_open:
                     logger.warning(
                         "espresso.booking_release_unconfirmed",
@@ -1327,13 +1355,35 @@ class EspressoScraper(BaseScraper):
             # 2) Fallback: the navigation the page's own handler performs.
             # Group bookings use a DIFFERENT event - taken from that same
             # handler, not assumed.
+            # ABSOLUTE, NOT RELATIVE. Found 2026-09-30 in the log:
+            #
+            #   espresso.booking_release_failed x22, and 21 of them
+            #   "Page.goto: Protocol error (Page.navigate): Cannot
+            #    navigate to invalid URL ... navigating to "/espres..."
+            #
+            # window.Base.flowExecutionURL is a ROOT-RELATIVE path
+            # ("/espresso/protected/reservations.do?execution=e3s1"), and
+            # page.goto() rejects anything that is not absolute. So this
+            # entire fallback - the path taken whenever the Exit link is
+            # not on the page - threw on EVERY attempt, and those bookings
+            # stayed locked for the full 15 minutes.
+            #
+            # The 2026-09-23 `finally` fix was working: release was being
+            # CALLED every time. It was the release itself that could not
+            # complete. Last occurrence 2026-09-30 18:43, still live.
+            #
+            # Resolved in the page, against the live document base, rather
+            # than by gluing on an origin here - the browser knows the base
+            # and this cannot drift if the portal moves the path.
             released = await self.page.evaluate("""
                 (() => {
                   if (!window.Base || !window.Base.flowExecutionURL) return null;
                   const group = (typeof isGroupBooking !== 'undefined') && isGroupBooking;
-                  return window.Base.flowExecutionURL + '&_eventId='
+                  const rel = window.Base.flowExecutionURL + '&_eventId='
                        + (group ? 'linkToCompleteIgnoreReservationGb'
                                 : 'linkToIgnoreReservation');
+                  try { return new URL(rel, document.baseURI).href; }
+                  catch (e) { return rel; }
                 })()
             """)
             if released:
@@ -1682,7 +1732,21 @@ class EspressoScraper(BaseScraper):
 
             # WLT check (AFTER categories table is loaded — fix from v6.3)
             if price_category and await self._check_wlt(price_category):
-                return {"_wlt": True}
+                # SAVE THE PRICE. Same reason as the skipRepriceModal
+                # branch below - see make_skip_reprice_result. A waitlisted
+                # booking still HAS a price and the panel is on screen;
+                # recording nothing produced 1,741 WLT rows with no figures
+                # at all, the single biggest group of price-less rows in
+                # the database.
+                payment = {}
+                try:
+                    payment = await self._read_payment_status()
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("espresso.wlt_price_unreadable",
+                                   booking_id=booking_id, error=str(exc)[:200])
+                return {"_wlt": True,
+                        "oldTotal": payment.get("total_price"),
+                        "currency": payment.get("currency")}
 
             page_data = await self._read_page_data(price_category)
             if not page_data.get("executionToken"):
@@ -1702,8 +1766,33 @@ class EspressoScraper(BaseScraper):
             # the portal's own "Booking Restriction: Changing price pgm
             # is not allowed" message). No point retrying — it won't change.
             if api_result.get("ok") and (api_result.get("data") or {}).get("key") == "skipRepriceModal":
-                logger.info("espresso.skip_reprice", booking_id=booking_id)
-                return {"_skipRepriceModal": True}
+                # SAVE THE PRICE ANYWAY. Neon 2026-10-01: "THIS BOOKINGS
+                # ARE NOT SHOWING PRICES WE NEED TO SAVE ALL PRICES NOW
+                # SINCE WE ARE HAVING AND RUNNING A DATA BASE."
+                #
+                # A restricted booking cannot be REPRICED, but it still has
+                # a price, and it was on screen the whole time. Before this
+                # the result carried no figures at all, so 559 skips across
+                # 154 bookings stored `old 0.00 / new 0.00 / conf 0` -
+                # indistinguishable from a booking nobody could read.
+                # Booking 3001017 has 15 scans and not one recorded price.
+                #
+                # The panel is already rendered on this page, so this costs
+                # one inner_text read and no navigation. Guarded: failing
+                # to read the price must not turn a clean "restricted" into
+                # an error.
+                payment = {}
+                try:
+                    payment = await self._read_payment_status()
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("espresso.skip_reprice_price_unreadable",
+                                   booking_id=booking_id, error=str(exc)[:200])
+                logger.info("espresso.skip_reprice", booking_id=booking_id,
+                            total_price=payment.get("total_price"))
+                return {"_skipRepriceModal": True,
+                        "oldTotal": payment.get("total_price"),
+                        "currency": payment.get("currency"),
+                        "finalPaymentDate": payment.get("final_payment_date")}
 
             short_response = (api_result.get("dataLength") or 0) < 300
             if not api_result.get("ok") or short_response:
@@ -1762,7 +1851,10 @@ class EspressoScraper(BaseScraper):
 
         # Handle sentinel results
         if api_result.get("_wlt"):
-            return make_wlt_result(booking_id, price_category, CruiseLine.ESPRESSO)
+            return make_wlt_result(
+                booking_id, price_category, CruiseLine.ESPRESSO,
+                old_total=api_result.get("oldTotal"),
+                currency=api_result.get("currency"))
         if api_result.get("_paidInFull"):
             return make_paid_in_full_result(
                 booking_id, price_category, CruiseLine.ESPRESSO, api_result.get("oldTotal", 0),
@@ -1782,7 +1874,10 @@ class EspressoScraper(BaseScraper):
                 "the reservation by hand.",
             )
         if api_result.get("_skipRepriceModal"):
-            return make_skip_reprice_result(booking_id, price_category, CruiseLine.ESPRESSO)
+            return make_skip_reprice_result(
+                booking_id, price_category, CruiseLine.ESPRESSO,
+                old_total=api_result.get("oldTotal"),
+                currency=api_result.get("currency"))
         if api_result.get("_noPriceChange"):
             return make_no_price_change_result(
                 booking_id, price_category, CruiseLine.ESPRESSO, api_result.get("price", 0),

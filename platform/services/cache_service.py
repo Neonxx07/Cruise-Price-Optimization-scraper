@@ -46,6 +46,7 @@ from datetime import datetime, timedelta
 from sqlalchemy import delete, select
 
 from config.settings import settings
+from core.calculator_version import CALCULATOR_FINGERPRINT
 from models.database import CacheEntry, async_session
 from utils.logging import get_logger
 
@@ -124,6 +125,31 @@ class CacheService:
                         payload = json.loads(entry.value_json or "{}")
                     except ValueError:
                         payload = {}
+
+                    # A VERDICT THE CURRENT CALCULATOR DISAGREES WITH IS
+                    # NOT FRESH.
+                    #
+                    # TRAP and NO_SAVING are both cacheable, for up to 24
+                    # hours. So when the calculator changes, every stored
+                    # row is an answer the code no longer gives - and it
+                    # keeps being served until the TTL runs out, silently,
+                    # looking perfectly normal.
+                    #
+                    # Hit twice in two days: the ALL INC 2PK NRD double
+                    # count (8 entries cleared by hand) and booking
+                    # 3001014, a price INCREASE shown as a green
+                    # OPTIMIZATION (1 entry). Clearing by hand is a step
+                    # someone will forget.
+                    #
+                    # Entries written before this existed carry no
+                    # fingerprint, so they expire once - which is correct,
+                    # nothing knows which calculator produced them.
+                    if payload.get("calc") != CALCULATOR_FINGERPRINT:
+                        logger.info("cache.stale_calculator",
+                                    booking_id=booking_id,
+                                    stored=payload.get("calc"),
+                                    current=CALCULATOR_FINGERPRINT)
+                        continue
                     out[booking_id] = {
                         "hours_ago": round(
                             (now - scanned_at).total_seconds() / 3600, 1),
@@ -152,6 +178,10 @@ class CacheService:
         body = dict(payload or {})
         body["status"] = status
         body["scanned_at"] = datetime.utcnow().isoformat()
+        # WHICH CALCULATOR PRODUCED THIS VERDICT. Read back in get_many: a
+        # mismatch means the logic has changed since, so the entry is not
+        # fresh however recent it is. See core/calculator_version.py.
+        body["calc"] = CALCULATOR_FINGERPRINT
         key = _key(cruise_line, booking_id)
         try:
             async with async_session() as session:

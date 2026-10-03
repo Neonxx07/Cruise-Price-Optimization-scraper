@@ -1,6 +1,7 @@
 # Cruise Intelligence System
 
-> Enterprise-grade repricing intelligence for Royal Caribbean, Celebrity & Norwegian Cruise Line.
+> Enterprise-grade repricing intelligence for Royal Caribbean, Celebrity, Norwegian,
+> Carnival & MSC Cruises.
 
 Evolved from the CruiseIntel Chrome Extension into a scalable, production-ready Python system.
 
@@ -84,20 +85,56 @@ python main.py scan --bookings "4097990,64756965" --cruise-line ESPRESSO -o resu
 
 ## Project Structure
 
+**Packages**
+
 ```
-├── core/               # Business logic (calculator, confidence, models)
-├── scraper/            # Playwright scrapers (ESPRESSO, NCL)
-├── api/                # FastAPI server + routes
-├── services/           # Orchestration, caching, CSV export
-├── models/             # SQLAlchemy database models
-├── utils/              # Retry, structured logging
-├── config/             # Pydantic Settings (env-based)
-├── main.py             # CLI entry point
-├── run.py              # PyInstaller entry point
-└── requirements.txt
+core/        business logic — calculators, perk tiers, price scope,
+             scan signatures, calculator versioning, models
+scraper/     Playwright scrapers (ESPRESSO, NCL, GoCCL) + browser pool,
+             smart locator, click verification
+services/    orchestration, caching, exclusions, outcomes, exports,
+             multi-line coordination, resource governor
+gui/         PySide6 desktop app (windows, queue manager, monitor tabs)
+api/         FastAPI server + routes
+models/      SQLAlchemy database models
+config/      Pydantic settings (env-based)
+utils/       structured logging, retry
+tests/       the suite — one module per behaviour, dated by discovery
+docs/        see docs/README.md for the index
 ```
 
----
+**Entry points** — run these from `platform/`
+
+| | |
+|---|---|
+| `python -m gui.main` · `START_GUI.bat` | desktop app (the usual way in) |
+| `python main.py scan …` · `python main.py api` | CLI and API server |
+| `python easy_menu.py` · `START.bat` | console menu, no commands to type |
+| `python scan_watchdog.py` | watch a run in progress from a second terminal |
+| `python save_login.py` / `clear_login.py` | store or remove a portal login (OS keyring) |
+
+**MSC session tooling** — MSC is driven by a long-lived browser session rather
+than a one-shot scrape, so it has its own entry points: `msc_session_controller.py`
+(holds the session), `msc_commands.py` (command dispatch), `msc_run_calculator.py`,
+`msc_dedupe_data.py`, `record_msc_session.py`.
+
+**Operational tools** — read-only unless stated
+
+| | |
+|---|---|
+| `analyze_history.py` | report over already-collected scan data |
+| `cross_line_audit.py` · `msc_audit.py` | audit stored results for scope mismatches |
+| `run_health.py` | catch a run that has silently gone wrong, while it runs |
+| `run_ncl_live_check.py` | one watched NCL booking, full Playwright trace |
+| `run_persistent_watchlist_scan.py` | long-running watchlist scan |
+| `check_bookings_now.py` | run the production scraper over a list |
+| `discover_portal_fields.py` | rank candidate form fields on a new portal |
+| `split_ncl_watchlist_by_account.py` | split a watchlist by NCL market account |
+| `rebuild_export.py` · `cleanup_test_pollution.py` | recovery/remediation (writes) |
+
+Local-only data — `data/`, `cruise_intel.db*`, `browser-profile/`, `reports/`
+and any watchlist file — is git-ignored by design. See
+[`SECURITY.md`](../SECURITY.md).
 
 ## Building a Standalone Executable
 
@@ -158,4 +195,7 @@ pyinstaller --onefile --name cruise-intel run.py
 
 ## License
 
-Proprietary — Internal use only.
+[MIT](../LICENSE), same as the rest of the repository.
+
+> This line previously read "Proprietary — internal use only", which contradicted
+> the MIT `LICENSE` at the repository root. The root licence governs.

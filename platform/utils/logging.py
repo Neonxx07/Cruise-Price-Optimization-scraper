@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import pathlib
 import sys
+import time as _time
 
 import structlog
 
@@ -76,6 +77,135 @@ def setup_logging(level: str = "INFO", log_file: str = "") -> None:
         )
         file_handler.setFormatter(file_formatter)
         root.addHandler(file_handler)
+
+    _make_logging_non_blocking(root)
+
+
+#: The background listener that owns the real handlers. Module-level so a
+#: second setup_logging() call replaces it instead of leaking a thread.
+_log_listener = None
+
+
+def _make_logging_non_blocking(root: logging.Logger) -> None:
+    """Move all log I/O off the calling thread.
+
+    THE HANG, 2026-09-30. py-spy on a frozen GUI:
+
+        emit (logging\\__init__.py:1154)
+        _proxy_to_logger (structlog\\_base.py:224)
+        _attempt (scraper\\espresso.py:1676)
+        _run_batch -> timerEvent (qasync)
+
+    The UI thread was blocked inside `Handler.emit`, 0% CPU, window
+    reported HUNG by Windows.
+
+    The cause is the same one that froze it on 2026-09-28 through a
+    `print()`: the app is launched from a .bat, so it owns a CONSOLE, and
+    Windows QuickEdit PAUSES console output the moment anyone clicks or
+    selects in that window. A paused console blocks whoever writes to it.
+    Removing the eight prints did not fix it, because EVERY `logger.info()`
+    also writes to the console handler - hundreds of times per scan instead
+    of eight times per session. The earlier fix treated the symptom.
+
+    A QueueHandler makes the caller's job a queue append, which cannot
+    block; a QueueListener thread owns the real handlers and does the I/O.
+    If the console is paused, that background thread waits - and nothing
+    else notices.
+
+    Also covers the FILE handler: a rotating write on a slow or locked disk
+    would stall the UI thread just as effectively.
+    """
+    global _log_listener
+    import queue as _queue
+    from logging.handlers import QueueHandler, QueueListener
+
+    class _PassthroughQueueHandler(QueueHandler):
+        """Enqueue the record UNCHANGED.
+
+        The stdlib QueueHandler.prepare() formats the record and replaces
+        `record.msg` with the resulting STRING (so the record can cross a
+        process boundary). That is wrong here: structlog puts a DICT in
+        `record.msg`, and the listener's ProcessorFormatter then does
+        `record.msg.copy()` and raises
+
+            AttributeError: 'str' object has no attribute 'copy'
+
+        ...on every single record, silently, on a background thread. The
+        first version of this fix produced a ZERO-BYTE log file - trading a
+        frozen window for no evidence at all, which is the worse bargain.
+
+        The queue is in-process, so there is nothing to serialise for and
+        the raw record is exactly what the real handlers want.
+        """
+
+        def prepare(self, record):
+            return record
+
+    if _log_listener is not None:
+        try:
+            _log_listener.stop()
+        except Exception:
+            pass
+        _log_listener = None
+
+    real_handlers = list(root.handlers)
+    if not real_handlers:
+        return
+    # Unbounded: dropping log records to protect the UI would lose exactly
+    # the evidence needed after an incident, and the listener drains far
+    # faster than any scan produces records.
+    record_queue: _queue.Queue = _queue.Queue(-1)
+    root.handlers.clear()
+    root.addHandler(_PassthroughQueueHandler(record_queue))
+    _log_listener = QueueListener(record_queue, *real_handlers,
+                                  respect_handler_level=True)
+    _log_listener.daemon = True
+    _log_listener.start()
+
+    import atexit
+    atexit.register(_stop_log_listener)
+
+
+def flush_logs(timeout: float = 5.0) -> bool:
+    """Wait until everything logged so far has actually been written.
+
+    Logging is asynchronous now (see _make_logging_non_blocking), so the
+    file lags the call by a few milliseconds. That is invisible in normal
+    use and matters in exactly two places: a test that logs then reads the
+    file, and any code that wants the evidence on disk before doing
+    something drastic.
+
+    Returns True if the queue drained within the timeout. Never raises -
+    a flush that cannot complete must not become the failure.
+    """
+    listener = _log_listener
+    if listener is None:
+        return True
+    try:
+        queue = listener.queue
+        deadline = _time.monotonic() + timeout
+        while _time.monotonic() < deadline:
+            if queue.empty():
+                # The listener may still be inside emit() for the last
+                # record; give it a moment to finish rather than racing it.
+                _time.sleep(0.02)
+                if queue.empty():
+                    return True
+            _time.sleep(0.01)
+        return False
+    except Exception:
+        return False
+
+
+def _stop_log_listener() -> None:
+    """Flush and stop the listener. Safe to call twice."""
+    global _log_listener
+    listener, _log_listener = _log_listener, None
+    if listener is not None:
+        try:
+            listener.stop()
+        except Exception:
+            pass
 
 
 def get_logger(name: str) -> structlog.stdlib.BoundLogger:

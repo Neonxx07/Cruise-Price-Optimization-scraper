@@ -44,6 +44,8 @@ from core.models import BookingResult, BookingStatus, CruiseLine
 from gui.queue_manager import BookingQueueManager, QueueStatus
 from gui.scan_adapter import GuiScanAdapter
 from services.msc_live_service import MscCheckOutcome, MscLiveService
+from services.outcome_service import APPLIED, OutcomeService
+from gui.monitor_tabs import DashboardPanel, LogsPanel, LogsWindow
 from utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -302,6 +304,16 @@ class CruiseLinePanel(QWidget):
         # BookingResult's single old_total/new_total/net_saving shape).
         self.msc_service = MscLiveService()
         self.results: list[BookingResult] = []
+        # Verified optimizations leave the list - see _is_verified.
+        # The SET is loaded once and reused for the whole render; a
+        # per-row query is what made the old cache slow enough to freeze
+        # the window (723 round trips before the first page drew).
+        self._outcome_service = OutcomeService()
+        self._verified_pairs: set = set()
+        # The most recent answer from scan_plan - whether the last Start
+        # scanned or reused, and when the next scan is allowed. Read by the
+        # Dashboard tab; None until Start is pressed.
+        self._last_scan_plan: dict | None = None
         self.msc_results: list[MscCheckOutcome] = []
         # Re-entrancy guard for _bulk_table_update. Depth, not a flag, so a
         # per-row helper called inside a batch does not restore sorting
@@ -416,6 +428,13 @@ class CruiseLinePanel(QWidget):
         self.start_button = QPushButton("Start")
         self.start_button.setMinimumWidth(90)
         self.start_button.setStyleSheet("font-weight: 600;")
+        # TWO JOBS, ONE BUTTON. Neon 2026-10-01: *"start starts loggin in
+        # and starts scanning a 2 in 1 button."* "Check login" stays, at his
+        # explicit request, for logging in WITHOUT starting a scan.
+        self.start_button.setToolTip(
+            "Logs in if needed, then scans. The session is verified for real "
+            "on every press, not assumed from an earlier login — ESPRESSO "
+            "drops one roughly hourly.")
         self.start_button.clicked.connect(self._on_start)
         header_row.addWidget(self.start_button)
 
@@ -598,9 +617,21 @@ class CruiseLinePanel(QWidget):
         self.results_table.sortByColumn(2, Qt.SortOrder.AscendingOrder)
         self.results_table.verticalHeader().setVisible(False)
         self.results_table.setAlternatingRowColors(True)
+        # KEEP THIS AT 240. It is itself a fix: without a floor the results
+        # table - the actual output - was squeezed to ~126px while empty
+        # boxes took the room (see
+        # tests/test_tabbed_gui_2026_08_28.py::test_results_table_gets_the_space).
+        #
+        # Lowering it to 120 on 2026-10-01 looked like the cure for the
+        # Verify button being painted across the rows, and it was the wrong
+        # one: it traded the new bug for the old one. The real cause was
+        # that the button sat INSIDE this box, competing with this minimum
+        # for height Qt could not take from the table. Moving Verify to the
+        # footer removed the competition, so the floor can stay.
         self.results_table.setMinimumHeight(240)
         self.results_table.verticalHeader().setDefaultSectionSize(24)
         results_v.addWidget(self.results_table)
+
         layout.addWidget(results_box, 1)          # <- the stretch
 
         # ── footer ──────────────────────────────────────────────
@@ -609,6 +640,29 @@ class CruiseLinePanel(QWidget):
         self.export_button.setMinimumWidth(130)
         self.export_button.clicked.connect(self._on_export)
         bottom.addWidget(self.export_button)
+
+        # VERIFY LIVES HERE, not inside the Results box. Neon 2026-10-01:
+        # *"just add a verify button in the gui"* - and then, when it was
+        # inside the box: *"verified selected is in a wrong place"*. It was
+        # being painted across the table rows (see the table's minimum
+        # height above). The footer is directly beneath the table it acts
+        # on, is always visible whatever the window height, and has nothing
+        # to collide with.
+        self.verify_button = QPushButton("Verify selected")
+        self.verify_button.setMinimumWidth(130)
+        self.verify_button.setToolTip(
+            "Mark the selected result rows as done. A verified optimization "
+            "leaves this list; the booking is still scanned, because its "
+            "price can drop again.")
+        self.verify_button.clicked.connect(self._on_verify_selected)
+        bottom.addWidget(self.verify_button)
+
+        self.realised_label = QLabel("")
+        self.realised_label.setToolTip(
+            "Money actually captured - verified optimizations only, not "
+            "everything found.")
+        bottom.addWidget(self.realised_label)
+
         self.status_label = QLabel("Ready")
         self.status_label.setWordWrap(True)
         bottom.addWidget(self.status_label, 1)
@@ -634,21 +688,69 @@ class CruiseLinePanel(QWidget):
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
         outer.addWidget(container)
+    def _latest_per_booking(self) -> list:
+        """One result per booking - the most recent scan of each.
+
+        THE BUG THIS FIXES, 2026-09-30. `self.results` is a flat list of
+        every row, and the GUI loads TODAY'S earlier results on startup and
+        then appends the new run's. A booking scanned twice in a day
+        therefore appeared twice and was COUNTED twice:
+
+            3001011   17:11 OPTIMIZATION $79   <- earlier run
+                     18:37 OPTIMIZATION $79   <- this run
+            3001016  17:38 OPTIMIZATION $199
+                     18:39 OPTIMIZATION $199
+
+        The header read "Optimizations: 8   Total savings: $725.00" when the
+        truth was 6 optimizations and $526 - it had counted two bookings
+        twice. An inflated savings figure is the worst kind of wrong here,
+        because it is the number the whole product is judged on.
+
+        These two were re-scanned correctly, not by mistake: OPTIMIZATION is
+        in `never_cache_statuses`, because a live saving must always be
+        re-confirmed rather than served from a cache. So duplicates in a
+        day are EXPECTED, and the display has to cope with them.
+
+        Deduplication is by (cruise line, booking id) - booking numbers are
+        only unique within a portal. The underlying history is untouched;
+        this is a display and counting concern only.
+        """
+        latest: dict[tuple, object] = {}
+        for result in self.results:
+            key = (getattr(result.cruise_line, "value", result.cruise_line),
+                   result.booking_id)
+            previous = latest.get(key)
+            if previous is None:
+                latest[key] = result
+                continue
+            # Keep the NEWEST. checked_at is set per scan; a skipped row
+            # carries the ORIGINAL scan time, which is what we want.
+            if getattr(result, "checked_at", None) and getattr(
+                    previous, "checked_at", None):
+                if result.checked_at >= previous.checked_at:
+                    latest[key] = result
+            else:
+                latest[key] = result          # no timestamps: last wins
+        return list(latest.values())
+
     def _refresh_summary(self) -> None:
-        total = len(self.results)
-        optimizations = sum(1 for r in self.results if r.status.value == "OPTIMIZATION")
-        upgrades = sum(1 for r in self.results if r.status.value == "UPGRADE_AVAILABLE")
-        traps = sum(1 for r in self.results if r.status.value == "TRAP")
+        # COUNT BOOKINGS, NOT ROWS. See _latest_per_booking.
+        unique = [r for r in self._latest_per_booking()
+                  if not self._is_verified(r)]
+        total = len(unique)
+        optimizations = sum(1 for r in unique if r.status.value == "OPTIMIZATION")
+        upgrades = sum(1 for r in unique if r.status.value == "UPGRADE_AVAILABLE")
+        traps = sum(1 for r in unique if r.status.value == "TRAP")
         # Only OPTIMIZATION rows represent savings actually recommended.
         # NO_SAVING rows carry a negative net_saving to mean "repricing
         # would cost more, so we didn't recommend it" — summing those in
         # would make "Total savings" go deeply negative even when real
         # optimizations were found. Matches the CLI's own summary (main.py).
-        savings = total_optimization_savings(self.results)
+        savings = total_optimization_savings(unique)
         # Unconfirmed candidates are excluded from `savings` (they said so
         # themselves) but must stay VISIBLE as an action — $4,100 of the
         # all-time total was previously unverified GoCCL candidates.
-        unconf_n, unconf_total = unconfirmed_candidate_total(self.results)
+        unconf_n, unconf_total = unconfirmed_candidate_total(unique)
         summary_text = (
             f"Bookings watched: {total}   "
             f"Optimizations: {optimizations}   "
@@ -1010,15 +1112,152 @@ class CruiseLinePanel(QWidget):
         # a 15-minute login TIMEOUT still leaves a live, alive scraper and
         # this guard used to pass, running the whole batch against a
         # logged-out portal while the status label read "timed out".
-        if not has_session or self._login_ok_for != cruise_line_check:
-            QMessageBox.warning(
-                self, "Not logged in",
-                "Click \"Check login\" first and complete the login in the browser "
-                "window that opens, then click Start.\n\n"
-                f"(No confirmed login for {cruise_line_check.value} in this session. "
-                "A browser being open is not the same as being logged in — starting "
-                "anyway would run every booking against a logged-out portal.)",
+        needs_login = not has_session or self._login_ok_for != cruise_line_check
+
+        # TRUST, THEN VERIFY. Added 2026-10-01, Neon: *"make it loggs in
+        # and starts by this button as well meaning start starts loggin in
+        # and starts scanning a 2 in 1 button."*
+        #
+        # Start already attempted a login when it had never had one. The
+        # hole was the other branch: `_login_ok_for` is STICKY - set once
+        # on a successful login and never re-checked - so after any earlier
+        # login, Start skipped the login step and went straight to
+        # scanning. ESPRESSO drops a session roughly hourly, so a Start
+        # pressed an hour later ran the whole batch against a logged-out
+        # portal. That is where the log's **339 `login.required`** events
+        # come from.
+        #
+        # One cheap page check against the browser that is already open -
+        # no navigation, no new window - turns the sticky flag into a fact.
+        if not needs_login:
+            try:
+                live = await self.queue_manager.session_is_logged_in(
+                    cruise_line_check)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("gui.start_session_check_failed",
+                               error=str(exc)[:200])
+                live = False
+            if not live:
+                logger.info("gui.start_session_expired_relogging_in",
+                            cruise_line=cruise_line_check.value)
+                self._login_ok_for = None
+                needs_login = True
+
+        if needs_login:
+            # TRY TO LOG IN RATHER THAN SENDING THE OPERATOR TO ANOTHER
+            # BUTTON.
+            #
+            # Neon 2026-09-30, pressing Start on a fresh app:
+            #
+            #   16:52:35  gui.start_entered          <- pressed Start
+            #   16:52:37  gui.login_check_entered    <- told to press this
+            #   16:52:51  login_check.success  via=auto_login
+            #   16:52:52  gui.start_entered          <- pressed Start AGAIN
+            #
+            # The credentials were in the keyring the whole time and
+            # auto_login needed nine seconds. Refusing to start, to ask for
+            # a click that runs the very thing we could have run ourselves,
+            # is a dialog in place of a feature.
+            #
+            # THE GUARD ITSELF STAYS, and it is still the thing that decides
+            # (see the 2026-08-26 note above): a browser being open is not a
+            # login, and a scan must never run against a logged-out portal.
+            # What changes is that a refusal is now the SECOND answer, given
+            # only after logging in has actually been attempted.
+            #
+            # ESPRESSO can still demand MFA, which no automation can
+            # complete - check_login opens the visible window and waits, and
+            # if that times out the original refusal stands.
+            self.status_label.setText(
+                f"Not logged in to {cruise_line_check.value} — logging in…")
+            logger.info("gui.start_auto_login_attempt",
+                        cruise_line=cruise_line_check.value)
+            logged_in = False
+            try:
+                if cruise_line_check == CruiseLine.MSC:
+                    logged_in = await self.msc_service.check_login(
+                        timeout_minutes=15.0)
+                else:
+                    logged_in = await self.queue_manager.check_login(
+                        cruise_line_check, timeout_minutes=15.0,
+                        headless=(cruise_line_check == CruiseLine.NCL
+                                  and self.headless_checkbox.isChecked()),
+                    )
+            except Exception as exc:
+                logger.error("gui.start_auto_login_failed",
+                             cruise_line=cruise_line_check.value,
+                             error=str(exc)[:300])
+            if logged_in:
+                self._login_ok_for = cruise_line_check
+                self.login_status_label.setText(
+                    f"Login status: OK for {cruise_line_check.value}")
+                logger.info("gui.start_auto_login_ok",
+                            cruise_line=cruise_line_check.value)
+            else:
+                self.status_label.setText("Not logged in — scan not started")
+                QMessageBox.warning(
+                    self, "Not logged in",
+                    f"Could not log in to {cruise_line_check.value} "
+                    f"automatically.\n\n"
+                    "Complete the login in the browser window that opened "
+                    "(ESPRESSO may demand MFA, which cannot be automated), "
+                    "then press Start again — Start logs in by itself, so "
+                    "\"Check login\" is only needed to log in WITHOUT "
+                    "starting a scan.\n\n"
+                    "A browser being open is not the same as being logged in — "
+                    "starting anyway would run every booking against a "
+                    "logged-out portal.",
+                )
+                return
+
+        # ── ALREADY SCANNED? DON'T OPEN A BROWSER AT ALL ────────
+        #
+        # Neon 2026-10-01: *"the problem is the script is still scanning i
+        # do not want it to scan because it is the same list it should not
+        # scan again it should gave me the same results and that these
+        # bookings were already scanned ... at least in a frame of 2
+        # hours."*
+        #
+        # Checked HERE - after the login guard, before anything is
+        # disabled or a browser is touched - so a suppressed scan costs one
+        # database read and leaves the window exactly as it was.
+        #
+        # This is a different question from the per-booking freshness
+        # cache, which runs INSIDE a scan and skips individual bookings.
+        # That one cannot stop a scan starting; this one can.
+        try:
+            plan = await self.queue_manager.scan_plan(
+                cruise_line_check,
+                bypass_cache=self.force_recheck_checkbox.isChecked())
+        except Exception as exc:  # noqa: BLE001 - fail OPEN and scan
+            logger.warning("gui.scan_plan_failed", error=str(exc)[:200])
+            plan = {"action": "scan"}
+
+        # Remembered so the Dashboard can show it without re-querying.
+        self._last_scan_plan = plan
+
+        if plan.get("action") == "reuse":
+            when = plan.get("scanned_at")
+            when_text = when.strftime("%H:%M") if when else "earlier"
+            next_at = plan.get("next_allowed_at")
+            next_text = next_at.strftime("%H:%M") if next_at else "later"
+            message = (
+                f"Already scanned {plan.get('bookings', 0)} booking(s) at "
+                f"{when_text}. Reusing those results — nothing rescanned. "
+                f"Next scan available at {next_text} "
+                f"({plan.get('minutes_remaining', 0)} min)."
             )
+            logger.info("gui.scan_suppressed",
+                        cruise_line=cruise_line_check.value,
+                        scanned_at=str(when),
+                        minutes_remaining=plan.get("minutes_remaining"))
+            self.status_label.setText(message)
+            QMessageBox.information(
+                self, "Already scanned",
+                message + "\n\nThe results below are the ones from that "
+                "scan.\n\nTo scan anyway, tick \"Force live recheck\" — a "
+                "forced re-check is treated as a different request and is "
+                "never suppressed.")
             return
 
         self.start_button.setEnabled(False)
@@ -1246,7 +1485,8 @@ class CruiseLinePanel(QWidget):
                 logger.exception("gui.activity_forward_failed")
 
     @staticmethod
-    def _format_net_saving(net_saving: float, status: str = "") -> str:
+    def _format_net_saving(net_saving: float, status: str = "",
+                           price_drop: float | None = None) -> str:
         """Spell out cost increases instead of a bare negative dollar
         figure ("$-459.00") that reads as ambiguous — a negative
         net_saving means repricing would cost more, not save less.
@@ -1265,11 +1505,48 @@ class CruiseLinePanel(QWidget):
         regardless of status, directly contradicting the TRAP/NO_SAVING
         label sitting right next to it in the previous column. Now never
         uses "saved" language for a row that isn't actually recommended."""
+        # A HIGHER PRICE SAYS SO, FIRST. Neon 2026-10-01, on booking
+        # 3001014: "I WANT TO TREAT THIS AS NO SAVING AND A HIGHER PRICE."
+        #
+        # That row's cash price rose $247 while a $300 OBC gain left
+        # net_saving at +$53, so this column rendered
+        #
+        #     "$53.00 (not recommended — see status)"
+        #
+        # - a positive dollar figure on a booking that costs MORE. The
+        # status had already been corrected to NO_SAVING (see
+        # core.calculator: OBC is not cash), but the money column still
+        # read like a win, which is most of what made the row alarming.
+        #
+        # When the cash price went UP, that is the number to show. The OBC
+        # side of the trade is not lost - it is spelled out in the note.
+        if price_drop is not None and price_drop < 0:
+            return f"+${abs(price_drop):.2f} more expensive"
         if status in ("TRAP", "NO_SAVING") and net_saving > 0:
             return f"${net_saving:.2f} (not recommended — see status)"
+        # NO MINUS SIGN ON A SAVING. Neon 2026-10-01 confirmed both of
+        # the inconsistencies flagged after the 3001014 fix should go.
+        #
+        # This used to render "-$79.00 saved", the sign following the PRICE
+        # DELTA (the bill got smaller) rather than the savings polarity. It
+        # is internally consistent and it reads as negative savings - a
+        # minus sign next to the word "saved" fights itself, and on the
+        # 3001014 row it compounded an error that was already alarming.
+        #
+        # "More expensive" keeps its "+": there the sign and the words
+        # agree, and the number IS going up.
         if net_saving > 0:
-            return f"-${net_saving:.2f} saved"
+            return f"${net_saving:.2f} saved"
         if net_saving < 0:
+            # WHEN CASH AND NET DISAGREE, SAY BOTH. A trap like 3001020
+            # has the cash price FALLING $546 while a $1,260 perk is given
+            # up, leaving net -714. Rendering only "+$714.00 more
+            # expensive" is true about the outcome and false about the
+            # cash, which is the same kind of half-truth that made 3001014
+            # alarming - just pointing the other way.
+            if price_drop is not None and price_drop > 0:
+                return (f"${price_drop:.2f} cash — but "
+                        f"${abs(net_saving):.2f} worse overall")
             return f"+${abs(net_saving):.2f} more expensive"
         return "$0.00"
 
@@ -1306,7 +1583,91 @@ class CruiseLinePanel(QWidget):
                 table.setUpdatesEnabled(True)
                 table.setSortingEnabled(self._bulk_sorted)
 
+    @asyncSlot()
+    async def _on_verify_selected(self) -> None:
+        """Mark the selected result rows as verified and retire them.
+
+        What "verified" means here is what Neon does: he has opened the
+        booking, applied the reprice (or decided not to), and is done with
+        it. An OPTIMIZATION is recorded as APPLIED and counts toward
+        realised savings; anything else is recorded as REVIEWED and counts
+        zero, because deciding not to reprice a TRAP saved nothing.
+
+        Never raises. A bookkeeping failure must not take the window down.
+        """
+        rows = {i.row() for i in self.results_table.selectedIndexes()}
+        if not rows:
+            self.status_label.setText("Select a result row first, then Verify.")
+            return
+
+        wanted = set()
+        for row in rows:
+            cell = self.results_table.item(row, 0)
+            line = self.results_table.item(row, 1)
+            if cell and line:
+                wanted.add((line.text().strip(), cell.text().strip()))
+
+        done = 0
+        for result in self._latest_per_booking():
+            key = (getattr(result.cruise_line, "value", result.cruise_line),
+                   str(result.booking_id))
+            if key not in wanted or self._is_verified(result):
+                continue
+            status = getattr(result.status, "value", result.status)
+            ok = await self._outcome_service.record(
+                key[0], result.booking_id,
+                old_total=getattr(result, "old_total", None),
+                new_total=getattr(result, "new_total", None),
+                net_saving=getattr(result, "net_saving", None),
+                outcome=APPLIED if status == "OPTIMIZATION" else "REVIEWED",
+                verified_by="human",
+                evidence={"status": status, "verified_from": "gui"},
+            )
+            done += 1 if ok else 0
+
+        await self._reload_verified()
+        self.status_label.setText(
+            f"Verified {done} booking(s) - removed from the list."
+            if done else "Nothing new to verify in the selection.")
+
+    async def _reload_verified(self) -> None:
+        """Refresh the verified set, then redraw. Never raises."""
+        try:
+            self._verified_pairs = await self._outcome_service.verified_pairs()
+            realised = await self._outcome_service.total_realised()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("gui.verified_reload_failed", error=str(exc)[:200])
+            return
+        try:
+            self.realised_label.setText(
+                f"Realised: ${realised:,.2f}" if realised else "")
+            self._populate_results_table()
+            self._refresh_summary()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("gui.verified_redraw_failed", error=str(exc)[:200])
+
+    def _is_verified(self, result: BookingResult) -> bool:
+        """Has this exact opportunity already been verified?
+
+        Neon 2026-10-01: *"once it is verified it is removed from the
+        least because it means it was optimized and it is not needed in
+        the gui list anymore."*
+
+        Matched on the FIGURES, not the booking: verifying $79 off today
+        must not hide a $300 drop next month. See OutcomeService.
+        """
+        try:
+            return self._outcome_service.is_verified(
+                self._verified_pairs, result.booking_id,
+                getattr(result, "old_total", None),
+                getattr(result, "new_total", None))
+        except Exception:  # noqa: BLE001 - never block a render
+            return False
+
     def _append_result_row(self, result: BookingResult) -> None:
+        # A verified opportunity is finished work; it leaves the list.
+        if self._is_verified(result):
+            return
         # Sorting must be off while inserting: with it enabled, each
         # setItem() call can trigger an immediate re-sort mid-insert and
         # scatter this row's cells across different rows.
@@ -1316,9 +1677,43 @@ class CruiseLinePanel(QWidget):
         with self._bulk_table_update():
             return self._append_result_row_unguarded(result)
 
+    def _find_result_row(self, result: BookingResult) -> int:
+        """The existing row for this booking, or -1.
+
+        Booking numbers are only unique WITHIN a portal, so the line is part
+        of the identity - NCL 12345 and ESPRESSO 12345 are different
+        bookings and must not overwrite each other.
+        """
+        line = getattr(result.cruise_line, "value", result.cruise_line)
+        for row in range(self.results_table.rowCount()):
+            id_cell = self.results_table.item(row, 0)
+            line_cell = self.results_table.item(row, 1)
+            if (id_cell is not None and line_cell is not None
+                    and id_cell.text() == result.booking_id
+                    and line_cell.text() == line):
+                return row
+        return -1
+
     def _append_result_row_unguarded(self, result: BookingResult) -> None:
-        row = self.results_table.rowCount()
-        self.results_table.insertRow(row)
+        # A RE-SCAN REPLACES THE BOOKING'S ROW. Added 2026-09-30.
+        #
+        # The table loads today's earlier results on startup and then
+        # appends the new run's, so a booking scanned twice in a day showed
+        # twice - 3001011 and 3001016 both appeared with identical
+        # OPTIMIZATION rows hours apart. Two rows for one booking is not
+        # history in a live table, it is confusion: the operator cannot
+        # tell which figure is current.
+        #
+        # The full history stays in `bookings` and `price_history`; this is
+        # the CURRENT state of each booking.
+        existing = self._find_result_row(result)
+        if existing >= 0:
+            self.results_table.removeRow(existing)
+            row = existing
+            self.results_table.insertRow(row)
+        else:
+            row = self.results_table.rowCount()
+            self.results_table.insertRow(row)
         # An ERROR result carries its cause in BOTH .error and .note
         # (make_error_result sets both); prefer .error so the reason is
         # never lost, and fall back to .note for every other status.
@@ -1328,7 +1723,8 @@ class CruiseLinePanel(QWidget):
             result.booking_id,
             result.cruise_line.value,
             result.status.value,
-            self._format_net_saving(result.net_saving, result.status.value),
+            self._format_net_saving(result.net_saving, result.status.value,
+                                    getattr(result, "price_drop", None)),
             str(result.confidence),
             f"${result.old_total:,.2f}" if result.old_total else "—",
             f"${result.new_total:,.2f}" if result.new_total else "—",
@@ -1651,6 +2047,17 @@ class CruiseLinePanel(QWidget):
 
             loaded.reverse()
             self.results = loaded
+            # AUTO-DETECT FIRST, then load the verified set, then draw.
+            # Neon 2026-10-01: a reprice a human applied without pressing
+            # Verify should be recognised by the script on its own. Doing
+            # it here means today's results arrive already filtered,
+            # instead of a verified row flashing up and then vanishing.
+            try:
+                await self._outcome_service.detect_applied(
+                    cruise_line=self.cruise_line.value)
+            except Exception as exc:  # noqa: BLE001 - never block startup
+                logger.warning("gui.autodetect_failed", error=str(exc)[:200])
+            await self._reload_verified()
             self._populate_results_table()
             self._refresh_summary()
             logger.info("gui.loaded_todays_results",
@@ -1858,11 +2265,24 @@ class MainWindow(QMainWindow):
         self.last_scan_label = QLabel("Last completed scan: (loading...)")
         self.last_scan_label.setStyleSheet(
             "font-family: Consolas, monospace; font-size: 11px;")
-        self.activity_log = QTextEdit()
-        self.activity_log.setReadOnly(True)
-        self.activity_log.setFixedHeight(110)
-        self.activity_log.setStyleSheet(
-            "font-family: Consolas, monospace; font-size: 11px;")
+        # LOGS MOVED OUT OF THE MAIN SCREEN. Neon 2026-10-01, marking the
+        # bottom strip "L" on a screenshot: *"Remove the large logs section
+        # from the bottom of the main GUI ... create a dedicated Logs
+        # tab."*
+        #
+        # That strip was 110px fixed - six lines of a 721-booking run -
+        # unfiltered, unbounded, and repainted on every append underneath
+        # the results table the operator was trying to read.
+        #
+        # `self.activity_log` is KEPT as a name because _append_activity
+        # and the panels write to it; it is now the Logs tab's view.
+        self.logs_panel = LogsPanel()
+        self.activity_log = self.logs_panel
+        self.dashboard_panel = DashboardPanel()
+        # Built on first use. The panel above is the live sink and exists
+        # from startup, so lines are collected whether or not the window
+        # has ever been opened.
+        self._logs_window = None
 
         self.tabs = QTabWidget()
         self.panels: dict[CruiseLine, CruiseLinePanel] = {}
@@ -1874,13 +2294,38 @@ class MainWindow(QMainWindow):
             )
             self.panels[line] = panel
             self.tabs.addTab(panel, line.value)
+
+        # Monitoring tabs last, so the cruise lines keep positions 0..n and
+        # nothing that addresses a tab by index moves.
+        self.tabs.addTab(self.dashboard_panel, "Dashboard")
         layout.addWidget(self.tabs, 1)
 
+        # The compact footer stays - three lines, no log block. The totals
+        # and the resource readout are the two things worth seeing whatever
+        # tab is open.
         layout.addWidget(self.global_summary_label)
-        layout.addWidget(self.resource_label)
+
+        # LOGS: A BUTTON, NOT A TAB. Neon 2026-10-01: *"i do not want a
+        # logs tab i want a logs button when i press it it opens another
+        # window that list the logs."*
+        #
+        # A tab was the wrong shape - logs are consulted WHILE watching a
+        # scan, and as a tab they replaced the view being watched, which is
+        # no better than the 110px strip they replaced. The window is
+        # non-modal, so it sits beside the scanner rather than blocking it.
+        status_row = QHBoxLayout()
+        status_row.addWidget(self.resource_label, 1)
+        self.logs_button = QPushButton("Logs")
+        self.logs_button.setMinimumWidth(90)
+        self.logs_button.setToolTip(
+            "Open the activity log in its own window (all cruise lines). "
+            "Searchable and filterable by level; the scanner stays usable "
+            "while it is open.")
+        self.logs_button.clicked.connect(self._on_show_logs)
+        status_row.addWidget(self.logs_button)
+        layout.addLayout(status_row)
+
         layout.addWidget(self.last_scan_label)
-        layout.addWidget(QLabel("Activity log (all lines):"))
-        layout.addWidget(self.activity_log)
 
         self.setCentralWidget(container)
 
@@ -1917,6 +2362,22 @@ class MainWindow(QMainWindow):
         self._keepalive_timer.start(5 * 60 * 1000)
         self._refresh_resources()
         self._refresh_global_summary()
+
+    def _on_show_logs(self) -> None:
+        """Open (or raise) the Logs window. Never raises.
+
+        ONE instance, reused. Building a second would leave half the
+        session's history in a window the operator just closed, and the
+        panel inside is the live sink that every scraper writes to.
+        """
+        try:
+            if getattr(self, "_logs_window", None) is None:
+                self._logs_window = LogsWindow(self.logs_panel, self)
+            self._logs_window.show()
+            self._logs_window.raise_()
+            self._logs_window.activateWindow()
+        except Exception:
+            logger.exception("gui.logs_window_failed")
 
     # -- shared surfaces the panels report into --
 
@@ -2037,8 +2498,104 @@ class MainWindow(QMainWindow):
                 "font-family: Consolas, monospace; font-size: 11px;"
                 + ("color: #b00; font-weight: bold;" if ram >= 93.0 else "")
             )
+            # Same tick feeds the Dashboard. No second timer: the census
+            # above is the most expensive thing this GUI does, and adding a
+            # tab must not make it happen more often.
+            self._refresh_dashboard(cpu, ram, chrome_count, rss, live)
         except Exception:
             self.resource_label.setText("Resources: (unavailable)")
+
+    def _refresh_dashboard(self, cpu: float, ram: float,
+                           chrome_count: int, rss: float, live: list) -> None:
+        """Push current state into the Dashboard tab. Never raises.
+
+        Reads only what the window already has in hand - no queries, no
+        process walks of its own. DashboardPanel.update_fields then writes
+        only the values that actually changed, because setText on an
+        unchanged string still repaints.
+        """
+        try:
+            scanning = []
+            errors = 0
+            found = 0
+            current = None
+            progress = None
+            for line, panel in self.panels.items():
+                try:
+                    snap = panel.queue_manager.get_snapshot()
+                except Exception:
+                    continue
+                errors += getattr(snap, "error", 0)
+                found += sum(
+                    1 for r in getattr(panel, "results", [])
+                    if getattr(r.status, "value", r.status) == "OPTIMIZATION")
+                if getattr(snap, "running", 0) or getattr(snap, "progress_total", 0) and (
+                        panel.queue_manager.is_running):
+                    scanning.append(line.value)
+                    current = getattr(snap, "current_booking_id", None)
+                    total = getattr(snap, "progress_total", 0)
+                    done = getattr(snap, "progress_done", 0)
+                    if total:
+                        progress = f"{done}/{total}  ({done * 100 // total}%)"
+
+            state = "SCANNING" if scanning else ("IDLE" if live else "NOT CONNECTED")
+            self.dashboard_panel.update_fields({
+                "state": state,
+                "line": ", ".join(scanning) if scanning else "—",
+                "booking": current,
+                "progress": progress,
+                "login": ("OK: " + ", ".join(live)) if live else "no live session",
+                "browser": f"{chrome_count} Chromium proc / {rss:,.0f} MB",
+                "results": f"{found} optimization(s) on screen",
+                "errors": f"{errors} error(s) this run",
+                "cpu": f"CPU {cpu:.1f}%   RAM {ram:.1f}%",
+                "processes": str(chrome_count),
+                "last_scan": self.last_scan_label.text().replace(
+                    "Last completed scan: ", ""),
+                "realised": self._realised_summary(),
+                "next_scan": self._next_scan_summary(),
+                "reused": self._reuse_summary(),
+            })
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("gui.dashboard_refresh_failed", error=str(exc)[:200])
+
+    def _realised_summary(self) -> str | None:
+        """Money actually captured, as the panels already display it."""
+        for panel in self.panels.values():
+            text = getattr(getattr(panel, "realised_label", None), "text", lambda: "")()
+            if text:
+                return text
+        return None
+
+    def _next_scan_summary(self) -> str | None:
+        """When the 2-hour suppression window next lets a scan run."""
+        for line, panel in self.panels.items():
+            plan = getattr(panel, "_last_scan_plan", None)
+            if plan and plan.get("action") == "reuse":
+                when = plan.get("next_allowed_at")
+                if when is not None:
+                    return (f"{line.value}: {when.strftime('%H:%M')} "
+                            f"({plan.get('minutes_remaining', 0)} min)")
+        return None
+
+    def _reuse_summary(self) -> str | None:
+        """Whether the last Start reused previous results instead of
+        scanning - the thing Neon could never tell before."""
+        for line, panel in self.panels.items():
+            plan = getattr(panel, "_last_scan_plan", None)
+            if not plan:
+                continue
+            if plan.get("action") == "reuse":
+                when = plan.get("scanned_at")
+                stamp = when.strftime("%H:%M") if when else "earlier"
+                return (f"{line.value}: reused {plan.get('bookings', 0)} "
+                        f"booking(s) from {stamp} — no rescan")
+            overlap = plan.get("overlap") or {}
+            if overlap:
+                return (f"{line.value}: {overlap.get('shared', 0)} already known, "
+                        f"{overlap.get('added', 0)} new, "
+                        f"{overlap.get('removed', 0)} dropped")
+        return None
 
     async def refresh_last_scan_label(self) -> None:
         """The query is global, so borrow any panel's implementation."""
@@ -2074,7 +2631,14 @@ class MainWindow(QMainWindow):
         self.global_summary_label.setText(
             "Stopping " + (", ".join(busy) if busy else "all lines")
             + " and closing browser sessions...")
-        asyncio.ensure_future(self._shutdown_all())
+        # RETAINED, 2026-09-30. This was the only task creation in this
+        # file and it had no strong reference, so the event loop's own
+        # reference was all that kept SHUTDOWN alive. If it is collected
+        # mid-flight the browser sessions never close - which means
+        # orphaned Chromium processes and, worse, ESPRESSO bookings left
+        # LOCKED, the one bug pinned as V-VIP. Held on self for the
+        # window's lifetime; there is exactly one shutdown.
+        self._shutdown_task = asyncio.ensure_future(self._shutdown_all())
         # Tick the message while teardown runs. A close that legitimately
         # takes 30 seconds - because a booking is mid-flight - is
         # indistinguishable from a hang if nothing on screen moves.

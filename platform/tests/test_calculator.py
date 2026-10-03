@@ -13,14 +13,50 @@ from core.models import BookingResult, BookingStatus, CruiseLine
 
 
 def _espresso_raw(old_total, new_total, old_obc=0.0, new_obc=0.0, old_pkgs=None, new_pkgs=None):
-    """Build a minimal, realistic ESPRESSO reprice-modal raw_data dict."""
+    """Build a minimal, realistic ESPRESSO reprice-modal raw_data dict.
+
+    SHAPE CORRECTED 2026-09-30, and the correction is the whole point of
+    the bug these tests missed. The old builder emitted a perk as::
+
+        {"paxId": "total", "type": "CRUISE_PROMO", "name": ..., "amount": +594}
+
+    Measured across all 3,074 captured reprice responses, that row cannot
+    occur:
+
+      - every one of the 46,573 `paxId == "total"` rows has NO type field;
+      - all 22,839 CRUISE_PROMO rows are per-passenger, never "total"
+        (already stated in _get_promo_value_by_name's docstring: "0 of
+        1,616 real instances");
+      - a real perk is a COMPONENT (BEVCLINGRA9, BASICWIFCH9), all 7,626
+        of which are likewise per-passenger.
+
+    So the fixture asserted a perk is a CRUISE_PROMO, while in reality a
+    positive CRUISE_PROMO is a SURCHARGE (`ALL INC 2PK NRD` at +$1,260 is
+    the price of the package). The tests passed on data the portal never
+    sends, and the 167 real cases went unnoticed.
+
+    Now each perk emits what the portal actually sends: an untyped
+    summary row plus a typed per-passenger COMPONENT row. Pass
+    `type="CRUISE_PROMO"` in a pkg dict to model a fare/promo line
+    instead of a perk.
+    """
     def items(total, obc, pkgs):
         rows = [
             {"paxId": "total", "type": "VACATION_TOTAL", "amount": total},
             {"paxId": "total", "type": "OBC_TOTAL", "amount": obc},
         ]
         for pkg in (pkgs or []):
-            rows.append({"paxId": "total", "type": "CRUISE_PROMO", "name": pkg["name"], "amount": pkg["amount"]})
+            # The summary row the calculator reads for the dollar value -
+            # untyped, exactly as the portal sends it.
+            rows.append({"paxId": "total", "name": pkg["name"], "amount": pkg["amount"]})
+            # The per-passenger row that carries the TYPE, which is the
+            # only place the category can be recovered from.
+            rows.append({
+                "paxId": "1",
+                "type": pkg.get("type", "COMPONENT"),
+                "name": pkg["name"],
+                "amount": pkg["amount"],
+            })
         return rows
 
     return {
@@ -72,19 +108,34 @@ def test_case_c_plain_price_increase_is_not_misclassified():
     assert r.status == BookingStatus.NO_SAVING
 
 
-def test_case_c_documented_edge_case_fare_increase_with_bigger_obc_gain():
-    """CONFIRMED INTENTIONAL DESIGN, not a bug (2026-08-13 audit): a fare
-    increase can still be reported OPTIMIZATION if a larger OBC gain
-    more than offsets it, since net_saving = price_drop + obc_change
-    with no independent sign check on price_drop alone. This test
-    exists to make that behavior an explicit, visible contract -- if a
-    future change alters this, this test will catch the change instead
-    of it silently shipping unnoticed."""
+def test_case_c_a_fare_increase_is_never_an_optimization_even_with_more_obc():
+    """REVERSED 2026-10-01. This test previously asserted the OPPOSITE and
+    called it "CONFIRMED INTENTIONAL DESIGN, not a bug (2026-08-13 audit)":
+    a fare increase could be reported OPTIMIZATION when a larger OBC gain
+    offset it, because net_saving = price_drop + obc_change with no sign
+    check on price_drop.
+
+    It shipped, and on 2026-10-01 booking 3001014 reached the GUI as a
+    GREEN OPTIMIZATION row reading `old 9,236.94 -> new 9,483.94` and
+    "optimized $53", on a booking whose bill goes UP $247. Neon: "THIS
+    BOOKING IS SHOWING A HIGHER PRICE AND IT IS GREEN ... SUCH MISTAKE CAN
+    NEVER HAPPEN AGAIN IN OUR PROJECT".
+
+    The arithmetic was never wrong. The rule was: OBC is not cash. Onboard
+    credit cannot pay the invoice, is onboard-only, and is commonly
+    use-it-or-lose-it and non-refundable. Paying real money for it is a
+    judgement call and must never be auto-labelled a win.
+
+    Being an "explicit, visible contract" did not make it correct - it only
+    meant the wrong behaviour had a test defending it.
+    """
     raw = _espresso_raw(old_total=1282.46, new_total=1332.46, old_obc=0.0, new_obc=200.0)
     r = calculate_espresso(raw, "BOOK3B")
-    assert r.status == BookingStatus.OPTIMIZATION
-    assert r.new_total > r.old_total  # the underlying fare genuinely went UP
-    assert r.net_saving == 150.0      # yet net is positive because OBC gain (200) exceeds the fare increase (50)
+    assert r.status != BookingStatus.OPTIMIZATION
+    assert r.status == BookingStatus.NO_SAVING
+    assert r.new_total > r.old_total        # the client genuinely pays more
+    # The trade is still spelled out, not hidden - a human may want the OBC.
+    assert "INCREASES" in r.note and "OBC is not cash" in r.note
 
 
 # ── Cases F/G: independent levers (fare vs. OBC/package) ─────────
