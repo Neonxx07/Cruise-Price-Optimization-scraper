@@ -55,6 +55,75 @@ class MscCheckOutcome:
     note: str = ""
 
 
+async def persist_outcome(outcome: "MscCheckOutcome") -> bool:
+    """Write one MSC evaluation to the database. Never raises.
+
+    THE GAP, found 2026-10-01. MSC had **zero rows in every table** -
+    bookings 0, scan_jobs 0, price_history 0, market_data 0 - despite a
+    1,337-line calculator and a working live session. Not a crash:
+    `run_batch` built outcomes, handed them to the GUI and returned them,
+    and nothing ever wrote one down. Every MSC scan ever run evaporated
+    when the window closed.
+
+    Stored faithfully rather than squeezed into `bookings`: an MSC result
+    is four independent checks whose estimated values carry DIFFERENT
+    UNITS (dollars for PRICE_MATCH, percentage points for
+    DISCOUNT_TIER_UPGRADE, none for the rest). See MscResultRecord.
+
+    NEVER RAISES, and never swallows silently either - a bookkeeping
+    failure must not end a scan, but it must not vanish. Returns whether
+    the row was written.
+    """
+    import json
+
+    from models.database import MscResultRecord, async_session
+
+    result = outcome.result
+    checks = []
+    opportunities = []
+    if result is not None:
+        for check in result.checks:
+            check_type = getattr(check.type, "value", check.type)
+            check_status = getattr(check.status, "value", check.status)
+            checks.append({
+                "type": check_type,
+                "status": check_status,
+                "note": check.note,
+                "estimated_value": check.estimated_value,
+                # The unit travels WITH the value - mixing dollars and
+                # percentage points in one column was flagged as a landmine
+                # for any future aggregator. See MscCheck.
+                "value_unit": getattr(check, "value_unit", None),
+            })
+            if check_status == "OPPORTUNITY":
+                opportunities.append(check_type)
+
+    try:
+        async with async_session() as session:
+            session.add(MscResultRecord(
+                booking_id=str(outcome.booking_id),
+                status=outcome.status,
+                note=outcome.note or "",
+                category=getattr(result, "category", None),
+                cancelled_or_postponed=bool(
+                    getattr(result, "cancelled_or_postponed", False)),
+                is_paid_in_full=bool(getattr(result, "is_paid_in_full", False)),
+                has_any_opportunity=bool(
+                    getattr(result, "has_any_opportunity", False)),
+                opportunity_types=",".join(opportunities),
+                checks_json=json.dumps(checks, default=str),
+            ))
+            await session.commit()
+    except Exception as exc:  # noqa: BLE001 - must not end the scan
+        logger.warning("msc_live.persist_failed",
+                       booking_id=outcome.booking_id, error=str(exc)[:200])
+        return False
+
+    logger.info("msc_live.persisted", booking_id=outcome.booking_id,
+                status=outcome.status, opportunities=len(opportunities))
+    return True
+
+
 def _summarize_outcome(outcome: dict) -> str:
     status = outcome.get("status")
     if status != "checked":
@@ -256,6 +325,11 @@ class MscLiveService:
                         note=_summarize_outcome(outcome_dict),
                     )
                 outcomes.append(outcome)
+                # WRITE IT DOWN. Before 2026-10-01 nothing did, which is
+                # why MSC had zero rows in every table. Persisted here, per
+                # booking, so a scan interrupted halfway still keeps what
+                # it learned.
+                await persist_outcome(outcome)
                 if on_result:
                     on_result(outcome)
                 # Same randomized inter-booking pacing as the other cruise

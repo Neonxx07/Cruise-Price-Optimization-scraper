@@ -24,25 +24,59 @@ All notable changes to this project are recorded here.
 
 ## [Unreleased]
 
+Nothing yet.
+
+---
+
+## [1.1] — 2026-10-03
+
 ### Added
-- **ESPRESSO perk tiers.** Four mutually exclusive tiers (`ALL INC 2PK`,
-  `RETREAT`, `NOPERK`, `STANDARD`) derived from the fare name, with the tier
-  change named on any affected result. Across 3,074 captured reprice
-  responses, all 148 tier changes were downgrades — a reprice has never once
-  improved a client's perk.
+- **Outcome tracking** (`services/outcome_service.py`). $31,000 of optimizations had been
+  reported and none verified. A **Verify** button in the GUI marks one done and removes it
+  from the list; separately, if a human applied a reprice without saying so, the next scan
+  notices the booking now sits at the quoted price and records it. Run against history this
+  found **46 already-applied repricings worth $5,485.90** that the system never knew about.
+- **Resumable jobs** — a job that died at booking 400 of 723 used to restart from zero.
+- **Retry queue** for errored bookings, most of which are timeouts and session drops.
+- **Start logs you in.** Auto-login already worked and was simply never trusted to run;
+  the measured cost was 339 stops waiting for a human.
+- `core/scan_signature.py` — identifies a scan *request*, so the same list submitted twice
+  is not scanned twice.
+- `core/calculator_version.py` — fingerprints calculator logic so a change expires stale
+  cached verdicts automatically, instead of serving wrong TRAPs until cleared by hand.
+- `scraper/click_verify.py` — important actions are verified by their effect rather than
+  assumed to have worked because `click()` returned.
+- **ESPRESSO perk tiers** — four mutually exclusive tiers (`ALL INC 2PK`, `RETREAT`,
+  `NOPERK`, `STANDARD`) derived from the fare name, so a reprice that swaps the client's
+  perk is named. All 148 recorded tier changes were downgrades.
+- **Dashboard and Logs tabs** (`gui/monitor_tabs.py`), moving logs out of the main window;
+  watchdog gained crash, process-death and navigation-retry monitors.
+- `docs/ROADMAP.md`, `docs/ESPRESSO_PERK_TIERS.md`, `docs/README.md` (a docs index), and
+  dated session handoffs.
 
 ### Fixed
-- **A perk was charged twice.** The same fare name arrived from two sources,
-  once bare and once priced, and both were subtracted. Corpus-wide this
-  removed phantom loss from 21 bookings with **0 verdicts reversed** — the
-  traps were still traps, the magnitudes were wrong.
-- **Test fixtures used a row shape the portal never sends.** A perk was built
-  as a typed `paxId: "total"` row; measured against real data, every
-  `paxId: "total"` row is untyped and every typed row is per-passenger. The
-  tests passed on impossible data while real cases went unnoticed.
+- **Bookings were still being left locked.** The release fallback navigated to a
+  *relative* URL, which `page.goto()` rejects, so it failed every time that path was taken.
+  The September release-in-`finally` fix was working correctly — which is precisely why
+  these failures were visible at all.
+- **A perk was charged twice** — the same fare name arrived from two sources, once bare and
+  once priced, and both were subtracted. 21 bookings corrected, **0 verdicts reversed**:
+  the traps were still traps, the magnitudes were wrong.
+- **Two dangling asyncio tasks** held no reference, risking collection mid-flight — one on
+  GUI shutdown (orphaned browsers, bookings left locked) and one in a GoCCL capture
+  listener (silently dropped captured data).
+- Test fixtures used a row shape the portal never sends, so tests passed on impossible data
+  while real cases went unnoticed.
 
-> Not yet committed — this work currently exists only on the development
-> machine. See the note at the end of this file.
+### Removed
+- `platform/scheduler/` — an unreachable APScheduler placeholder, never imported by
+  anything outside itself.
+- Five spent 2026-09-23 ESPRESSO headless investigation scripts. The question they answered
+  is settled, recorded in `docs/ESPRESSO_SESSION_BUGS_2026_09.md`, and enforced by eight
+  tests in `test_espresso_headless_blocked_2026_09_23.py`.
+- `verify_upgrades.py` — a date-specific checker, unreferenced and superseded by the suite.
+
+> Git history preserves all of the above; nothing captured was deleted.
 
 ---
 
@@ -121,6 +155,7 @@ here so later releases have a baseline to sit on.
 
 ## A note on what is not here
 
-Some work exists only on the development machine and has never been committed.
-It is listed under **[Unreleased]** above so it is at least recorded. Anything
-not in this file and not in the repository is backed up nowhere.
+Development happens on a separate machine that is not a git checkout, so work can
+exist there before it reaches this repository. Anything not in this file and not in
+the repository is backed up nowhere — if you are about to do something substantial,
+commit it first.

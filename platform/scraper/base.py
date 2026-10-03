@@ -6,6 +6,7 @@ All cruise line scrapers inherit from BaseScraper.
 from __future__ import annotations
 
 import asyncio
+import difflib
 import time
 import re
 from abc import ABC, abstractmethod
@@ -1001,6 +1002,12 @@ class BaseScraper(ABC):
     # run, not just this one.
     STRUCTURE_BASELINE_DIR = "data/structure_baselines"
 
+    #: How long a structure snapshot may take. Deliberately small: this is
+    #: an early warning, not part of the scrape, and it used to inherit the
+    #: 30-second action timeout - two watched selectors then cost 61
+    #: seconds of every single session.
+    STRUCTURE_SNAPSHOT_TIMEOUT_MS = 4000
+
     async def check_structure_drift(self, name: str, selector: str = "body") -> dict:
         """Capture an ARIA-accessibility-tree snapshot of `selector` and
         compare it against a saved baseline for `name`. On the first call
@@ -1052,14 +1059,39 @@ class BaseScraper(ABC):
             # surfaced that because "capture_failed" looks like ordinary
             # noise. Snapshotting the first match is the correct behaviour
             # here: it's the same element page.click would act on.
-            snapshot = await self.page.locator(selector).first.aria_snapshot()
+            # BOUNDED TIGHTLY. An early-warning diagnostic must never cost
+            # more than the thing it is warning about.
+            #
+            # MEASURED 2026-09-30 from Neon's run: aria_snapshot inherited
+            # page.set_default_timeout (30 s), both watched selectors timed
+            # out, and booking 1 spent 61 SECONDS between navigate and
+            # search instead of the usual ~2. The log shows the same two
+            # failures on 09-23, 09-28 and 09-30 - every session since this
+            # was wired up, about a minute each time, and these two
+            # baselines have never once been captured.
+            #
+            # A few seconds is the right budget: if the element is not
+            # there by then, that IS the finding. Waiting thirty seconds
+            # does not make a redesigned page appear.
+            snapshot = await self.page.locator(selector).first.aria_snapshot(
+                timeout=self.STRUCTURE_SNAPSHOT_TIMEOUT_MS)
         except Exception as e:
-            # Escalated from warning to error: a capture failure means this
-            # baseline is not being watched AT ALL, which is exactly the
-            # silent-coverage-gap that hid the bug above.
-            logger.error("structure_watch.capture_failed", name=name, selector=selector, error=str(e))
-            self.log_action("structure_watch_capture_failed", name=name, error=str(e))
-            return {"status": "capture_failed", "error": str(e)}
+            # A TIMEOUT and a real failure are different news. The element
+            # simply not being ready yet is expected on a page still
+            # rendering - logging it as an error every session is how a
+            # genuine alarm gets tuned out. A non-timeout failure still
+            # means this baseline is unwatched, which is the
+            # silent-coverage-gap the escalation above was for.
+            timed_out = "Timeout" in str(e)
+            log = logger.info if timed_out else logger.error
+            log("structure_watch.capture_failed", name=name, selector=selector,
+                timed_out=timed_out,
+                budget_ms=self.STRUCTURE_SNAPSHOT_TIMEOUT_MS,
+                error=str(e)[:200])
+            self.log_action("structure_watch_capture_failed", name=name,
+                            error=str(e)[:200])
+            return {"status": "capture_failed", "error": str(e),
+                    "timed_out": timed_out}
 
         baseline_dir = self.STRUCTURE_BASELINE_DIR
         os.makedirs(baseline_dir, exist_ok=True)
@@ -1076,17 +1108,83 @@ class BaseScraper(ABC):
         if snapshot.strip() == baseline.strip():
             return {"status": "unchanged"}
 
+        # SAY WHAT CHANGED, OR THE ALERT IS UNACTIONABLE.
+        #
+        # FOUND 2026-10-01. This fired SIX times - 09-28, 09-30, 10-01, two
+        # elements each - and nobody acted on any of them, because the
+        # warning carried only a name and a file path. "Page structure
+        # differs" with no diff gives the reader nothing to do except open
+        # a YAML file and guess what the portal looks like now.
+        #
+        # It was RIGHT every time. The ESPRESSO search box really had
+        # changed: the baseline reads
+        #
+        #     textbox "Search by Reservation ID, Name or Date"
+        #
+        # and Neon's own 2026-09-30 browser recording shows the live
+        # placeholder is now "Find by Reservation ID, Name, Date, etc...".
+        # The search BUTTON's fallback selector is that exact old string -
+        # `[aria-label="Search by Reservation ID, Name or Date"]` - so the
+        # fallback had rotted while the primary `#searchReservationBtn`
+        # quietly carried everything. Catching a dead fallback BEFORE the
+        # primary dies too is the entire point of this check.
+        #
+        # A detector whose output cannot be acted on gets ignored, and an
+        # ignored detector is worse than none - it reads as noise and the
+        # next real change hides inside it.
+        diff = "\n".join(difflib.unified_diff(
+            baseline.strip().splitlines(),
+            snapshot.strip().splitlines(),
+            fromfile=f"{name} (baseline)", tofile=f"{name} (now)",
+            lineterm="", n=1,
+        ))
         logger.warning(
             "structure_watch.structure_changed", name=name, path=baseline_path,
-            note="page structure differs from the saved baseline -- a portal redesign may have broken a selector",
+            diff=diff[:1500],
+            note=("page structure differs from the saved baseline -- a portal "
+                  "redesign may have broken a selector. Check any selector "
+                  "that matches on the OLD text, then update the baseline "
+                  "file if the change is benign."),
         )
-        self.log_action("structure_changed", name=name, path=baseline_path)
-        return {"status": "changed", "baseline": baseline, "current": snapshot}
+        self.log_action("structure_changed", name=name, path=baseline_path,
+                        diff=diff[:1500])
+        return {"status": "changed", "baseline": baseline,
+                "current": snapshot, "diff": diff}
 
     async def fill_and_submit(self, selector: str, value: str, submit_selector: str) -> None:
         """Fill an input and click submit."""
         await self.page.fill(selector, value)
         await self.page.click(submit_selector)
+
+    async def click_verified(self, selector: str, **expectations):
+        """Click something important and PROVE the page reacted.
+
+        Neon 2026-10-01: *"The system should never assume a click
+        succeeded merely because click() returned successfully ... Never
+        silently continue after an uncertain click."*
+
+        `click()` returning only means Playwright dispatched an event to an
+        element that passed its actionability checks. A handler that
+        silently bailed, a form that failed validation, an overlay that
+        swallowed the event - all return cleanly. The 2026-09-18 release
+        bug was exactly that: the click was logged as successful, the Exit
+        dialog stayed open, the booking stayed locked.
+
+        Pass at least one expectation - `expect_gone`, `expect_visible`,
+        `expect_text` or `expect_url_change` - and check the result:
+
+            outcome = await self.click_verified(
+                "#acceptIgnoreReservation",
+                expect_gone="#ignoreReservationPopup")
+            if not outcome:
+                ...recover; do NOT carry on as if it worked
+
+        Never raises. See scraper/click_verify.py for the measurements
+        behind the design, including why there is no OCR in it.
+        """
+        from .click_verify import click_verified as _click_verified
+
+        return await _click_verified(self.page, selector, **expectations)
 
     @abstractmethod
     async def check_booking(self, booking_id: str, capture_market_data: bool = False) -> BookingResult:

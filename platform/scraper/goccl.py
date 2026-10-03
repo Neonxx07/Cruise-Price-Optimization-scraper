@@ -32,7 +32,7 @@ from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 from config.settings import settings
 from core.calculator import calculate_goccl, make_error_result
 from core.models import BookingResult, BookingStatus, CruiseLine
-from utils.logging import get_logger
+from utils.logging import get_logger, track_background_task
 
 from .base import BaseScraper, is_dead_browser_error
 
@@ -590,9 +590,29 @@ class GoCCLScraper(BaseScraper):
                             log("goccl.advisory", code=code, message=msg,
                                 blocking=blocking, status=resp.status)
 
-                asyncio.ensure_future(read())
-            except Exception:
-                pass
+                # RETAINED, 2026-09-30. This was the last unreferenced
+                # capture listener in the project. track_background_task's
+                # own docstring already named "MSC/ESPRESSO network-response
+                # capture listeners" as the sites that needed this; GoCCL's
+                # was missed. A task with no strong reference is a real
+                # candidate for "Task was destroyed but it is pending!", and
+                # what it drops here is CAPTURED DATA - the advisory codes
+                # behind goccl.advisory - which this project never discards.
+                # self._background_tasks comes from BaseScraper, which also
+                # already drains it on close, so this gets that for free.
+                track_background_task(self._background_tasks,
+                                      asyncio.ensure_future(read()))
+            except Exception as exc:
+                # Still never raises - this is a Playwright event callback,
+                # and throwing here would take the response handler down
+                # with it. But it no longer vanishes: a silent `pass` in a
+                # CAPTURE path meant advisory data could stop arriving and
+                # nothing would ever say so, which is the same failure the
+                # crash-reporting work existed to end (an error that is
+                # never recorded cannot be alerted on). debug, not warning -
+                # it fires per response and must not flood the log.
+                logger.debug("goccl.advisory_listener_error",
+                             error=str(exc)[:200])
 
         self.page.on("response", on_response)
         self._advisory_listener_attached = True

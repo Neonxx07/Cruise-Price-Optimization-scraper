@@ -17,7 +17,7 @@ class Settings(BaseSettings):
 
     # ── App ─────────────────────────────────────────────────────
     app_name: str = "Cruise Intelligence System"
-    app_version: str = "1.0.0"
+    app_version: str = "1.1.0"
     debug: bool = False
 
     # ── API ─────────────────────────────────────────────────────
@@ -136,6 +136,17 @@ class Settings(BaseSettings):
     # page load into a booking nobody looks at again until the window
     # expires. CANCELLED is excluded because Neon requires every
     # cancellation reported on every run.
+    # DO NOT RE-RUN THE SAME SCAN REQUEST WITHIN THIS MANY HOURS.
+    #
+    # Neon 2026-10-01: *"at least in a frame of 2 hours we do not need to
+    # scan again at least 2 hours for now."*
+    #
+    # Distinct from `freshness_hours`, which is per BOOKING and applies
+    # inside a running scan. This one is per REQUEST: pressing Start on a
+    # list that was already scanned within the window does not open a
+    # browser at all. Set to 0 to disable.
+    scan_suppression_hours: float = 2.0
+
     never_cache_statuses: list[str] = [
         "OPTIMIZATION", "ERROR", "CANCELLED", "UNKNOWN",
     ]

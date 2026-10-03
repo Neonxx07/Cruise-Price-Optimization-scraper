@@ -311,7 +311,38 @@ def _get_cruise_fare(items: list[dict]) -> float:
 
 
 def _get_packages(items: list[dict]) -> list[dict]:
-    """Get all package (non-fee) items with positive amounts."""
+    """Get all package (non-fee) items with positive amounts.
+
+    A "package" is a PERK the client gives up by repricing, and its value
+    is subtracted from the saving. A POSITIVE CRUISE_PROMO belongs here:
+    it is the PRICE OF A PERK, not a discount.
+
+    CONFIRMED 2026-09-30, booking 3001020 plus the Promotions screen:
+
+      - `ALL INC 2PK NRD` = "All Incl Bev and Wifi NRD", charged +$1,260.
+      - Its Compare column prices ABOVE Best Rate (A2 Aqua Class $6,210.00
+        vs $5,328.00) - you PAY for all-inclusive.
+      - `NOPERK NRD` = "No Perk Rate NRD". The two are mutually exclusive
+        (neither lists the other under "Combined With"), so moving to
+        NOPERK gives the perk up.
+
+    So the charge is a fair proxy for what the perk is worth to this
+    client: they were paying $1,260 for drinks and Wi-Fi, and repricing
+    takes it away. Subtracting it is correct.
+
+    A DEAD END, recorded so it is not retried: an earlier version of this
+    fix excluded positive CRUISE_PROMO lines here, reasoning that dropping
+    a charge saves money. It does - and the price_drop ALREADY carries
+    that saving. Removing the perk's value as well turned 3001020 into a
+    $546 OPTIMIZATION and would have told Neon to trade $1,962 of drinks
+    and Wi-Fi for $546.
+
+    The newInvoice's own COMPONENT lines cannot settle this: across all
+    148 perk-tier changes in the corpus the component lines are IDENTICAL
+    in old and new - including 14 NOPERK -> STANDARD moves where the perk
+    certainly does not survive. The reprice modal ECHOES the booking's
+    existing components into the preview. They are not evidence.
+    """
     return [
         item
         for item in items
@@ -359,6 +390,61 @@ def _is_travel_protection(item: dict) -> bool:
     return any(p.search(name) for p in _TRAVEL_PROTECTION_PATTERNS)
 
 
+# ── Perk Tier ───────────────────────────────────────────────────
+#
+# CONFIRMED 2026-09-30 from ESPRESSO's own Promotions screen (sidebar ->
+# Promotions, _eventId=linkToPromotionList), captured by Neon on booking
+# 3001020. Every offer carries a "Short Description" and a "Combined With"
+# list, and four of them are PERK TIERS - what the fare includes:
+#
+#     ALL INC 2PK    All Incl Bev and Wifi
+#     RETREAT        Retreat beverage and wifi
+#     NOPERK         No Perk Rate
+#     STANDARD       (no perk)
+#
+# They are MUTUALLY EXCLUSIVE: no tier appears in another tier's "Combined
+# With" column, though each combines freely with the savings offers
+# (BONUS SAV, BOGO75, MilitarySav, SAVEUPTO100). A reprice that changes
+# the tier therefore changes what the client actually gets on board, which
+# is not visible in any dollar figure on the invoice.
+#
+# Corpus: 148 tier changes, all downgrades - ALL INC 2PK -> NOPERK (134)
+# and NOPERK -> STANDARD (14). Not one upgrade.
+#
+# WHY THE INVOICE CANNOT ANSWER THIS. In all 148, the COMPONENT lines
+# (BEVCLINGRA9 beverage, BASICWIFCH9 Wi-Fi) are IDENTICAL in the old and
+# new invoices - including the 14 NOPERK -> STANDARD moves, where the perk
+# plainly cannot survive. The reprice modal ECHOES the booking's existing
+# components into the preview. "Still present in newInvoice" means
+# nothing; only the fare tier does.
+
+PERK_TIERS = ("ALL INC 2PK", "RETREAT", "NOPERK", "STANDARD")
+
+
+def _perk_tier(fare_names: list[str]) -> str | None:
+    """Which perk tier this set of fares sits in, if any."""
+    for tier in PERK_TIERS:
+        for name in fare_names:
+            if (name or "").upper().lstrip().startswith(tier):
+                return tier
+    return None
+
+
+def perk_tier_change(old_fare_names: list[str],
+                     new_fare_names: list[str]) -> tuple[str, str] | None:
+    """(old_tier, new_tier) when repricing moves between perk tiers.
+
+    Returned so the agent is told what is being given up in words. The
+    dollar cost is already handled - the tier's price rides in a
+    CRUISE_PROMO line that _get_packages counts as a lost package.
+    """
+    old_tier = _perk_tier(old_fare_names)
+    new_tier = _perk_tier(new_fare_names)
+    if old_tier and new_tier and old_tier != new_tier:
+        return old_tier, new_tier
+    return None
+
+
 # ── Re-Addable Fare Detection ──────────────────────────────────
 
 _READDABLE_PATTERNS = [
@@ -373,6 +459,19 @@ _READDABLE_PATTERNS = [
     # "truly lost" despite reading as the same kind of marketing promo as
     # the patterns above.
     re.compile(r"sav", re.IGNORECASE),
+    # CONFIRMED BY NEON, 2026-09-30, from the portal itself. "ALL INC 2PK
+    # NRD" is the only all-inclusive fare name in the corpus (158 of 158
+    # occurrences) and it is RE-ADDABLE by hand after a reprice:
+    #
+    #   sidebar -> Promotions
+    #     /espresso/protected/reservations.do?...&_eventId=linkToPromotionList
+    #   then the offer's own row, with a Compare button and a checkbox:
+    #     ...&_eventId=fareDetails&fareCodes=DI980793&...
+    #
+    # He checks it this way on every booking. It matters twice over: the
+    # perk is not lost, and the same 158 lines were until today being
+    # charged against the saving as if it were (see _get_packages).
+    re.compile(r"all\s*inc", re.IGNORECASE),
 ]
 
 # BOGO60/BOGO75 NRD is the single most common lost fare in real data (536
@@ -483,8 +582,40 @@ def calculate_espresso(raw_data: dict, booking_id: str, price_category: str | No
         # was never being cross-referenced. Confirmed against real data:
         # losing a BOGO60/75 NRD fare is worth $394-$2,833 (avg ~$1,756).
         old_promo_values = _get_promo_value_by_name(old_items)
+
+        # NEVER CHARGE THE SAME LOSS TWICE.
+        #
+        # THE BUG, found 2026-09-30 on booking 3001020. Neon checked it by
+        # hand: "this booking is not cheaper or more expensive ... it is the
+        # same price because of allinc2pk nrd". The tool said:
+        #
+        #   old 3804.66 -> new 3258.66      raw drop        546.00
+        #   lost_pkg_names: ["ALL INC 2PK NRD",
+        #                    "ALL INC 2PK NRD ($1260.00)"]
+        #   net_saving: -1974.00
+        #
+        # 546 - 1260 - 1260 = -1974 exactly. "ALL INC 2PK NRD" is BOTH a
+        # lost package (counted at line ~457) and a lost fare (counted
+        # again below), so its $1,260 was subtracted twice. The duplicate
+        # was visible in lost_pkg_names the whole time - the same name from
+        # two sources, one bare and one priced.
+        #
+        # Direction of the error matters: it makes a loss look far worse
+        # than it is, so it can only turn a real OPTIMIZATION into a TRAP,
+        # never the reverse. Safe, but wrong - and Neon relies on the
+        # magnitude to decide whether a trap is worth a second look. The
+        # honest figure here is 546 - 1260 = -714.
+        already_counted = {
+            norm_str(i.get("name", "") or i.get("normalizedName", ""))
+            for i in lost_pkgs
+            if (i.get("name") or i.get("normalizedName"))
+        }
         priced_lost_fares = []
         for fare_name in truly_lost_fares:
+            if norm_str(fare_name) in already_counted:
+                # Already in lost_pkg_value as a package. Counting the fare
+                # too would charge the customer's loss twice.
+                continue
             promo_amount = old_promo_values.get(norm_str(fare_name))
             if promo_amount:
                 priced_lost_fares.append((fare_name, abs(round2(promo_amount))))
@@ -498,7 +629,39 @@ def calculate_espresso(raw_data: dict, booking_id: str, price_category: str | No
         net = round2(price_drop + obc_change - lost_pkg_value)
 
         # Status determination
-        re_add_note = (" — re-add: " + ", ".join(re_addable_fares)) if re_addable_fares else ""
+        #
+        # SAY WHAT RE-ADDING IS WORTH. Added 2026-10-01, and it explains a
+        # discrepancy that had been open since the day before.
+        #
+        # Booking 3001021: we quoted $2,183 (save $48); Neon achieved
+        # $2,117 (save $114) - $66 better, and nobody knew why. Booking
+        # 3001022, same day: we quoted $2,547, the portal's own Rate
+        # Comparison showed $2,481 - $66 again.
+        #
+        # Both gaps are EXACTLY the value of `Email Bonus NRD`, the promo
+        # this very note already told him to re-add. The calculator was
+        # identifying the promo correctly and then leaving its money out of
+        # the figure, so every quote carrying a re-addable fare reads low.
+        #
+        # Measured across the corpus: **401 bookings carry a re-addable
+        # promo with a real dollar value, totalling $97,565** that was
+        # absent from the quoted savings.
+        #
+        # `net_saving` is deliberately NOT inflated by this. Re-adding is a
+        # manual step on the Promotions screen and it can fail; promising
+        # money that is not yet secured is the mistake the OBC rule exists
+        # to prevent, pointed the other way. The verdict stays conservative
+        # and the note states the ceiling.
+        re_add_note = ""
+        if re_addable_fares:
+            re_add_note = " — re-add: " + ", ".join(re_addable_fares)
+            re_add_value = round2(sum(
+                abs(old_promo_values.get(norm_str(name), 0.0))
+                for name in re_addable_fares))
+            if re_add_value > 0:
+                re_add_note += (
+                    f" (worth ${re_add_value:,.2f} — saving becomes "
+                    f"${net + re_add_value:,.2f} if re-added)")
         # Surfaced regardless of status/branch below — a client losing trip
         # insurance/travel-protection coverage is worth flagging even on a
         # NO_SAVING or TRAP result, not just an OPTIMIZATION.
@@ -506,15 +669,59 @@ def calculate_espresso(raw_data: dict, booking_id: str, price_category: str | No
             f" — ALSO LOSES TRAVEL PROTECTION: {', '.join(lost_travel_protection)} "
             "(confirm this doesn't affect cancellation/trip-insurance coverage before repricing)"
         ) if lost_travel_protection else ""
+        # What the client stops GETTING, in words. lost_pkg_value already
+        # carries what they stop PAYING; neither says the other.
+        tier_move = perk_tier_change(old_fare_names, new_fare_names)
+        perk_note = (
+            f" — PERK TIER {tier_move[0]} → {tier_move[1]}"
+            " (confirm on the Promotions screen before repricing; the offer"
+            " can be re-added there)"
+        ) if tier_move else ""
 
-        if net > 0 and lost_pkg_value > 0 and net < lost_pkg_value:
+        if price_drop < 0:
+            # THE CLIENT PAYS MORE CASH. Never an OPTIMIZATION, whatever
+            # the OBC does.
+            #
+            # THE BUG, 2026-10-01, booking 3001014. The GUI showed a GREEN
+            # OPTIMIZATION row reading:
+            #
+            #   old 9,236.94 -> new 9,483.94      "optimized $53"
+            #
+            # The client's bill goes UP $247. Neon, seeing it: "THIS
+            # BOOKING IS SHOWING A HIGHER PRICE AND IT IS GREEN AS WELL AS
+            # IT IS SHOWING AN OPTIMIZATION ... SUCH MISTAKE CAN NEVER
+            # HAPPEN AGAIN IN OUR PROJECT".
+            #
+            # The arithmetic was right: -247 fare + 300 OBC = +53. The
+            # RULE was wrong. net_saving adds OBC to cash as though they
+            # were the same thing, and they are not - onboard credit is
+            # restricted to onboard spending, is commonly use-it-or-lose-it
+            # and not refundable, and cannot pay the invoice. Handing over
+            # $247 of real money for $300 of OBC is a judgement call, never
+            # an automatic win, and it must never be presented as one.
+            #
+            # A 2026-08-13 audit had recorded this as "CONFIRMED INTENTIONAL
+            # DESIGN" and written a test to lock it in. It was intentional
+            # and still wrong; the person who sells the result decided.
+            #
+            # Reported as NO_SAVING, not hidden: the trade is spelled out
+            # so it can still be judged by a human who wants the OBC.
+            status = BookingStatus.NO_SAVING
+            obc_part = (f", gaining ${round(obc_change)} OBC"
+                        if obc_change > 0 else "")
+            note = (
+                f"no saving — price INCREASES ${round(abs(price_drop))}"
+                f"{obc_part}. OBC is not cash: it cannot pay the invoice and "
+                f"is usually onboard-only and non-refundable{re_add_note}"
+            )
+        elif net > 0 and lost_pkg_value > 0 and net < lost_pkg_value:
             # Net saving is positive on paper, but it's smaller than the
             # value of a package being given up to get it — the client is
             # trading a perk worth more than the "win" itself. Confirmed
             # against a real case: $50 net saving from losing a $594
             # all-inclusive drink package is not a real optimization.
             status = BookingStatus.TRAP
-            note = f"trap - losing ${round(lost_pkg_value)} perk for only ${round(net)} net{re_add_note}"
+            note = f"trap - losing ${round(lost_pkg_value)} perk for only ${round(net)} net{re_add_note}{perk_note}"
         elif net > 0 and obc_change < 0 and price_drop < abs(obc_change) * OBC_LOSS_MIN_RATIO:
             # Net is positive on paper, but a chunk of it is OBC being
             # forfeited rather than a real fare reduction — confirmed
@@ -529,10 +736,10 @@ def calculate_espresso(raw_data: dict, booking_id: str, price_category: str | No
             )
         elif net > 0:
             status = BookingStatus.OPTIMIZATION
-            note = f"optimized ${round(net)}{re_add_note}"
+            note = f"optimized ${round(net)}{re_add_note}{perk_note}"
         elif price_drop > 0 and net <= 0:
             status = BookingStatus.TRAP
-            note = f"trap - do not reprice{re_add_note}"
+            note = f"trap - do not reprice{re_add_note}{perk_note}"
         else:
             status = BookingStatus.NO_SAVING
             extra = (" — can re-add: " + ", ".join(re_addable_fares)) if re_addable_fares else ""
@@ -935,6 +1142,13 @@ def realizable_saving(price_drop: float, amount_due: float | None) -> float:
 def ncl_commission_loss(price_drop: float, commission_rate: float | None) -> float:
     """Commission the agency gives up by lowering the fare.
 
+    NOT PART OF THE SAVING PATH since 2026-10-01. Neon: *"seprate it
+    totaly away from our optimization process or saving process."* Nothing
+    in `calculate_ncl` calls this any more, and no status, net_saving or
+    recommendation may. Kept as a correct, tested calculation the agency
+    can use against the commission figures now stored on every scan
+    (BookingRecord.commission_rate / _earned / _due).
+
     RAISED BY NEON 2026-08-28 on booking 3000054: "it is good and worth it
     nut the problem is i do not feel like it as well as we will lose 48$
     comission".
@@ -1052,12 +1266,11 @@ def calculate_ncl(
         final_payment_passed = ncl_final_payment_passed(final_payment_date)
 
         # Cap the win at what is still collectable, and price the
-        # commission given up. See realizable_saving / ncl_commission_loss.
+        # Cap the win at what is still collectable. See realizable_saving.
         realizable = realizable_saving(price_drop, amount_due)
         capped_by_balance = (
             amount_due is not None and realizable < price_drop - 0.01
         )
-        commission_loss = ncl_commission_loss(price_drop, commission_rate)
 
         # HARD GATE, project owner's rule 2026-08-26 — checked BEFORE any
         # status is assigned, so a protected-promo loss can never come
@@ -1150,13 +1363,21 @@ def calculate_ncl(
                 "the agency collects."
             )
 
-        if status == BookingStatus.OPTIMIZATION and commission_loss > 0:
-            note += (
-                f" - COSTS ${round(commission_loss)} OF COMMISSION "
-                f"(at the booking's own {round((commission_rate or 0) * 100)}% "
-                f"rate), so the net gain to the agency is "
-                f"${round(realizable - commission_loss)}."
-            )
+        # COMMISSION NO LONGER APPEARS ON THE RESULT. Neon 2026-10-01:
+        # *"do not totally ignore the comission include it in the database
+        # infromations and collected data but seprate it totaly away from
+        # our optimization process or saving process or whatever u call
+        # it."*
+        #
+        # This used to append "- COSTS $48 OF COMMISSION ... net gain to
+        # the agency is $252" to an NCL OPTIMIZATION note (150 of 2,021 NCL
+        # rows carry it). It never changed `status` or `net_saving`, but a
+        # note IS the optimization output, so it has been taken out.
+        #
+        # The figures are not lost - the opposite. They were being computed
+        # and discarded; they are now STORED on every scan
+        # (BookingRecord.commission_rate / _earned / _due) where the agency
+        # can use them, with nothing in the saving maths able to read them.
 
         # ANY lost promo must be visible on an OPTIMIZATION, not just the
         # two hard-gated ones. See ncl_lost_promos for the real numbers.
@@ -1251,6 +1472,10 @@ def calculate_ncl(
             # columns are persisted as of 2026-08-27.
             lost_fares=lost_protected,
             re_addable_fares=lost_promos,
+            # COLLECTED DATA ONLY. Carried so it reaches the database;
+            # nothing above reads it. See the commission note further down
+            # and BookingResult.commission_rate.
+            commission_rate=commission_rate,
         )
 
     except Exception as e:
@@ -1672,10 +1897,31 @@ def find_upgrade_candidates(
 # ── Helper Constructors ────────────────────────────────────────
 
 
-def make_wlt_result(booking_id: str, price_category: str | None, cruise_line: CruiseLine) -> BookingResult:
+def make_wlt_result(booking_id: str, price_category: str | None,
+                    cruise_line: CruiseLine, old_total: float | None = None,
+                    currency: str | None = None) -> BookingResult:
+    """A waitlisted booking. It cannot be repriced, but it has a price.
+
+    Neon 2026-10-01: *"WE NEED TO SAVE ALL PRICES NOW SINCE WE ARE HAVING
+    AND RUNNING A DATA BASE."* WLT was the largest group of price-less rows
+    in the database - **1,741 of them** - because this builder recorded no
+    figures at all while the payment panel was on screen.
+
+    Same known limitation as make_skip_reprice_result: an unreadable price
+    still lands as 0.0 because the model types old_total as a float. The
+    note and `confidence` keep the two cases apart on the row.
+    """
+    extra = {}
+    if old_total:
+        extra["old_total"] = old_total
+        extra["new_total"] = old_total
+    if currency:
+        extra["currency"] = currency
     return BookingResult(
         cruise_line=cruise_line, status=BookingStatus.WLT,
-        note="WLT - waitlisted", booking_id=booking_id, price_category=price_category,
+        note=("WLT - waitlisted"
+              + (f" (current total {old_total:,.2f})" if old_total else "")),
+        booking_id=booking_id, price_category=price_category, **extra,
     )
 
 
@@ -1745,15 +1991,42 @@ def make_no_price_change_result(
 
 def make_skip_reprice_result(
     booking_id: str, price_category: str | None, cruise_line: CruiseLine,
+    old_total: float | None = None, currency: str | None = None,
 ) -> BookingResult:
     """ESPRESSO's API explicitly returned skipRepriceModal — a deliberate
     'this booking has a restriction that blocks repricing' response, not
     an error (confirmed against the portal's own 'Booking Restriction:
-    Changing price pgm is not allowed' message). No point retrying."""
+    Changing price pgm is not allowed' message). No point retrying.
+
+    THE PRICE IS STILL RECORDED. Neon 2026-10-01: *"THIS BOOKINGS ARE NOT
+    SHOWING PRICES WE NEED TO SAVE ALL PRICES NOW SINCE WE ARE HAVING AND
+    RUNNING A DATA BASE."*
+
+    A restricted booking cannot be repriced, but it has a price, and it was
+    on screen throughout. This used to return no figures at all, so **559
+    skips across 154 bookings** stored `old 0.00 / new 0.00 / conf 0` -
+    identical on the row to a booking nothing could be read from. Booking
+    3001017 has 15 scans and not one recorded price.
+
+    KNOWN LIMITATION, not papered over. `BookingResult.old_total` is typed
+    `float = 0.0`, so an unreadable price still lands as 0.0 rather than a
+    distinct "unknown". The note carries the figure only when one was
+    actually read, and `confidence` stays 0, so the two cases remain
+    distinguishable on the row - but separating them properly needs
+    old_total to become optional across the model, the database column and
+    every consumer. Worth doing; too wide to do here.
+    """
+    extra = {}
+    if old_total:
+        extra["old_total"] = old_total
+        extra["new_total"] = old_total
+    if currency:
+        extra["currency"] = currency
     return BookingResult(
         cruise_line=cruise_line, status=BookingStatus.NO_SAVING,
-        note="Booking restriction — price program change not allowed",
-        booking_id=booking_id, price_category=price_category,
+        note=("Booking restriction — price program change not allowed"
+              + (f" (current total {old_total:,.2f})" if old_total else "")),
+        booking_id=booking_id, price_category=price_category, **extra,
     )
 
 

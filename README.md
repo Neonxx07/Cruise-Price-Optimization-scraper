@@ -4,7 +4,7 @@
 
 **Automated repricing intelligence for Royal Caribbean, Celebrity, Norwegian, Carnival & MSC Cruises**
 
-[![Version](https://img.shields.io/badge/version-1.0-blue.svg)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-1.1-blue.svg)](CHANGELOG.md)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](CONTRIBUTING.md)
 [![Chrome Extension](https://img.shields.io/badge/Chrome-Extension-4285F4?logo=googlechrome&logoColor=white)]()
@@ -247,6 +247,52 @@ Full policy, plus the incident record that produced these rules:
 
 ## What's New
 
+### Outcome tracking — know whether a saving was actually taken
+
+$31,000 of optimizations had been reported and none verified: no column recorded whether
+anyone acted, or what was really saved. [`services/outcome_service.py`](platform/services/outcome_service.py)
+closes that, in two halves:
+
+- **A Verify button in the GUI.** Once verified, the booking leaves the list — it has been
+  optimized, so it no longer needs looking at.
+- **Automatic detection.** If a human applied a reprice without saying so, the next scan
+  notices the booking now *sits at* the price we quoted, and records the outcome itself.
+  Run against history, this found **46 repricings already applied, worth $5,485.90**, that
+  the system had never known about.
+
+### Scans that finish, and don't repeat themselves
+
+- **Resumable jobs** — a job that died at booking 400 of 723 used to restart from zero.
+- **Retry queue** — errors are retried rather than written off; most are timeouts and
+  session drops, which is exactly what a retry fixes.
+- **Start logs you in.** Auto-login already worked, it was just never trusted to run at the
+  moments that mattered; the measured cost was 339 stops waiting for a human.
+- [`core/scan_signature.py`](platform/core/scan_signature.py) — identifies a scan *request*,
+  so submitting the same list twice does not scan it twice.
+
+### Correctness guards
+
+- [`core/calculator_version.py`](platform/core/calculator_version.py) — fingerprints the
+  calculator's logic so changing it expires stale cached verdicts automatically. Previously
+  a calculator fix left wrong TRAP verdicts being served from cache until cleared by hand.
+- [`scraper/click_verify.py`](platform/scraper/click_verify.py) — never assumes a click
+  worked because `click()` returned; important actions are verified by their effect.
+- **ESPRESSO perk tiers** — four mutually exclusive tiers derived from the fare name, so a
+  reprice that quietly swaps the client's perk is named rather than silently priced. All
+  148 recorded tier changes were downgrades. See
+  [`docs/ESPRESSO_PERK_TIERS.md`](platform/docs/ESPRESSO_PERK_TIERS.md).
+- **Bookings are no longer left locked** — the release fallback navigated to a *relative*
+  URL, which `page.goto()` rejects, so it failed every time it was used.
+
+### Monitoring
+
+[`gui/monitor_tabs.py`](platform/gui/monitor_tabs.py) moves logs out of the main window
+into dedicated Dashboard and Logs tabs, and [`scan_watchdog.py`](platform/scan_watchdog.py)
+gained crash, process-death and navigation-retry monitors.
+
+<details>
+<summary><strong>Earlier releases</strong></summary>
+
 ### Scan awareness — stop rescanning what the database already knows
 
 Measured over 24 hours: **565 of 1,393 scans (41%) were redundant**, about 148
@@ -302,9 +348,6 @@ rows existed and nothing had ever compared two of them.
   which blocked the writer and hung the app. An AST test enforces it.
 - **GUI update cost 352.8ms → 0.002ms per row**, roughly 12.7 minutes of frozen window
   per run, by updating items in place instead of rebuilding the list.
-
-<details>
-<summary><strong>Earlier releases</strong></summary>
 
 ### Scan watchdog — a third eye on a running scan
 
@@ -488,12 +531,12 @@ logged-in session.
 - [`CHANGELOG.md`](CHANGELOG.md) — what's new and what was fixed, per version
 - [`SECURITY.md`](SECURITY.md) — what must never be committed, the three defences that
   enforce it, and the incident record behind each rule
-- [`platform/docs/MSC_DISCOUNT_RULES.md`](platform/docs/MSC_DISCOUNT_RULES.md) — which MSC
-  discounts combine, which are agency-side, and which never apply
-- [`platform/docs/ESPRESSO_SESSION_BUGS_2026_09.md`](platform/docs/ESPRESSO_SESSION_BUGS_2026_09.md)
-  — the measured session/navigation failures and what fixed them
-- [`platform/docs/HANDOFF_2026_09_23.md`](platform/docs/HANDOFF_2026_09_23.md) — working
-  context and the hard rules for anyone picking the project up
+- [`platform/docs/`](platform/docs/) — the platform's own documentation set, indexed:
+  the [roadmap](platform/docs/ROADMAP.md) (start here),
+  [ESPRESSO perk tiers](platform/docs/ESPRESSO_PERK_TIERS.md) (read before touching the
+  calculator), [MSC discount rules](platform/docs/MSC_DISCOUNT_RULES.md),
+  [session bugs](platform/docs/ESPRESSO_SESSION_BUGS_2026_09.md), and the dated
+  session handoffs
 - [`CONTRIBUTING.md`](CONTRIBUTING.md) — guidelines for adding a new cruise line
 - [`HOW_TO_CHECK_A_BOOKING.md`](HOW_TO_CHECK_A_BOOKING.md) — the plain-English manual process
   the ESPRESSO automation is based on

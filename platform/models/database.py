@@ -8,7 +8,9 @@ from __future__ import annotations
 import json
 from datetime import datetime
 
-from sqlalchemy import Column, DateTime, Float, Integer, Index, String, Text, event
+from sqlalchemy import (
+    Boolean, Column, DateTime, Float, Index, Integer, String, Text, event,
+)
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase
 
@@ -94,6 +96,28 @@ class BookingRecord(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
 
 
+
+    # ── COMMISSION: COLLECTED DATA ONLY ──────────────────────────────
+    #
+    # Neon 2026-10-01: *"do not totally ignore the comission include it in
+    # the database infromations and collected data but seprate it totaly
+    # away from our optimization process or saving process or whatever u
+    # call it."*
+    #
+    # These are RECORDED AND NEVER READ by any status, net_saving, or
+    # recommendation path. CruiseIntel reports the PRICE DIFFERENCE; the
+    # agency works out commission itself. Storing it costs nothing and
+    # builds the corpus (never delete captured data); letting it reach the
+    # saving maths is what was asked against.
+    #
+    # NCL's scraper already read all three from the portal's own summary
+    # and threw them away here - they only ever reached a note. Rate is
+    # Commiss.Earned / invoice total, measured per booking and never
+    # assumed: 13.17% on 3000049, 13.99% on another real capture.
+    commission_rate = Column(Float, nullable=True)
+    commission_earned = Column(Float, nullable=True)
+    commission_due = Column(Float, nullable=True)
+
 class PriceHistory(Base):
     """Tracks price over time for each booking."""
 
@@ -151,6 +175,42 @@ class ScanJobRecord(Base):
     progress_total = Column(Integer, default=0)
     started_at = Column(DateTime)
     completed_at = Column(DateTime)
+
+    # THE SCAN REQUEST'S OWN IDENTITY. Added 2026-10-01.
+    #
+    # Neon: *"it is the same list it should not scan again ... at least in
+    # a frame of 2 hours."* CacheService answers a per-BOOKING question
+    # from inside a running scan; nothing modelled the REQUEST, so every
+    # Start opened a browser by definition.
+    #
+    # Deterministic and order-independent - see core/scan_signature.py.
+    # Stored on the job that already exists rather than in a new table:
+    # scan_jobs already records what was asked for, when it started and
+    # whether it completed, which is exactly what the 2-hour rule needs.
+    signature = Column(String(32), nullable=True, index=True)
+
+    # WHICH bookings finished, not just how many. Added 2026-10-01.
+    #
+    # progress_done alone cannot resume a job, and it was not even
+    # reliable: _update_job_in_db ran ONCE, in the finally at the end of a
+    # run, so a hard death wrote nothing and reconcile_stale_jobs then
+    # marked the row FAILED at progress_done = 0. Measured: jobs recorded
+    # as "0 of 723" had really scanned 530, and one NCL job that finished
+    # all 189 of its bookings is on record as a total failure.
+    #
+    # A JSON array of the booking ids that produced a result. Written as
+    # the run proceeds, so an interrupted job can continue from whatever
+    # is missing rather than starting again.
+    completed_ids_json = Column(Text, nullable=True)
+
+    @property
+    def completed_ids(self) -> list[str]:
+        if not self.completed_ids_json:
+            return []
+        try:
+            return json.loads(self.completed_ids_json)
+        except ValueError:
+            return []
 
     @property
     def booking_ids(self) -> list[str]:
@@ -215,6 +275,133 @@ class PermanentExclusion(Base):
     excluded_at = Column(DateTime, default=datetime.utcnow, nullable=False)
     # Set when an exclusion is lifted. Non-NULL means it no longer applies;
     # the row stays so the decision remains auditable.
+    cleared_at = Column(DateTime, nullable=True)
+
+
+class MscResultRecord(Base):
+    """One MSC booking evaluation. MSC's results had NOWHERE to go.
+
+    FOUND 2026-10-01 while switching MSC on (roadmap P2.1). MSC has a
+    1,337-line calculator, a session controller, a 4,053-line command
+    module, documented discount rules and a GUI panel - and **zero rows in
+    every table**: bookings 0, scan_jobs 0, price_history 0, market_data 0.
+
+    The cause was not a crash. `MscLiveService.run_batch` builds
+    `MscCheckOutcome` objects, hands them to the GUI and returns them.
+    Nothing ever wrote one down. Every MSC scan ever run has evaporated
+    when the window closed.
+
+    WHY ITS OWN TABLE RATHER THAN `bookings`. An MSC evaluation is not one
+    saving, it is FOUR independent checks (PRICE_MATCH, DISCOUNT_ADD,
+    DISCOUNT_TIER_UPGRADE, VOYAGERS_SELECTION), each with its own status,
+    and their `estimated_value` fields carry DIFFERENT UNITS - dollars for
+    PRICE_MATCH, percentage points for DISCOUNT_TIER_UPGRADE, nothing at
+    all for the other two. Flattening that into old_total/new_total/
+    net_saving would invent figures MSC never produced, and quietly
+    reducing fidelity is exactly what Neon's "never delete captured data"
+    rule exists to stop.
+
+    So the checks are stored whole, as JSON, with the fields that DO
+    generalise promoted to columns so MSC can be queried alongside the
+    other lines.
+    """
+
+    __tablename__ = "msc_results"
+    __table_args__ = (
+        Index("ix_msc_results_booking_created", "booking_id", "created_at"),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    booking_id = Column(String(50), nullable=False, index=True)
+
+    # The OUTCOME of the attempt: "checked", or a short-circuit from
+    # _check_booking_msc ("not_found", "cancelled",
+    # "session_expired_after_relogin", "error"...). A booking that could
+    # not be checked is a fact worth keeping, not a blank.
+    status = Column(String(40), nullable=False, index=True)
+    note = Column(Text, default="")
+
+    category = Column(String(20), nullable=True)
+    cancelled_or_postponed = Column(Boolean, default=False)
+    is_paid_in_full = Column(Boolean, default=False)
+    has_any_opportunity = Column(Boolean, default=False, index=True)
+
+    # Comma-separated opportunity types, for querying without parsing the
+    # JSON ("PRICE_MATCH,DISCOUNT_ADD"). "" when there are none.
+    opportunity_types = Column(String(200), default="")
+
+    # The full four checks, each with type, status, note, estimated_value
+    # and value_unit. The unit travels WITH the value deliberately - see
+    # MscCheck, where mixing dollars and percentage points in one field was
+    # flagged as a landmine for any future aggregator.
+    checks_json = Column(Text, default="[]")
+
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+
+class OptimizationOutcome(Base):
+    """Did a reported optimization actually get applied?
+
+    THE GAP, 2026-10-01. The database held 204 OPTIMIZATION rows worth
+    $31,000 and **not one column recording whether any of them was acted
+    on**. "We found $31k" and "we saved $31k" are different claims and the
+    schema could not tell them apart.
+
+    Two ways a row lands here.
+
+    1. A HUMAN presses Verify in the GUI. Neon 2026-10-01: *"once it is
+       verified it is removed from the least because it means it was
+       optimized and it is not needed in the GUI list anymore."*
+
+    2. The SCANNER works it out by itself. Neon, same message: *"if the
+       price was originally 1500 and we found a drop to 1400, then a human
+       saved and was not verified, after 3 days if the script scan this
+       booking and it is saved to 1400 it should understand on its own."*
+
+       The signal is exact and needs no new data: a LATER scan's
+       `old_total` equals an EARLIER optimization's `new_total`. The quoted
+       price became the price being paid, which only happens if someone
+       applied it.
+
+       Measured over the whole history before this table existed: **46
+       applied repricings worth $5,485.90** that the system had no record
+       of - including $943.00 on booking 3001009, quoted 2026-09-18 and
+       confirmed in place by the 2026-09-21 scan.
+
+    SCOPED TO THE FIGURES, NOT THE BOOKING. A verification stores the
+    old/new pair it refers to. If the same booking is later quoted a
+    DIFFERENT saving, that is a new opportunity and must appear in the list
+    again - verifying $79 off today cannot silence a $300 drop next month.
+
+    NOT an exclusion. The booking keeps being scanned; only the GUI row is
+    retired. See PermanentExclusion for the "never scan this again" case,
+    which is a different decision with a much stricter evidence bar.
+    """
+
+    __tablename__ = "optimization_outcomes"
+    __table_args__ = (
+        Index("ix_outcome_booking_line", "booking_id", "cruise_line"),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    booking_id = Column(String(50), nullable=False, index=True)
+    cruise_line = Column(String(20), nullable=False, index=True)
+
+    # The opportunity this verification refers to. Matching is on these.
+    old_total = Column(Float, nullable=True)
+    new_total = Column(Float, nullable=True)
+    net_saving = Column(Float, nullable=True)
+
+    # APPLIED  - the reprice was done, the client is paying the new price.
+    # REVIEWED - a human looked and decided no action (e.g. a TRAP).
+    outcome = Column(String(20), nullable=False, default="APPLIED")
+    # "human" (Verify button) or "auto" (detected by the scanner).
+    verified_by = Column(String(10), nullable=False, default="human")
+    evidence = Column(Text, default="")
+
+    verified_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    # Set if a verification is withdrawn. The row stays, so the decision
+    # remains auditable - same convention as PermanentExclusion.
     cleared_at = Column(DateTime, nullable=True)
 
 

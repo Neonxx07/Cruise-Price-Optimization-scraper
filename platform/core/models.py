@@ -104,6 +104,22 @@ class BookingResult(BaseModel):
     # is Intelligence-layer work, explicitly out of scope here.
     currency: str = "UNKNOWN"
 
+    # ── COMMISSION: COLLECTED DATA, DELIBERATELY INERT ───────────────
+    #
+    # Neon 2026-10-01: *"do not totally ignore the comission include it in
+    # the database infromations and collected data but seprate it totaly
+    # away from our optimization process or saving process."*
+    #
+    # Carried so the scraper can persist it. NOTHING in the status rules,
+    # net_saving, or any recommendation may read these - CruiseIntel reports
+    # the PRICE DIFFERENCE and the agency computes commission itself.
+    # Pinned by tests/test_commission_is_data_only_2026_10_01.py.
+    #
+    # None, never 0.0: an unread rate and a zero rate are different facts.
+    commission_rate: float | None = None
+    commission_earned: float | None = None
+    commission_due: float | None = None
+
     old_total: float = 0.0
     new_total: float = 0.0
     price_drop: float = 0.0
@@ -429,6 +445,15 @@ class ScanJob(BaseModel):
 
     started_at: Optional[datetime] = None
     completed_at: Optional[datetime] = None
+
+    # THE REQUEST'S IDENTITY, added 2026-10-01. Deterministic and
+    # order-independent - see core/scan_signature.py. Pressing Start on a
+    # list already scanned within settings.scan_suppression_hours reuses
+    # the previous results instead of opening a browser.
+    #
+    # Declared rather than set ad hoc: this is a pydantic model, so an
+    # undeclared attribute raises on assignment.
+    signature: Optional[str] = None
 
     # ADDED 2026-08-27: a FAILED job carried its status but not its REASON,
     # so the GUI could only say "SCAN FAILED" and the operator had to go

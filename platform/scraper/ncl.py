@@ -1797,6 +1797,19 @@ class NclScraper(BaseScraper):
             )
             result.new_price_category = current_category  # same category, not a switch
 
+            # COMMISSION: COLLECTED DATA ONLY. Neon 2026-10-01: *"do not
+            # totally ignore the comission include it in the database
+            # infromations and collected data but seprate it totaly away
+            # from our optimization process or saving process."*
+            #
+            # All three were already being read from NCL's own summary and
+            # then DISCARDED - they only ever reached a note on the result,
+            # which has since been removed. Attached here so they reach the
+            # database, after the verdict is final and where nothing in the
+            # saving maths can see them.
+            result.commission_earned = commiss_earned
+            result.commission_due = com_due
+
             addon_change_note = _summarize_addon_change(addons, new_addons)
             if addon_change_note:
                 result.note = f"{result.note} — addons changed: {addon_change_note}"

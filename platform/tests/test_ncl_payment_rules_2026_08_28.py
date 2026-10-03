@@ -157,11 +157,27 @@ def test_an_unknown_commission_rate_costs_nothing_rather_than_a_guess():
     assert ncl_commission_loss(300.0, 0.0) == 0.0
 
 
-def test_commission_appears_in_the_note_with_the_agency_net():
+def test_commission_no_longer_appears_in_the_note():
+    """REVERSED 2026-10-01. This asserted the note read "COSTS $48 OF
+    COMMISSION ... net gain to the agency is $252" - requested by Neon on
+    2026-08-28 and correct at the time.
+
+    He then drew the boundary the other way: *"do not totally ignore the
+    comission include it in the database infromations and collected data
+    but seprate it totaly away from our optimization process or saving
+    process or whatever u call it."*
+
+    So the sentence is gone from the result, and the figures are now STORED
+    instead (BookingRecord.commission_rate / _earned / _due) - they used to
+    be computed and thrown away. See
+    tests/test_commission_is_data_only_2026_10_01.py.
+    """
     r = calculate_ncl("3000054", "BF", 2257.0, 1957.0, [], "", "",
                       new_addons=[], commission_rate=0.16)
-    assert "COSTS $48 OF COMMISSION" in r.note
-    assert "net gain to the agency is $252" in r.note
+    assert "OF COMMISSION" not in r.note
+    assert "net gain to the agency" not in r.note
+    # ...but the rate still rides out to be stored.
+    assert r.commission_rate == 0.16
 
 
 def test_no_commission_note_when_the_rate_is_unknown():
@@ -316,7 +332,11 @@ def test_a_balance_that_is_entirely_commission_is_flagged():
                       balance_is_all_commission=True)
     assert "entire outstanding balance is COMMISSION" in r.note
     assert "COLLECTABLE ONLY $163" in r.note
-    assert "COSTS $80 OF COMMISSION" in r.note
+    # The "COSTS $80 OF COMMISSION" clause was removed 2026-10-01 - see
+    # test_commission_no_longer_appears_in_the_note. THIS warning stays:
+    # it is not agency accounting, it answers "is this saving collectable
+    # at all?", which is a price fact.
+    assert "OF COMMISSION (at the booking" not in r.note
 
 
 def test_the_all_commission_warning_does_not_fire_normally():

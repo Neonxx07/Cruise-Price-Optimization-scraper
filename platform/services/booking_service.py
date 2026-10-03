@@ -10,7 +10,7 @@ import asyncio
 import random
 import time
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Callable
 
 from sqlalchemy import select
@@ -24,6 +24,7 @@ from core.calculator import (
     make_skipped_result,
 )
 from core.models import BookingResult, BookingStatus, CruiseLine, ScanJob, ScanJobStatus
+from core.scan_signature import describe_overlap, scan_signature
 from core.price_change import compare as compare_price
 from models.database import BookingRecord, MarketDataRecord, PriceHistory, ScanJobRecord, async_session
 from scraper.base import (
@@ -39,6 +40,80 @@ from services.exclusion_service import ExclusionService
 from utils.logging import get_logger, track_background_task
 
 logger = get_logger(__name__)
+
+
+#: Error text meaning "this run ended because nobody was logged in". The
+#: single most useful thing a run summary can say, because it is the one
+#: failure a human can fix in ten seconds.
+_LOGIN_SHAPED = ("not logged in", "logged out", "login required",
+                 "please log into")
+
+
+def run_summary(job) -> dict:
+    """What a finished scan actually did, as one structured record.
+
+    THE GAP, 2026-10-01. `batch.complete` logged three fields - job_id,
+    status, total - so the log could not answer "was that run healthy?".
+    Nineteen batch.complete events in the log and not one of them says how
+    many bookings errored, what was found, or whether it stopped because
+    nobody was logged in.
+
+    That is what Neon asked the watchdog to be: *"a watcher watching the
+    code script project monitoring as a third eye that everything is
+    running and functioning properly."* A third eye needs something to
+    look at.
+
+    Derived entirely from `job`, which is the only thing guaranteed to
+    exist in `_run_batch`'s `finally` - counters declared inside the `try`
+    are unbound if it failed early, and a summary that raises in a finally
+    would replace a real failure with a confusing one.
+
+    Deliberately NOT a notification. Notifications were turned off on
+    2026-09-30 because closing the GUI looked like a crash and they fired
+    constantly. This writes one line to the log, where the watchdog and a
+    human can both read it after the fact.
+    """
+    from collections import Counter
+
+    results = list(getattr(job, "results", []) or [])
+    statuses = Counter(
+        getattr(r.status, "value", r.status) for r in results)
+
+    optimizations = [r for r in results
+                     if getattr(r.status, "value", r.status) == "OPTIMIZATION"]
+    errors = [r for r in results
+              if getattr(r.status, "value", r.status) == "ERROR"]
+
+    login_blocked = sum(
+        1 for r in errors
+        if any(token in str(getattr(r, "error", "") or "").lower()
+               for token in _LOGIN_SHAPED))
+
+    started = getattr(job, "started_at", None)
+    finished = getattr(job, "completed_at", None)
+    duration_s = None
+    if started and finished:
+        duration_s = round((finished - started).total_seconds(), 1)
+
+    requested = len(getattr(job, "booking_ids", []) or [])
+    checked = len(results)
+
+    return {
+        "requested": requested,
+        "checked": checked,
+        # Not the same number whenever a run stopped early - saying so is
+        # the point. A run that reports 306 of 723 is a different event
+        # from one that reports 723 of 723.
+        "unfinished": max(requested - checked, 0),
+        "statuses": dict(statuses.most_common()),
+        "optimizations": len(optimizations),
+        "savings": round(sum(float(r.net_saving or 0) for r in optimizations), 2),
+        "errors": len(errors),
+        "login_blocked": login_blocked,
+        "duration_s": duration_s,
+        "avg_s": (round(duration_s / checked, 1)
+                  if duration_s and checked else None),
+    }
 
 
 class BookingService:
@@ -287,6 +362,36 @@ class BookingService:
         logger.warning("login_check.timeout", cruise_line=cruise_line.value)
         return False
 
+    async def session_is_logged_in(self, cruise_line: CruiseLine) -> bool:
+        """Is the live session ACTUALLY logged in, right now?
+
+        `has_live_session` answers a different question - whether a browser
+        is open and alive. A browser can be perfectly alive and sitting on
+        a login wall, which is exactly what ESPRESSO does when it drops a
+        session (roughly hourly; see the auto-logout note in espresso.py).
+
+        THE GAP THIS CLOSES. The GUI's Start guard tested
+        `has_live_session() and _login_ok_for == line`. `_login_ok_for` is
+        STICKY - set once on a successful login and never re-checked - so
+        once it was set, Start skipped the login step entirely and began
+        scanning. If the session had expired in the meantime, every booking
+        ran against a logged-out portal: **339 `login.required` events** in
+        the log.
+
+        Cheap: one page check against the already-open browser, no
+        navigation, no new window. Never raises - an unanswerable question
+        is reported as "not logged in", so the caller logs in again rather
+        than scanning blind.
+        """
+        if not self.has_live_session(cruise_line):
+            return False
+        try:
+            return await self._verify_login(self._live_scraper, cruise_line)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("login.verify_failed", cruise_line=cruise_line.value,
+                           error=str(exc)[:200])
+            return False
+
     @staticmethod
     async def _verify_login(scraper, cruise_line: CruiseLine) -> bool:
         """One definition of "logged in", shared by the auto-login path and
@@ -362,6 +467,12 @@ class BookingService:
             progress_total=len(booking_ids),
             started_at=datetime.utcnow(),
         )
+        # THE REQUEST'S IDENTITY, so the same Start is not run twice in a
+        # row. See core/scan_signature.py and recent_identical_scan.
+        # Attached to the job rather than threaded through _save_job_to_db's
+        # signature, because every caller already builds the job.
+        job.signature = scan_signature(cruise_line.value, booking_ids,
+                                       bypass_cache=bypass_cache)
         self._active_jobs[job_id] = job
         self._stop_flags[job_id] = False
 
@@ -617,14 +728,46 @@ class BookingService:
                     logger.warning("batch.freshness_lookup_failed",
                                    error=str(exc)[:200])
 
-            for i, booking_id in enumerate(job.booking_ids):
+            # ONE RETRY PASS, APPENDED TO THE SAME LOOP.
+            #
+            # `work` starts as the queue and is extended ONCE, after the
+            # last original booking, with the failures worth re-attempting
+            # (see _bookings_to_retry). enumerate() over a LIST reads by
+            # index, so the appended ids are picked up by this same loop -
+            # no second copy of 600 lines of per-booking logic, which is
+            # where a divergence would eventually hide.
+            #
+            # Measured 2026-10-01: 456 of 514 ERROR rows (88%) were
+            # followed by a successful scan of the same booking. Those
+            # recoveries only ever happened because Neon ran the whole
+            # scan again the next day.
+            work: list[str] = list(job.booking_ids)
+            retry_queued = False
+
+            for i, booking_id in enumerate(work):
                 if self._stop_flags.get(job.job_id):
                     job.status = ScanJobStatus.STOPPED
                     logger.info("batch.stopped", job_id=job.job_id, at_index=i)
                     break
 
                 job.current_booking_id = booking_id
-                job.progress_done = i
+                # Capped: retries are appended to `work`, so i can run past
+                # the queue length, and a progress bar reading 740/723
+                # would look like a bug.
+                job.progress_done = min(i, job.progress_total)
+
+                # CHECKPOINT. Written at the TOP of the iteration, so it
+                # records everything finished so far whichever branch the
+                # PREVIOUS booking took - cached, excluded, skipped, errored
+                # or scanned. Five places append a result; checkpointing at
+                # each of them would be five chances to forget one, and a
+                # sixth branch added later would silently stop being
+                # recorded.
+                #
+                # Before this, progress reached the database once, in the
+                # finally at the end of the run - so a hard death recorded
+                # nothing at all. See _checkpoint.
+                await self._checkpoint(job)
 
                 # NEVER RESCAN A CONFIRMED PAID-IN-FULL BOOKING.
                 #
@@ -668,7 +811,7 @@ class BookingService:
                         # not now - checked_at defaults to utcnow().
                         result.checked_at = when
                     job.results.append(result)
-                    job.progress_done = i + 1
+                    job.progress_done = min(i + 1, job.progress_total)
                     if on_progress:
                         on_progress(job)
                     continue
@@ -726,7 +869,7 @@ class BookingService:
                             f"window for {job.cruise_line.value})"
                         )
                     job.results.append(result)
-                    job.progress_done = i + 1
+                    job.progress_done = min(i + 1, job.progress_total)
                     if on_progress:
                         on_progress(job)
                     continue
@@ -1035,7 +1178,7 @@ class BookingService:
                                 self._live_scraper = None
                             job.status = ScanJobStatus.FAILED
                             job.results.append(result)
-                            job.progress_done = i + 1
+                            job.progress_done = min(i + 1, job.progress_total)
                             break
 
                 # CONFIRMED REAL BUG 2026-08-12: everything from here down
@@ -1076,7 +1219,7 @@ class BookingService:
                     consecutive_failures = 0
 
                 job.results.append(result)
-                job.progress_done = i + 1
+                job.progress_done = min(i + 1, job.progress_total)
 
                 # ESPRESSO states sailDate/shipCode/shipName in the booking
                 # page's own embedded JSON. Read via the scraper's
@@ -1273,6 +1416,25 @@ class BookingService:
                         settings.scraper_interbooking_delay_max_s,
                     ))
 
+                # QUEUE THE RETRY PASS, once, after the last ORIGINAL
+                # booking. Appending to `work` feeds these ids back through
+                # this same loop (see the comment at `work =` above).
+                #
+                # Done at the END rather than inline because the failures
+                # worth retrying are mostly transient session and timeout
+                # faults, and the minutes spent on the rest of the queue
+                # are exactly what lets them clear. Retrying immediately
+                # would hit the same dead session.
+                if (not retry_queued
+                        and i == len(job.booking_ids) - 1
+                        and not self._stop_flags.get(job.job_id)):
+                    retry_queued = True
+                    retries = self._bookings_to_retry(job)
+                    if retries:
+                        work.extend(retries)
+                        logger.info("batch.retry_pass", job_id=job.job_id,
+                                    count=len(retries))
+
             # Also excludes FAILED now (2026-08-13 fix) — a batch that broke
             # out of the loop above because the browser restart failed must
             # stay FAILED, not be silently overwritten back to COMPLETED
@@ -1315,11 +1477,22 @@ class BookingService:
             except Exception as e:
                 logger.error("batch.job_status_update_failed", job_id=job.job_id, error=str(e))
             self._stop_flags.pop(job.job_id, None)
+            # ONE LINE THAT SAYS WHETHER THE RUN WAS HEALTHY. See
+            # run_summary - this used to carry three fields and could not
+            # answer that. Guarded: a summary must never be the thing that
+            # breaks a finally block.
+            try:
+                detail = run_summary(job)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("batch.summary_failed", job_id=job.job_id,
+                               error=str(exc)[:200])
+                detail = {}
             logger.info(
                 "batch.complete",
                 job_id=job.job_id,
                 status=job.status.value,
                 total=len(job.results),
+                **detail,
             )
 
     async def stop_scan(self, job_id: str) -> bool:
@@ -1451,6 +1624,11 @@ class BookingService:
                 re_addable_fares=json.dumps(result.re_addable_fares),
                 gained_fares=json.dumps(result.gained_fares),
                 lost_travel_protection=json.dumps(result.lost_travel_protection),
+                # COLLECTED DATA ONLY — see BookingRecord's commission note.
+                # Stored, never read by any saving or status logic.
+                commission_rate=result.commission_rate,
+                commission_earned=result.commission_earned,
+                commission_due=result.commission_due,
                 old_cruise_fare=result.old_cruise_fare,
                 new_cruise_fare=result.new_cruise_fare,
                 fare_change_pct=result.fare_change_pct,
@@ -1579,9 +1757,238 @@ class BookingService:
                 status=job.status.value,
                 progress_total=job.progress_total,
                 started_at=job.started_at,
+                signature=getattr(job, "signature", None),
             )
             session.add(record)
             await session.commit()
+
+    #: Error text that has NEVER recovered on a re-scan, so retrying it is
+    #: pure waste. Measured 2026-10-01 across all 514 ERROR rows: 88% of
+    #: errors were followed by a successful scan of the same booking, but
+    #: these were 0 of 9.
+    _RETRY_NEVER = (
+        "payment panel unreadable",
+    )
+
+    #: At most this many bookings are retried at the end of a run. A scan
+    #: where hundreds failed has something systemically wrong - a dead
+    #: session, a portal outage - and grinding through a second full pass
+    #: would double the damage rather than fix it.
+    _RETRY_MAX = 60
+
+    def is_retryable_error(self, error: str | None) -> bool:
+        """Whether a failed booking is worth a second attempt.
+
+        MEASURED, not assumed. Across all 514 ERROR rows in the database,
+        456 (88%) were followed by a SUCCESSFUL scan of the same booking -
+        so the failure was transient and a retry would have worked:
+
+            Page.wait_for_selector timeout 60000ms   117   100% recovered
+            Cannot read categories: VX._form_12       58   100%
+            Session logged out while searching        45   100%
+            Page.wait_for_selector timeout 12000ms    28   100%
+            NCL portal error: Reservation not found   20   100%
+            payment panel unreadable                   9     0%  <- never
+
+        "Payment panel unreadable" is the one that never recovers, and it
+        is also the one where guessing is dangerous - it is the exact
+        condition that produced the false $400 on booking 3001001. Left
+        out deliberately.
+        """
+        if not error:
+            return False
+        text = str(error).lower()
+        return not any(never in text for never in self._RETRY_NEVER)
+
+    def _bookings_to_retry(self, job: ScanJob) -> list[str]:
+        """Bookings that errored and are worth one more attempt.
+
+        Only bookings whose LATEST result is an ERROR - one that already
+        succeeded on a session-recovery retry must not be scanned a third
+        time. Order follows the queue, and the list is capped (_RETRY_MAX).
+        """
+        latest: dict[str, object] = {}
+        for result in job.results:
+            latest[str(result.booking_id)] = result
+
+        out = [
+            booking_id for booking_id, result in latest.items()
+            if getattr(result.status, "value", result.status) == "ERROR"
+            and self.is_retryable_error(getattr(result, "error", None))
+        ]
+        if len(out) > self._RETRY_MAX:
+            logger.warning("batch.retry_capped", job_id=job.job_id,
+                           failed=len(out), retrying=self._RETRY_MAX)
+            out = out[:self._RETRY_MAX]
+        return out
+
+    async def recent_identical_scan(self, cruise_line: str, booking_ids,
+                                    *, bypass_cache: bool = False,
+                                    within_hours: float | None = None) -> dict | None:
+        """The last COMPLETED run of this exact request, if it is recent.
+
+        Neon 2026-10-01: *"it is the same list it should not scan again it
+        should gave me the same results ... at least 2 hours."*
+
+        Returns None when a scan should go ahead, or a dict describing the
+        previous run when it should be reused:
+
+            {"job_id", "scanned_at", "age_hours", "next_allowed_at",
+             "minutes_remaining", "bookings"}
+
+        WHAT WILL NOT SUPPRESS A SCAN, deliberately:
+
+          * a FAILED, STOPPED or still-RUNNING job. An interrupted run is
+            not an answer, and reusing one would hide exactly the work
+            that needs redoing (see resumable_jobs).
+          * a DIFFERENT booking set. Order and duplicates do not count as
+            different; membership does.
+          * a different cruise line, or "Force live recheck" - that flag is
+            part of the signature, so a forced re-check can never be
+            suppressed by an ordinary scan.
+
+        Never raises. A failure to answer means "go ahead and scan": a
+        redundant scan costs time, a wrongly suppressed one costs a real
+        client's price drop.
+        """
+        window = (settings.scan_suppression_hours
+                  if within_hours is None else within_hours)
+        if not window or window <= 0:
+            return None
+
+        signature = scan_signature(cruise_line, booking_ids,
+                                   bypass_cache=bypass_cache)
+        cutoff = datetime.utcnow() - timedelta(hours=window)
+        try:
+            async with async_session() as session:
+                row = (await session.execute(
+                    select(ScanJobRecord).where(
+                        ScanJobRecord.signature == signature,
+                        ScanJobRecord.status == ScanJobStatus.COMPLETED.value,
+                        ScanJobRecord.completed_at.isnot(None),
+                        ScanJobRecord.completed_at >= cutoff,
+                    ).order_by(ScanJobRecord.completed_at.desc()).limit(1)
+                )).scalars().first()
+        except Exception as exc:  # noqa: BLE001 - fail OPEN, see docstring
+            logger.warning("scan.suppression_lookup_failed",
+                           error=str(exc)[:200])
+            return None
+
+        if row is None:
+            return None
+
+        finished = row.completed_at
+        next_allowed = finished + timedelta(hours=window)
+        remaining = (next_allowed - datetime.utcnow()).total_seconds()
+        return {
+            "job_id": row.job_id,
+            "scanned_at": finished,
+            "age_hours": round(
+                (datetime.utcnow() - finished).total_seconds() / 3600, 2),
+            "next_allowed_at": next_allowed,
+            "minutes_remaining": max(0, int(round(remaining / 60))),
+            "bookings": row.progress_total or 0,
+        }
+
+    async def scan_plan(self, cruise_line: str, booking_ids,
+                        *, bypass_cache: bool = False) -> dict:
+        """What pressing Start would actually do, before it does it.
+
+        Lets the GUI tell the operator the truth up front rather than
+        opening a browser and leaving them to guess - Neon's standing
+        complaint that he could not tell whether a booking was really
+        rescanned.
+
+        Returns `{"action": "reuse"|"scan", ...}` and, when scanning, how
+        the request differs from the most recent one on this line.
+        """
+        suppressed = await self.recent_identical_scan(
+            cruise_line, booking_ids, bypass_cache=bypass_cache)
+        if suppressed:
+            return {"action": "reuse", "reason": "identical_scan_recently",
+                    **suppressed}
+
+        overlap = None
+        try:
+            async with async_session() as session:
+                row = (await session.execute(
+                    select(ScanJobRecord).where(
+                        ScanJobRecord.cruise_line == cruise_line,
+                        ScanJobRecord.status == ScanJobStatus.COMPLETED.value,
+                    ).order_by(ScanJobRecord.completed_at.desc()).limit(1)
+                )).scalars().first()
+            if row is not None:
+                import json as _json
+                overlap = describe_overlap(
+                    _json.loads(row.booking_ids_json or "[]"), booking_ids)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("scan.plan_overlap_failed", error=str(exc)[:200])
+
+        return {"action": "scan", "overlap": overlap,
+                "requested": len(set(str(b).strip() for b in booking_ids or []
+                                     if str(b).strip()))}
+
+    async def resumable_jobs(self, cruise_line: str | None = None,
+                             max_age_hours: float = 72.0) -> list[dict]:
+        """Interrupted jobs that still have bookings left to scan.
+
+        A job qualifies when it did not reach COMPLETED and some of its
+        booking ids have no recorded result. RUNNING counts: a job the
+        process died inside is left RUNNING forever until
+        reconcile_stale_jobs gets to it, and that is precisely the case
+        worth resuming.
+
+        Never raises - a failure to OFFER a resume must not stop a scan
+        being started normally.
+        """
+        import json
+        from datetime import timedelta
+
+        cutoff = datetime.utcnow() - timedelta(hours=max_age_hours)
+        try:
+            async with async_session() as session:
+                query = select(ScanJobRecord).where(
+                    ScanJobRecord.status != ScanJobStatus.COMPLETED.value,
+                    ScanJobRecord.started_at >= cutoff,
+                ).order_by(ScanJobRecord.started_at.desc())
+                if cruise_line:
+                    query = query.where(ScanJobRecord.cruise_line == cruise_line)
+                records = (await session.execute(query)).scalars().all()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("batch.resumable_lookup_failed", error=str(exc)[:200])
+            return []
+
+        out: list[dict] = []
+        for record in records:
+            try:
+                all_ids = json.loads(record.booking_ids_json or "[]")
+            except ValueError:
+                continue
+            done = set(record.completed_ids)
+            remaining = [b for b in all_ids if b not in done]
+            if not remaining:
+                continue
+            out.append({
+                "job_id": record.job_id,
+                "cruise_line": record.cruise_line,
+                "status": record.status,
+                "started_at": record.started_at,
+                "total": len(all_ids),
+                "done": len(all_ids) - len(remaining),
+                "remaining": remaining,
+            })
+        return out
+
+    async def remaining_for(self, job_id: str) -> list[str]:
+        """The bookings of one job that still have no result.
+
+        Returns [] for an unknown job rather than raising - the caller is
+        usually about to decide whether to offer a resume.
+        """
+        for job in await self.resumable_jobs(max_age_hours=24 * 365):
+            if job["job_id"] == job_id:
+                return job["remaining"]
+        return []
 
     async def reconcile_stale_jobs(self, max_age_hours: float = 12.0) -> int:
         """Mark abandoned scan_jobs rows FAILED instead of RUNNING forever.
@@ -1626,7 +2033,23 @@ class BookingService:
             return len(stale)
 
     async def _update_job_in_db(self, job: ScanJob) -> None:
-        """Update a scan job status."""
+        """Update a scan job's status, progress and completed-booking list.
+
+        ALSO RECORDS WHICH BOOKINGS FINISHED, as of 2026-10-01, so an
+        interrupted run can resume. The ids are derived from job.results
+        rather than tracked separately - there are five places that append
+        a result, and a sixth would otherwise silently stop being counted.
+        """
+        import json
+
+        completed = []
+        seen = set()
+        for result in job.results:
+            booking_id = str(getattr(result, "booking_id", "") or "")
+            if booking_id and booking_id not in seen:
+                seen.add(booking_id)
+                completed.append(booking_id)
+
         async with async_session() as session:
             result = await session.execute(
                 select(ScanJobRecord).where(ScanJobRecord.job_id == job.job_id)
@@ -1636,4 +2059,31 @@ class BookingService:
                 record.status = job.status.value
                 record.progress_done = job.progress_done
                 record.completed_at = job.completed_at
+                record.completed_ids_json = json.dumps(completed)
                 await session.commit()
+
+    async def _checkpoint(self, job: ScanJob) -> None:
+        """Write progress mid-run. Never raises.
+
+        THE BUG THIS FIXES. `_update_job_in_db` was called exactly ONCE, in
+        _run_batch's `finally`. A hard death - the process killed, a crash,
+        the machine going down - wrote nothing at all, and
+        reconcile_stale_jobs then marked the row FAILED with
+        progress_done = 0.
+
+        Measured 2026-10-01 against each job's own booking list: rows
+        recorded as "0 of 723" had really scanned 530, "0 of 721" had
+        scanned 559, and one NCL job that completed all 189 of its
+        bookings was on record as a total failure. The 43% completion
+        figure in the roadmap was measuring bookkeeping, not work.
+
+        One small UPDATE per booking against a booking that already costs
+        seconds of browser time is not worth batching, and batching is
+        exactly what loses the last N on a crash.
+        """
+        try:
+            await self._update_job_in_db(job)
+        except Exception as exc:  # noqa: BLE001 - a checkpoint must never
+            # take down the scan it is only trying to record.
+            logger.warning("batch.checkpoint_failed", job_id=job.job_id,
+                           error=str(exc)[:200])
