@@ -63,7 +63,7 @@ python main.py api
 ### 4. Run a CLI Scan
 
 ```bash
-python main.py scan --bookings "4097990,64756965" --cruise-line ESPRESSO -o results.csv
+python main.py scan --bookings "3000085,3000086" --cruise-line ESPRESSO -o results.csv
 ```
 
 ---

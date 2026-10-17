@@ -703,7 +703,7 @@ Only for a single candidate a human has already chosen to look at more closely �
 
 | Key | Area | Shape | Written by | Read by |
 |---|---|---|---|---|
-| `cache_<cruiseLine>_<bookingId>` (e.g. `cache_ESPRESSO_4097990`) | `local` | `{ ts: <epoch-ms number> }` | cache-write helper after a NO_SAVING result | cache-read helper, checked before every live check |
+| `cache_<cruiseLine>_<bookingId>` (e.g. `cache_ESPRESSO_3000085`) | `local` | `{ ts: <epoch-ms number> }` | cache-write helper after a NO_SAVING result | cache-read helper, checked before every live check |
 | `autoSaveCSV` | `local` | string — full CSV text (header + rows) | after every single booking completes | export button |
 | `autoSaveTime` | `local` | string — `new Date().toISOString()` | alongside `autoSaveCSV` | returned alongside `autoSaveCSV` |
 | `bookingInput` | `session` | string — raw textarea contents | on every keystroke in the booking-ID textarea | restored on popup open |

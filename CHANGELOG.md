@@ -24,7 +24,41 @@ All notable changes to this project are recorded here.
 
 ## [Unreleased]
 
-Nothing yet.
+### Added
+- **`tools/extract_page_metadata.py` and the `booking_group_info` table.** Page snapshots
+  carried five fields that existed nowhere in the database — Group ID, Group Name, Group
+  Type, Policy Type and Option Date — on 27% of pages. They are now stored per
+  `(booking_id, captured_at)`, identifying **348 group bookings**, which is a known cause of
+  "Booking restriction - price program change not allowed" and was previously invisible.
+  Agent Name and Agency phone are deliberately **not** extracted (personal data, no
+  analytical value), and Total Guests is skipped because on ESPRESSO it is group-level, not
+  per-cabin — one sampled booking read 237 guests across 100 staterooms.
+
+### Removed
+- **`data/pages/` (46,328 HTML/JSON snapshots, 10 GB) deleted on 2026-10-17**, at the
+  project owner's explicit instruction and only after coverage was measured rather than
+  assumed: `categories_table` 99% already in `market_data`, `booking_summary` 98%,
+  `offer_code_comparison` 100%, `after_search` 87% — and the 87% gap is lines that never
+  write `market_data` at all, whose outcomes live in `bookings`, not data loss. The five
+  fields that were *not* covered were extracted first (above). Disk went 14 GB → 3.5 GB.
+
+  This is a deliberate, recorded exception to the project's standing rule that captured
+  data is never deleted. The rule stands; what made this case different is that the
+  deletion was preceded by a measurement showing what the files still held.
+
+### Security
+- **Three example booking numbers brought onto the placeholder convention.** The extension's
+  input placeholder and four docs used bare 7–8 digit numbers whose shape is
+  indistinguishable from a real ESPRESSO reference. Checked against every identifier in the
+  database and the watchlists (1,693 of them) they match nothing, so this is a consistency
+  fix rather than an exposure — but a number that *looks* real costs a reader the same
+  verification every time, and a scan that has to pause on a false positive is a scan that
+  eventually waves through a true one. They are now `300xxxx` like every other example.
+- **`.githooks/install.sh` now warns against a bare surname in the local denylist.**
+  Matching is substring, so a common surname fires on ordinary code — a real seeding of
+  that file blocked this very commit on `iPlanetDirectoryPro`. The template asks for the
+  full name on one line instead, because a hook that cries wolf gets `--no-verify`d, and
+  that is how a true match eventually goes through with it.
 
 ---
 

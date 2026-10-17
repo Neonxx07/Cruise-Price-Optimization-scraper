@@ -23,7 +23,11 @@ if [ ! -f "$DENY" ]; then
 # Blank lines and #-comments are ignored. Matching is case-insensitive.
 #
 # Suggested contents:
-#   - the operator's real first and last name
+#   - the operator's real full name, FIRST AND LAST ON ONE LINE. Matching is
+#     substring, so a bare common surname fires on ordinary prose and code --
+#     "ross" matches inside "across", "hart" inside "chart". A hook that
+#     cries wolf gets bypassed with --no-verify, and that is how a real match
+#     eventually gets waved through with it.
 #   - the agent login / agency id used on the cruise-line portals
 #   - any customer name that has appeared in captured data
 #   - specific real booking references you want hard-blocked

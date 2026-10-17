@@ -278,7 +278,7 @@ Only `NO_SAVING` results are cached — the class docstring in `cache_service.py
 if not bypass_cache and result.status == BookingStatus.NO_SAVING:
     await self.cache.set_no_saving(job.cruise_line.value, booking_id)
 ```
-`OPTIMIZATION`, `TRAP`, `WLT`, `PAID_IN_FULL`, `ERROR`, and `SKIPPED_TODAY` results are **never** written to cache. Cache key format: `cache_{cruise_line}_{booking_id}` (e.g. `cache_ESPRESSO_4097990`). TTL default: **12 hours** (`cache_ttl_hours: int = 12` in settings; `CACHE_TTL_MS = 12 * 60 * 60 * 1000` in the extension). A cache hit produces a `SKIPPED_TODAY` result via `make_skipped_result`/`makeSkippedResult`, carrying an `hours_ago` figure.
+`OPTIMIZATION`, `TRAP`, `WLT`, `PAID_IN_FULL`, `ERROR`, and `SKIPPED_TODAY` results are **never** written to cache. Cache key format: `cache_{cruise_line}_{booking_id}` (e.g. `cache_ESPRESSO_3000085`). TTL default: **12 hours** (`cache_ttl_hours: int = 12` in settings; `CACHE_TTL_MS = 12 * 60 * 60 * 1000` in the extension). A cache hit produces a `SKIPPED_TODAY` result via `make_skipped_result`/`makeSkippedResult`, carrying an `hours_ago` figure.
 
 **Important limitation, by design, as of this writing**: the cache is purely **time-anchored**, not price-anchored. It stores only presence + expiry (`{ts: <epoch-ms>}` in the extension; `key` + `expires_at` in the platform's `CacheEntry` table) — it does not record what price it saw when it cached the `NO_SAVING` verdict. This means a booking that goes NO_SAVING today, then has an unrelated market price shift tomorrow, will still be silently skipped until the 12-hour TTL lapses. The project owner has discussed evolving this into a price-anchored cache (store the last-known price so a market move can invalidate the cache early), but **this evolution has not been implemented** — it is a documented future direction only (see [Roadmap](#roadmap)).
 
@@ -474,7 +474,7 @@ CSV export is client-side trivial: popup.js just requests the already-built `aut
 
 #### popup.html structure
 
-Fixed **420px wide** popup, font `-apple-system, BlinkMacSystemFont, Arial, sans-serif`, 13px, bg `#f8fafc`. Notable CSS classes: `.header` (gradient `linear-gradient(135deg,#1e3a5f,#1d4ed8)`), `.cl-btn.active.espresso` (blue `#1d4ed8`) / `.cl-btn.active.ncl` (red `#d4002a`), `.card.OPTIMIZATION` (green left border `#10b981`), `.card.TRAP` (amber `#f59e0b`), `.card.ERROR` (red `#ef4444`), `.card.PAID_IN_FULL` (purple `#8b5cf6`), `.conf-row`/`.conf-stars` (confidence pill), `.card-pkg-loss` (orange lost-package warning), `#logPanel` (dark terminal-style, monospace, max-height 150px). Textarea placeholder (literal): `4097990` + newline + `64756965, 60129622`.
+Fixed **420px wide** popup, font `-apple-system, BlinkMacSystemFont, Arial, sans-serif`, 13px, bg `#f8fafc`. Notable CSS classes: `.header` (gradient `linear-gradient(135deg,#1e3a5f,#1d4ed8)`), `.cl-btn.active.espresso` (blue `#1d4ed8`) / `.cl-btn.active.ncl` (red `#d4002a`), `.card.OPTIMIZATION` (green left border `#10b981`), `.card.TRAP` (amber `#f59e0b`), `.card.ERROR` (red `#ef4444`), `.card.PAID_IN_FULL` (purple `#8b5cf6`), `.conf-row`/`.conf-stars` (confidence pill), `.card-pkg-loss` (orange lost-package warning), `#logPanel` (dark terminal-style, monospace, max-height 150px). Textarea placeholder (literal): `3000085` + newline + `3000086, 3000087`.
 
 ### calculator.js
 
@@ -1150,12 +1150,13 @@ Both implementations mirror the same conceptual data at rest — presence-only c
 
 | Concept | Chrome Extension (`chrome.storage`) | Python Platform (SQLite via SQLAlchemy) |
 |---|---|---|
-| Smart cache (NO_SAVING only) | `local` key `cache_<cruiseLine>_<bookingId>` → `{ts: <epoch-ms>}`. TTL 12h (`CACHE_TTL_MS`). | `CacheEntry` table (`cache`): `key` (unique, e.g. `cache_ESPRESSO_4097990`), `value_json` (defined but unused — always `"{}"`), `expires_at`. TTL 12h (`cache_ttl_hours`). |
+| Smart cache (NO_SAVING only) | `local` key `cache_<cruiseLine>_<bookingId>` → `{ts: <epoch-ms>}`. TTL 12h (`CACHE_TTL_MS`). | `CacheEntry` table (`cache`): `key` (unique, e.g. `cache_ESPRESSO_3000085`), `value_json` (defined but unused — always `"{}"`), `expires_at`. TTL 12h (`cache_ttl_hours`). |
 | Per-booking result | Not persisted beyond the in-memory `state.results` array and the CSV autosave string; no per-run history retained after `clearState`. | `BookingRecord` table (`bookings`): `booking_id`, `cruise_line`, `status`, `old_total`, `new_total`, `net_saving`, `confidence`, `price_category`, `new_price_category`, `note`, `error`, `lost_pkg_names` (JSON), `created_at`. Full history retained indefinitely. |
 | Price-over-time history | None. | `PriceHistory` table (`price_history`): `booking_id`, `cruise_line`, `total`, `category`, `checked_at`. Skipped when `old_total <= 0`. |
 | Batch/job tracking | In-memory `state.progress`/`state.results` only, lost on service-worker restart. | `ScanJobRecord` table (`scan_jobs`): `job_id` (unique), `booking_ids_json`, `cruise_line`, `status`, `progress_done`, `progress_total`, `started_at`, `completed_at`. |
 | Raw market/category snapshot | None (an ephemeral in-page read only). | `MarketDataRecord` table (`market_data`), optional, gated on `capture_market_data`: `booking_id`, `cruise_line`, `capture_type`, `current_category`, `execution_token`, `selection_json`, `category_table_json`, `created_at`, with a composite index on `(booking_id, created_at)`. |
 | CSV/XLSX export | Auto-built CSV string in `local` storage keys `autoSaveCSV`/`autoSaveTime`, re-written after every booking; downloaded on demand from the popup. 10-column CSV, no Excel. | On-demand export via `services/csv_export.py` (12 columns) and `services/excel_export.py` (17 columns, color-coded, sorted, with a Summary sheet). Not auto-saved after every booking — an explicit user action. |
+| Group-booking metadata | None. | `booking_group_info` table, written by [`platform/tools/extract_page_metadata.py`](platform/tools/extract_page_metadata.py) rather than by the SQLAlchemy models: `booking_id`, `captured_at`, `group_id`, `group_name`, `group_type`, `policy_type`, `option_date`, `rate_name`, keyed on `(booking_id, captured_at)`. Salvaged from page snapshots on 2026-10-17 before those were deleted; 348 bookings are identified as group bookings, which is one known cause of "price program change not allowed". |
 | Booking-input scratch state | `session` key `bookingInput` (raw textarea text, cleared on browser restart). | N/A (CLI/GUI take booking IDs as flags/queue items, not persisted scratch text). |
 | Session/login cookies | Browser's own persistent cookie jar (whatever profile the extension runs in). | Playwright `storage_state.json` under `browser_user_data_dir` (default `platform/browser-profile`), explicitly snapshotted/restored by `BaseScraper.start()`/`stop()` — necessary because Chromium marks ESPRESSO's SSO cookies session-only and wipes them from its own on-disk store otherwise. |
 
@@ -1318,7 +1319,7 @@ The following are **unresolved as of this writing** — documented so they are n
 
 ```
 python main.py login --cruise-line ESPRESSO --timeout-minutes 15
-python main.py scan --bookings "4097990,64756965" --cruise-line ESPRESSO -o results.csv -x results.xlsx
+python main.py scan --bookings "3000085,3000086" --cruise-line ESPRESSO -o results.csv -x results.xlsx
 python main.py watch --bookings-file watchlist.txt --interval-minutes 60 --duration-hours 8
 ```
 Setup: `python -m venv venv; source venv/bin/activate (or venv\Scripts\activate on Windows); pip install -r requirements.txt; playwright install chromium`. Optional `.env`:
