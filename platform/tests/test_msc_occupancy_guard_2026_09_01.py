@@ -230,12 +230,12 @@ def test_paid_in_full_still_reaches_the_rule_through_the_public_entry_point():
         today_discount_options=["SENIOR DISCOUNT"], club_discount_offered=True,
         is_paid_in_full=True,
     )
-    by_type = {c.type.value: c for c in result.checks}
-    pm = by_type["PRICE_MATCH"]
-    assert pm.status.value == "NO_OPPORTUNITY", (
-        "a paid-in-full booking must never report a price-match opportunity"
+    # Since 2026-10-15 (Neon, 3001068) paid in full stops EVERY check,
+    # not only the price match.
+    assert result.checks == [] and not result.has_any_opportunity, (
+        "a paid-in-full booking must never report any opportunity"
     )
-    assert "paid in full" in pm.note.lower()
+    assert "paid in full" in result.note.lower()
 
 
 def test_the_occupancy_guard_is_reachable_from_the_public_entry_point():

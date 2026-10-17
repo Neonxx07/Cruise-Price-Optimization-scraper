@@ -108,7 +108,31 @@ def _filter_out_disallowed_discounts(options: list[str] | None) -> list[str] | N
     filtered out) distinction."""
     if options is None:
         return None
-    return [o for o in options if "MIL-CIV" not in o.upper() and "MILITARY" not in o.upper()]
+    return [o for o in options if not is_military_label(o)]
+
+
+def is_military_label(label: str | None) -> bool:
+    """MSC's military discount, e.g. 'MIL-CIV-IL-DSCNT-05%' /
+    'MIL-CIV-IL-DSCNT-10%' (both seen on real bookings)."""
+    text = (label or "").upper()
+    return "MIL-CIV" in text or "MILITARY" in text
+
+
+def military_discounts(current_discounts: list[dict] | None) -> list[dict]:
+    """The military discounts already applied to a booking ([] if none or
+    unknown)."""
+    return [d for d in (current_discounts or []) if is_military_label(d.get("label"))]
+
+
+def military_rule_note(military: list[dict]) -> str:
+    """RULE MSC-D9, stated by Neon 2026-10-08: a Voyagers discount cannot
+    be applied on top of a military discount. That covers the Club 5%
+    (MSCCLUB5), Voyagers Selection and Voyagers Exclusives - and so a
+    status match, whose whole value is a Voyagers tier discount, gains a
+    military booking nothing. See docs/MSC_DISCOUNT_RULES.md."""
+    labels = ", ".join(d.get("label") or "military" for d in military)
+    return (f"military discount applied ({labels}) - a Voyagers discount cannot be "
+            f"applied on top of military (rule MSC-D9)")
 
 
 #: Labels MSC uses for the Voyagers Selection / "special offer" family.
@@ -603,6 +627,16 @@ def _check_discount_add(
             note="this booking's own current discount status wasn't confirmed (Price Breakdown capture didn't complete) — cannot safely tell whether a discount is already applied",
         )
 
+    # RULE MSC-D9 (2026-10-08). Checked before the Group Rate branch,
+    # which would otherwise offer the Club 5% on top of military.
+    military = military_discounts(current_discounts)
+    if military:
+        return MscCheck(
+            type=MscOpportunityType.DISCOUNT_ADD,
+            status=MscCheckStatus.NO_OPPORTUNITY,
+            note=military_rule_note(military),
+        )
+
     # Confirmed hard rule, stated directly by Neon 2026-08-11: Group
     # Rate bookings can ONLY ever get the flat 5% Voyagers Club discount
     # — none of the military/senior/promo tiers surfaced in the
@@ -629,6 +663,7 @@ def _check_discount_add(
                 f"{_voyagers_club_addable_label(has_voyagers)} discount (not military/senior/promo tiers, not "
                 "Voyagers Selection), call MSC to check eligibility and add"
             ),
+            discount_pct=5.0,
         )
 
     # "implied" (SRN-math-detected, see _extract_discounts_with_implied)
@@ -708,7 +743,11 @@ def _check_discount_add(
                 "the standard-fare reference table used to rule out senior discount already being silently "
                 "applied — can't confirm it isn't already on top of the rest; verify the SRN line by hand)"
             )
-        return MscCheck(type=MscOpportunityType.DISCOUNT_ADD, status=MscCheckStatus.OPPORTUNITY, note=note)
+        # The rate is known only when the club 5% is the sole addable
+        # option; a dropdown label ("SENIOR DISCOUNT") carries no rate.
+        club_only = (club_discount_offered and len(addable) == 1)
+        return MscCheck(type=MscOpportunityType.DISCOUNT_ADD, status=MscCheckStatus.OPPORTUNITY,
+                        note=note, discount_pct=5.0 if club_only else None)
     if uncertain:
         return MscCheck(
             type=MscOpportunityType.DISCOUNT_ADD,
@@ -731,6 +770,7 @@ def _check_discount_tier_upgrade(
     current_discounts: list[dict] | None,
     today_discount_options: list[str] | None,
     is_group_rate: bool = False,
+    has_voyagers: bool = False,
 ) -> MscCheck:
     if current_discounts is None:
         return MscCheck(
@@ -776,6 +816,21 @@ def _check_discount_tier_upgrade(
             status=MscCheckStatus.NO_OPPORTUNITY if implied is None else MscCheckStatus.INSUFFICIENT_DATA,
             note=note,
         )
+    # RULE MSC-D10, Neon 2026-10-08: a military discount may be SWAPPED
+    # for a higher one "only if the cx has a vouagers memebership if not
+    # then do not allow that at all". Swapping replaces military rather
+    # than stacking on it (that is MSC-D9), so it is a separate rule.
+    # has_voyagers is False when the passenger list was not read, which
+    # blocks the swap - the safe direction.
+    military = military_discounts(named)
+    if military and not has_voyagers:
+        return MscCheck(
+            type=MscOpportunityType.DISCOUNT_TIER_UPGRADE,
+            status=MscCheckStatus.NO_OPPORTUNITY,
+            note=(f"military discount applied ({', '.join(d.get('label') for d in military)}) - "
+                  f"it may only be swapped for a higher discount when a passenger has an MSC "
+                  f"Voyagers Club membership, and nobody on this booking does (rule MSC-D10)"),
+        )
     current_best = max(safe_float(d.get("rate_pct")) for d in named)
 
     # Only labels with a printed percentage can be safely compared —
@@ -788,15 +843,19 @@ def _check_discount_tier_upgrade(
 
     if better:
         best_label, best_rate = max(better, key=lambda x: x[1])
+        swap_note = (" - this REPLACES the military discount, allowed because a passenger is a "
+                     "Voyagers Club member (rule MSC-D10)" if military else "")
         return MscCheck(
             type=MscOpportunityType.DISCOUNT_TIER_UPGRADE,
             status=MscCheckStatus.OPPORTUNITY,
             note=(
                 f"current best named discount is {current_best:.1f}% — '{best_label}' offers {best_rate:.1f}% today, "
                 f"call MSC to swap just this component, keep the base rate and any other stacked discount unchanged"
+                f"{swap_note}"
             ),
             estimated_value=round2(best_rate - current_best),
             value_unit="PERCENTAGE_POINTS",
+            discount_pct=best_rate,
         )
     if unparseable:
         return MscCheck(
@@ -821,6 +880,20 @@ def _check_voyagers_selection(
     senior_count: int,
     is_group_rate: bool = False,
 ) -> MscCheck:
+    # RULE MSC-D9 (2026-10-08): Voyagers Selection is a Voyagers discount,
+    # so it cannot go on top of military. THE FALSE POSITIVE IT ENDS:
+    # booking 3001058 (MIL-CIV-IL-DSCNT-10%, Voyagers members) was told
+    # "MSVG10W (10%) ... confirmed to stack with the base 5% Club, call
+    # MSC to add" - only SPECIAL OFFER / VOYAGERS EXCLUSIV counted as
+    # "already applied" below, so a military line cleared every guard.
+    military = military_discounts(current_discounts)
+    if military:
+        return MscCheck(
+            type=MscOpportunityType.VOYAGERS_SELECTION,
+            status=MscCheckStatus.NO_OPPORTUNITY,
+            note=military_rule_note(military),
+        )
+
     # Same Group Rate rule, stated directly by Neon 2026-08-11: ONLY
     # the flat 5% Voyagers Club discount is eligible for Group Rate
     # bookings — Voyagers Selection (MSVG10W/MSVG15W) does not apply to
@@ -952,10 +1025,137 @@ def _check_voyagers_selection(
             f"'{best.get('program_name')}') available on this sailing — confirmed to stack with the base "
             f"5% Club discount, single-cabin-booking only, call MSC to check eligibility and add{exclusivity_note}"
         ),
+        discount_pct=safe_float(best.get("rate_pct")) or None,
     )
 
 
-def evaluate_msc_booking(
+def msc_row_status(result: MscBookingResult | None) -> str:
+    """The status an MSC row is shown (and coloured) with.
+
+    GREEN IS FOR AN AVAILABLE LOWER PRICE ONLY - Neon 2026-10-15, for the
+    whole project: "THROUGH THE WHOLE PROJECT GREEN IS FOR AVAIABLE LOWER
+    RPICES ONLY AND PRICE DIFFERNCES". MSC rows used to turn green on ANY
+    opportunity, including an unpriced "add a discount" lead.
+
+      OPPORTUNITY           a lower price is shown in figures: a PRICE_MATCH
+                            dollar value, or a discount whose reprice at
+                            today's rate lands below the current fare
+                            (msc_discount_beats_current said so)  -> green
+      DISCOUNT_OPPORTUNITY  a discount lead with no proven lower price
+                            -> orange
+      NO_OPPORTUNITY        nothing found
+    """
+    if result is None:
+        return "NO_OPPORTUNITY"
+    opps = [c for c in result.checks if c.status == MscCheckStatus.OPPORTUNITY]
+    lower = [c for c in opps
+             if (c.type == MscOpportunityType.PRICE_MATCH and (c.estimated_value or 0) > 0)
+             or "below the current" in (c.note or "")]
+    if lower:
+        return "OPPORTUNITY"
+    return "DISCOUNT_OPPORTUNITY" if opps else "NO_OPPORTUNITY"
+
+
+_DISCOUNT_CHECKS = (MscOpportunityType.DISCOUNT_ADD,
+                    MscOpportunityType.DISCOUNT_TIER_UPGRADE,
+                    MscOpportunityType.VOYAGERS_SELECTION)
+
+
+def _apply_reprice_rule(check: MscCheck, current_cruise: float | None,
+                        today_price: float | None, unpriced: str,
+                        keep_club: bool) -> MscCheck:
+    """Hold a discount OPPORTUNITY to RULE MSC-D1/D2 (Neon 2026-09-22).
+
+    `msc_discount_beats_current` was written that day and NEVER CALLED from
+    production - so every discount check kept reporting OPPORTUNITY on a
+    percentage alone. Live 2026-10-15, Neon on 3001067 (MSVG15W "SPECIAL
+    OFFER 15%"): "yes it can be applied but ... that is useless". Same
+    failure as 3000005 (all three discounts left the customer worse off).
+
+      repriced below the current fare  -> OPPORTUNITY, with the figures
+      repriced at or above it          -> NO_OPPORTUNITY, with the figures
+      price, rate or quote unknown     -> INSUFFICIENT_DATA, with the reason
+
+    `keep_club`: the customer's 5% club discount is re-applied on top -
+    MULTIPLICATIVE (MSC's own 9.75% = 1 - 0.95 x 0.95).
+    """
+    if check.type not in _DISCOUNT_CHECKS or check.status != MscCheckStatus.OPPORTUNITY:
+        return check
+    pct = check.discount_pct
+    if pct is not None and keep_club and not (check.type == MscOpportunityType.DISCOUNT_ADD
+                                              and pct == 5.0):
+        pct = round((1 - 0.95 * (1 - pct / 100.0)) * 100, 4)
+    if unpriced:
+        beats, why = None, unpriced
+    elif pct is None:
+        beats, why = None, "this discount's rate is not known, so its repriced total cannot be worked out"
+    else:
+        beats, why = msc_discount_beats_current(current_cruise, today_price, pct)
+    if beats is True:
+        return check.model_copy(update={"note": f"{check.note} — {why}"})
+    # The club 5% on a booking holding NO discount stays a lead when it
+    # cannot be priced: Neon 2026-10-15 on 3001065 (no Voyagers member,
+    # no discount, today's quote unverified): "this is accurate". A KNOWN
+    # worse reprice (3000005) is still refused below.
+    if beats is None and check.type == MscOpportunityType.DISCOUNT_ADD and check.discount_pct == 5.0:
+        return check.model_copy(update={"note": (
+            f"{check.note} — not priced ({why}): confirm on the call that today's "
+            f"repriced total with the 5% is below the current fare")})
+    status = (MscCheckStatus.NO_OPPORTUNITY if beats is False
+              else MscCheckStatus.INSUFFICIENT_DATA)
+    lead = ("NOT WORTH IT - a discount reprices at today's rate: " if beats is False
+            else "NOT PRICED - a discount reprices at today's rate, and ")
+    return check.model_copy(update={"status": status,
+                                    "note": f"{lead}{why} [was: {check.note}]"})
+
+
+def evaluate_msc_booking(*args, **kwargs) -> MscBookingResult:
+    """See _evaluate_msc_booking. Stamps the prices the scan read onto every
+    result, whichever early return produced it (paid in full, overpaid,
+    cancelled, or the full four checks), so the GUI and the database can
+    show the booked price and today's price (Neon 2026-10-15)."""
+    import inspect
+
+    bound = inspect.signature(_evaluate_msc_booking).bind(*args, **kwargs)
+    bound.apply_defaults()
+    a = bound.arguments
+    result = _evaluate_msc_booking(*args, **kwargs)
+    return result.model_copy(update={
+        "current_total_price": a.get("current_total_price"),
+        "today_price": a.get("today_base_price"),
+        "due_amount": a.get("due_amount"),
+        "discounts_before": _discount_text(a.get("current_discounts")),
+        "discounts_today": _offered_text(a.get("today_discount_catalog"),
+                                         a.get("today_discount_options")),
+    })
+
+
+def _discount_text(discounts: list[dict] | None) -> str | None:
+    """'LABEL rate%' for each discount the booking holds; None = not read."""
+    if discounts is None:
+        return None
+    out = []
+    for d in discounts:
+        label = (d.get("label") or d.get("kind") or "?").strip()
+        rate = d.get("rate_pct")
+        out.append(f"{label} {safe_float(rate):g}%" if rate not in (None, "") else label)
+    return ", ".join(out)
+
+
+def _offered_text(catalog: list[dict] | None, options: list[str] | None) -> str | None:
+    """What MSC offers today: catalog 'CODE rate%' plus dropdown options."""
+    if catalog is None and options is None:
+        return None
+    out = []
+    for d in catalog or []:
+        code = d.get("disc_cd") or d.get("label") or "?"
+        rate = d.get("rate_pct")
+        out.append(f"{code} {safe_float(rate):g}%" if rate not in (None, "") else str(code))
+    out.extend(o for o in (options or []) if o and o not in out)
+    return ", ".join(dict.fromkeys(out))
+
+
+def _evaluate_msc_booking(
     booking_id: str,
     category: str | None,
     cancelled_or_postponed: bool = False,
@@ -1151,6 +1351,25 @@ def evaluate_msc_booking(
             note="sailing is cancelled/postponed (placeholder departure date) — nothing to check",
         )
 
+    # PAID IN FULL IS NOT OPTIMIZABLE. Neon 2026-10-15 on 3001068 (Booking
+    # Value $544.48, Due Amount $5.48): "on msc this is paid in full fix
+    # that". It WAS detected (is_paid_in_full=1 in msc_results) but only
+    # PRICE_MATCH honoured it - the 2026-08-12 rule let the discount checks
+    # run, so the row carried a VOYAGERS_SELECTION "opportunity" (MSVG15W,
+    # never priced). This replaces that rule. CLAUDE.md hard rule 7: a
+    # paid-in-full booking is reported, never re-scanned.
+    if is_paid_in_full:
+        return MscBookingResult(
+            booking_id=booking_id,
+            category=category,
+            cancelled_or_postponed=False,
+            is_paid_in_full=True,
+            checks=[],
+            has_any_opportunity=False,
+            note=(f"PAID IN FULL — not optimizable"
+                  f"{f' (Due Amount ${due_amount:.2f})' if due_amount else ''}"),
+        )
+
     # IMPORTANT: current_discounts is NOT defaulted to [] here on purpose.
     # None and [] are different, real facts — None means "the Price
     # Breakdown wasn't confirmed captured for this booking" (see
@@ -1201,10 +1420,34 @@ def evaluate_msc_booking(
             current_discounts, allowed_discount_options, is_group_rate, club_discount_offered,
             has_voyagers, senior_discount_verifiable,
         ),
-        _check_discount_tier_upgrade(current_discounts, allowed_discount_options, is_group_rate),
+        _check_discount_tier_upgrade(current_discounts, allowed_discount_options, is_group_rate,
+                                     has_voyagers),
         _check_voyagers_selection(current_discounts, today_discount_catalog, has_voyagers, senior_count, is_group_rate),
     ]
+    # RULE MSC-D1/D2, finally wired in: a discount REPRICES the booking at
+    # today's rate, so it is an opportunity only when that lands below the
+    # fare already held.
+    if not occupancy_verified:
+        unpriced = f"today's quote is not trustworthy ({occupancy_note or 'occupancy not verified'})"
+    elif is_group_rate:
+        unpriced = "a Group Rate booking has no individual today's rate to reprice against"
+    elif not today_price_tab_confirmed:
+        unpriced = "today's price was not read on this booking's own rate tab"
+    else:
+        unpriced = ""
+    current_cruise = (current_total_price - (non_cruise_charges or 0.0)
+                      if current_total_price is not None else None)
+    keep_club = customer_has_club_membership and not today_price_includes_club_discount
+    checks = [_apply_reprice_rule(c, current_cruise, None if unpriced else today_base_price,
+                                  unpriced, keep_club) for c in checks]
     has_any_opportunity = any(c.status == MscCheckStatus.OPPORTUNITY for c in checks)
+    note = "opportunity found" if has_any_opportunity else "no opportunity found on the data available"
+    # Measured on every price scan (2026-10-08): a military booking says so
+    # first, because it rules out every Voyagers discount and a status
+    # match (MSC-D9).
+    military = military_discounts(current_discounts)
+    if military:
+        note = f"MILITARY DISCOUNT APPLIED - {military_rule_note(military)}; {note}"
 
     return MscBookingResult(
         booking_id=booking_id,
@@ -1213,7 +1456,7 @@ def evaluate_msc_booking(
         is_paid_in_full=is_paid_in_full,
         checks=checks,
         has_any_opportunity=has_any_opportunity,
-        note="opportunity found" if has_any_opportunity else "no opportunity found on the data available",
+        note=note,
     )
 
 

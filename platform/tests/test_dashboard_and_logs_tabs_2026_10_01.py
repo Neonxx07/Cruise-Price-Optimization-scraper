@@ -350,3 +350,80 @@ def test_the_logs_panel_answers_toplaintext_like_the_widget_it_replaced(qt_app):
     panel = LogsPanel()
     panel.append("[NCL] search booking_id=3000055")
     assert "3000055" in panel.toPlainText()
+
+
+# -- the dashboard actually refreshes ------------------------------------
+#
+# THE BUG, 2026-10-05. Neon, with a scan running and the board reading
+# NOT CONNECTED / 0 Chromium: *"dashboard is not functioning at all"*.
+#
+# `_refresh_resources` is a MainWindow method, but `_CHROME_CENSUS_EVERY`
+# was only ever set on CruiseLinePanel. Every tick raised
+#
+#     AttributeError: 'MainWindow' object has no attribute
+#                     '_CHROME_CENSUS_EVERY'
+#
+# and the broad `except Exception` around that method turned it into
+# "Resources: (unavailable)" - so the footer looked merely unlucky while
+# the Dashboard silently froze at whatever the first tick had read.
+#
+# A pre-existing fault, but the Dashboard is what made it visible: a label
+# that stops updating looks identical to one with nothing to say.
+
+
+def test_the_window_can_run_its_own_resource_tick(qt_app):
+    """The constant must live on the class whose method uses it."""
+    from gui.windows import MainWindow
+
+    window = MainWindow()
+    assert hasattr(window, "_CHROME_CENSUS_EVERY"), (
+        "_refresh_resources will raise on every tick and the Dashboard "
+        "will freeze")
+
+
+def test_the_resource_footer_shows_real_numbers(qt_app):
+    """"(unavailable)" is the swallow branch - if it appears, the tick
+    raised."""
+    from gui.windows import MainWindow
+
+    window = MainWindow()
+    window._refresh_resources()
+
+    assert "unavailable" not in window.resource_label.text().lower(), (
+        f"the resource tick is failing: {window.resource_label.text()}")
+
+
+def test_the_dashboard_keeps_updating_past_the_first_tick(qt_app):
+    """The census runs every _CHROME_CENSUS_EVERY ticks, so the failure
+    only appeared from the SECOND tick on - a single call would have
+    looked fine."""
+    from gui.windows import MainWindow
+
+    window = MainWindow()
+    for _ in range(window._CHROME_CENSUS_EVERY + 3):
+        window._refresh_resources()
+
+    assert "unavailable" not in window.resource_label.text().lower()
+    assert window.dashboard_panel._values["cpu"].text() != "—"
+    assert window.dashboard_panel._values["processes"].text() != "—"
+
+
+def test_the_scanning_state_expression_is_not_a_precedence_accident():
+    """`A or B and C` binds as `A or (B and C)`. The first version read as
+    that by accident, so a line with a queue but no booking in flight
+    could be misreported."""
+    import ast
+    import pathlib
+
+    source = pathlib.Path("gui/windows.py").read_text(encoding="utf-8")
+    func = next(
+        n for n in ast.walk(ast.parse(source))
+        if isinstance(n, ast.FunctionDef) and n.name == "_refresh_dashboard")
+
+    for node in ast.walk(func):
+        if isinstance(node, ast.BoolOp) and isinstance(node.op, ast.Or):
+            for value in node.values:
+                assert not (isinstance(value, ast.BoolOp)
+                            and isinstance(value.op, ast.And)), (
+                    "an `or` with a bare `and` inside it is back in the "
+                    "state expression - parenthesise it or split it out")

@@ -225,16 +225,25 @@ def test_discount_tier_upgrade_estimated_value_tagged_percentage_points():
     together blindly."""
     from core.calculator_msc import _check_discount_tier_upgrade
 
+    # has_voyagers=True since 2026-10-08: a military discount may only be
+    # swapped when a passenger is a Voyagers member (rule MSC-D10). This
+    # test is about the value's UNIT, so it uses the case where the swap
+    # is allowed; the refused case is in test_msc_military_rule_2026_10_08.
     check = _check_discount_tier_upgrade(
         current_discounts=[{"kind": "named", "label": "MIL-CIV-IL-DSCNT-10%", "rate_pct": 10.0}],
         today_discount_options=["SPECIAL OFFER 15%"],
+        has_voyagers=True,
     )
     assert check.status == MscCheckStatus.OPPORTUNITY
     assert check.estimated_value == 5.0
     assert check.value_unit == "PERCENTAGE_POINTS"
 
 
-def test_evaluate_msc_booking_paid_in_full_still_allows_discount_add():
+def test_evaluate_msc_booking_paid_in_full_stops_every_check():
+    """CHANGED 2026-10-15 (was ..._paid_in_full_still_allows_discount_add,
+    pinning Neon's 2026-08-12 rule). Neon on 3001068, Due $5.48: "on msc
+    this is paid in full fix that" - a paid-in-full booking now carries no
+    check and no opportunity. See test_msc_paid_in_full_and_reprice_2026_10_15."""
     result = evaluate_msc_booking(
         booking_id="TEST",
         category="BR1",
@@ -245,6 +254,5 @@ def test_evaluate_msc_booking_paid_in_full_still_allows_discount_add():
         today_discount_options=["SENIOR DISCOUNT"],
         club_discount_offered=True,
     )
-    checks_by_type = {c.type.value: c for c in result.checks}
-    assert checks_by_type["PRICE_MATCH"].status == MscCheckStatus.NO_OPPORTUNITY
-    assert checks_by_type["DISCOUNT_ADD"].status == MscCheckStatus.OPPORTUNITY
+    assert result.is_paid_in_full and result.checks == []
+    assert not result.has_any_opportunity and "PAID IN FULL" in result.note

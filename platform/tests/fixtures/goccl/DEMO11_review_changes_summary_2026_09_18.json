@@ -1,0 +1,488 @@
+{
+ "agentInvoice": {
+  "summary": {
+   "lineItems": [
+    {
+     "code": "CNRF",
+     "name": "Cruise Charges",
+     "price": {
+      "amount": 1224.46,
+      "currencyCode": "USD",
+      "currencySymbol": "$",
+      "formatted": "$ 1,224.46",
+      "amountFormatted": "1,224.46",
+      "wholeNumber": 1224.0,
+      "wholeNumberFormatted": "1,224"
+     },
+     "tooltipShowInFootnote": false,
+     "isTotal": true,
+     "isSpecialService": false,
+     "isItalic": false,
+     "isIndented": false
+    },
+    {
+     "code": "CRUS",
+     "name": "Cruise Rate",
+     "price": {
+      "amount": 720.0,
+      "currencyCode": "USD",
+      "currencySymbol": "$",
+      "formatted": "$ 720.00",
+      "amountFormatted": "720.00",
+      "wholeNumber": 720.0,
+      "wholeNumberFormatted": "720"
+     },
+     "tooltipShowInFootnote": false,
+     "isTotal": false,
+     "isSpecialService": false,
+     "isItalic": false,
+     "isIndented": true
+    },
+    {
+     "code": "PTCH",
+     "name": "Non-Comm Cruise Amount",
+     "price": {
+      "amount": 238.0,
+      "currencyCode": "USD",
+      "currencySymbol": "$",
+      "formatted": "$ 238.00",
+      "amountFormatted": "238.00",
+      "wholeNumber": 238.0,
+      "wholeNumberFormatted": "238"
+     },
+     "tooltipShowInFootnote": false,
+     "isTotal": false,
+     "isSpecialService": false,
+     "isItalic": false,
+     "isIndented": true
+    },
+    {
+     "code": "RCFE",
+     "name": "Required Cruise Fees & Expenses",
+     "price": {
+      "amount": 266.46,
+      "currencyCode": "USD",
+      "currencySymbol": "$",
+      "formatted": "$ 266.46",
+      "amountFormatted": "266.46",
+      "wholeNumber": 266.0,
+      "wholeNumberFormatted": "266"
+     },
+     "tooltipTitle": "Required Cruise Fees and Expenses",
+     "tooltipBody": "<span>Required Cruise Fees and Expenses includes all mandatory and third-party fees and expenses associated with the Cruise Fare for services on board and in port (which are subject to penalty).<br />\n</span>",
+     "tooltipShowInFootnote": true,
+     "tooltipFootnoteMark": "",
+     "isTotal": false,
+     "isSpecialService": false,
+     "isItalic": false,
+     "isIndented": true
+    },
+    {
+     "code": "GTFE",
+     "name": "Government Taxes & Fees",
+     "price": {
+      "amount": 327.54,
+      "currencyCode": "USD",
+      "currencySymbol": "$",
+      "formatted": "$ 327.54",
+      "amountFormatted": "327.54",
+      "wholeNumber": 327.0,
+      "wholeNumberFormatted": "327"
+     },
+     "tooltipTitle": "Government Taxes and Fees",
+     "tooltipBody": "<span>Government Taxes and Fees could include, but are not limited to: Taxes, Fees &amp; Port Expenses, as used by us, may include any and all fees, charges, tolls and taxes imposed on us by governmental or quasi-governmental authorities, as well third party fees and charges arising from a vessel&rsquo;s presence in a harbor or port. Taxes, Fees &amp; Port Expenses may include U.S. Customs fees, head taxes, Panama Canal tolls, dockage fees, wharfage fees, inspection fees, pilotage, air taxes, hotel or VAT taxes incurred as part of a land tour, immigration and naturalization fees, and Internal Revenue Service fees, as well as fees for navigation, berthing, stevedoring, baggage handling/storage and security services. Taxes, Fees, &amp; Port Expenses may be assessed per passenger, per berth, per ton or per vessel. Assessments calculated on a per ton or per vessel basis will be spread over the number of passengers on the Ship. Taxes, Fees &amp; Port Expenses are subject to change and Carnival reserves the right to collect any increases in effect at the time of sailing even if the fare has already been paid in full.</span>",
+     "tooltipShowInFootnote": false,
+     "tooltipFootnoteMark": "",
+     "isTotal": true,
+     "isSpecialService": false,
+     "isItalic": false,
+     "isIndented": false
+    },
+    {
+     "code": "INSU",
+     "name": "Carnival Vacation Protection",
+     "price": {
+      "amount": 0.0,
+      "currencyCode": "USD",
+      "currencySymbol": "$",
+      "formatted": "$ 0.00",
+      "amountFormatted": "0.00",
+      "wholeNumber": 0.0,
+      "wholeNumberFormatted": "0"
+     },
+     "tooltipTitle": "Cruise Vacation Protection Plan",
+     "tooltipBody": "Carnival Vacation Protection is available to US residents of all states except New York and Puerto Rico. It is also available to guests residing in U.S. Virgin Islands (St. Thomas, St. Croix, and St. John) and American Samoa - this includes citizens of the U.S, Permanent Residents and those living in the United States for 6 months of the year or longer (and have a valid U.S Government issued ID).<br />\n<a rel=\"noopener noreferrer\" target=\"_blank\" href=\"http://www.carnival.com/about-carnival/vacation-protection.aspx\">More details.</a>",
+     "tooltipShowInFootnote": true,
+     "tooltipFootnoteMark": "",
+     "isTotal": true,
+     "isSpecialService": true,
+     "isItalic": false,
+     "isIndented": false
+    },
+    {
+     "code": "PKGS",
+     "name": "Pre/Post Packages",
+     "price": {
+      "amount": 0.0,
+      "currencyCode": "USD",
+      "currencySymbol": "$",
+      "formatted": "$ 0.00",
+      "amountFormatted": "0.00",
+      "wholeNumber": 0.0,
+      "wholeNumberFormatted": "0"
+     },
+     "tooltipShowInFootnote": false,
+     "isTotal": false,
+     "isSpecialService": false,
+     "isItalic": false,
+     "isIndented": false
+    },
+    {
+     "code": "TADD",
+     "name": "Transportation Add-On",
+     "price": {
+      "amount": 0.0,
+      "currencyCode": "USD",
+      "currencySymbol": "$",
+      "formatted": "$ 0.00",
+      "amountFormatted": "0.00",
+      "wholeNumber": 0.0,
+      "wholeNumberFormatted": "0"
+     },
+     "tooltipShowInFootnote": false,
+     "isTotal": true,
+     "isSpecialService": false,
+     "isItalic": false,
+     "isIndented": false
+    }
+   ],
+   "lineItemIndex": {
+    "cnrf": 0,
+    "crus": 1,
+    "ptch": 2,
+    "rcfe": 3,
+    "gtfe": 4,
+    "insu": 5,
+    "pkgs": 6,
+    "tadd": 7
+   },
+   "fare": {
+    "fares": [
+     {
+      "code": "CNRF",
+      "name": "Cruise Charges",
+      "price": {
+       "amount": 1224.46,
+       "currencyCode": "USD",
+       "currencySymbol": "$",
+       "formatted": "$ 1,224.46",
+       "amountFormatted": "1,224.46",
+       "wholeNumber": 1224.0,
+       "wholeNumberFormatted": "1,224"
+      },
+      "tooltipShowInFootnote": false,
+      "isTotal": true,
+      "isSpecialService": false,
+      "isItalic": false,
+      "isIndented": false
+     },
+     {
+      "code": "CRUS",
+      "name": "Cruise Rate",
+      "price": {
+       "amount": 720.0,
+       "currencyCode": "USD",
+       "currencySymbol": "$",
+       "formatted": "$ 720.00",
+       "amountFormatted": "720.00",
+       "wholeNumber": 720.0,
+       "wholeNumberFormatted": "720"
+      },
+      "tooltipShowInFootnote": false,
+      "isTotal": false,
+      "isSpecialService": false,
+      "isItalic": false,
+      "isIndented": true
+     },
+     {
+      "code": "PTCH",
+      "name": "Non-Comm Cruise Amount",
+      "price": {
+       "amount": 238.0,
+       "currencyCode": "USD",
+       "currencySymbol": "$",
+       "formatted": "$ 238.00",
+       "amountFormatted": "238.00",
+       "wholeNumber": 238.0,
+       "wholeNumberFormatted": "238"
+      },
+      "tooltipShowInFootnote": false,
+      "isTotal": false,
+      "isSpecialService": false,
+      "isItalic": false,
+      "isIndented": true
+     },
+     {
+      "code": "RCFE",
+      "name": "Required Cruise Fees & Expenses",
+      "price": {
+       "amount": 266.46,
+       "currencyCode": "USD",
+       "currencySymbol": "$",
+       "formatted": "$ 266.46",
+       "amountFormatted": "266.46",
+       "wholeNumber": 266.0,
+       "wholeNumberFormatted": "266"
+      },
+      "tooltipTitle": "Required Cruise Fees and Expenses",
+      "tooltipBody": "<span>Required Cruise Fees and Expenses includes all mandatory and third-party fees and expenses associated with the Cruise Fare for services on board and in port (which are subject to penalty).<br />\n</span>",
+      "tooltipShowInFootnote": true,
+      "tooltipFootnoteMark": "",
+      "isTotal": false,
+      "isSpecialService": false,
+      "isItalic": false,
+      "isIndented": true
+     },
+     {
+      "code": "GTFE",
+      "name": "Government Taxes & Fees",
+      "price": {
+       "amount": 327.54,
+       "currencyCode": "USD",
+       "currencySymbol": "$",
+       "formatted": "$ 327.54",
+       "amountFormatted": "327.54",
+       "wholeNumber": 327.0,
+       "wholeNumberFormatted": "327"
+      },
+      "tooltipTitle": "Government Taxes and Fees",
+      "tooltipBody": "<span>Government Taxes and Fees could include, but are not limited to: Taxes, Fees &amp; Port Expenses, as used by us, may include any and all fees, charges, tolls and taxes imposed on us by governmental or quasi-governmental authorities, as well third party fees and charges arising from a vessel&rsquo;s presence in a harbor or port. Taxes, Fees &amp; Port Expenses may include U.S. Customs fees, head taxes, Panama Canal tolls, dockage fees, wharfage fees, inspection fees, pilotage, air taxes, hotel or VAT taxes incurred as part of a land tour, immigration and naturalization fees, and Internal Revenue Service fees, as well as fees for navigation, berthing, stevedoring, baggage handling/storage and security services. Taxes, Fees, &amp; Port Expenses may be assessed per passenger, per berth, per ton or per vessel. Assessments calculated on a per ton or per vessel basis will be spread over the number of passengers on the Ship. Taxes, Fees &amp; Port Expenses are subject to change and Carnival reserves the right to collect any increases in effect at the time of sailing even if the fare has already been paid in full.</span>",
+      "tooltipShowInFootnote": false,
+      "tooltipFootnoteMark": "",
+      "isTotal": true,
+      "isSpecialService": false,
+      "isItalic": false,
+      "isIndented": false
+     },
+     {
+      "code": "INSU",
+      "name": "Carnival Vacation Protection",
+      "price": {
+       "amount": 0.0,
+       "currencyCode": "USD",
+       "currencySymbol": "$",
+       "formatted": "$ 0.00",
+       "amountFormatted": "0.00",
+       "wholeNumber": 0.0,
+       "wholeNumberFormatted": "0"
+      },
+      "tooltipTitle": "Cruise Vacation Protection Plan",
+      "tooltipBody": "Carnival Vacation Protection is available to US residents of all states except New York and Puerto Rico. It is also available to guests residing in U.S. Virgin Islands (St. Thomas, St. Croix, and St. John) and American Samoa - this includes citizens of the U.S, Permanent Residents and those living in the United States for 6 months of the year or longer (and have a valid U.S Government issued ID).<br />\n<a rel=\"noopener noreferrer\" target=\"_blank\" href=\"http://www.carnival.com/about-carnival/vacation-protection.aspx\">More details.</a>",
+      "tooltipShowInFootnote": true,
+      "tooltipFootnoteMark": "",
+      "isTotal": true,
+      "isSpecialService": true,
+      "isItalic": false,
+      "isIndented": false
+     },
+     {
+      "code": "TADD",
+      "name": "Transportation Add-On",
+      "price": {
+       "amount": 0.0,
+       "currencyCode": "USD",
+       "currencySymbol": "$",
+       "formatted": "$ 0.00",
+       "amountFormatted": "0.00",
+       "wholeNumber": 0.0,
+       "wholeNumberFormatted": "0"
+      },
+      "tooltipShowInFootnote": false,
+      "isTotal": true,
+      "isSpecialService": false,
+      "isItalic": false,
+      "isIndented": false
+     },
+     {
+      "code": "PKGS",
+      "name": "Pre/Post Packages",
+      "price": {
+       "amount": 0.0,
+       "currencyCode": "USD",
+       "currencySymbol": "$",
+       "formatted": "$ 0.00",
+       "amountFormatted": "0.00",
+       "wholeNumber": 0.0,
+       "wholeNumberFormatted": "0"
+      },
+      "tooltipShowInFootnote": false,
+      "isTotal": false,
+      "isSpecialService": false,
+      "isItalic": false,
+      "isIndented": false
+     }
+    ],
+    "totalFares": [
+     {
+      "code": "NAMT",
+      "name": "Net Amount",
+      "price": {
+       "amount": 1444.0,
+       "currencyCode": "USD",
+       "currencySymbol": "$",
+       "formatted": "$ 1,444.00",
+       "amountFormatted": "1,444.00",
+       "wholeNumber": 1444.0,
+       "wholeNumberFormatted": "1,444"
+      },
+      "tooltipShowInFootnote": false,
+      "isTotal": false,
+      "isSpecialService": false,
+      "isItalic": false,
+      "isIndented": false
+     },
+     {
+      "code": "PMTS",
+      "name": "Payments Applied",
+      "price": {
+       "amount": 225.0,
+       "currencyCode": "USD",
+       "currencySymbol": "$",
+       "formatted": "$ 225.00",
+       "amountFormatted": "225.00",
+       "wholeNumber": 225.0,
+       "wholeNumberFormatted": "225"
+      },
+      "tooltipShowInFootnote": false,
+      "isTotal": false,
+      "isSpecialService": false,
+      "isItalic": false,
+      "isIndented": false
+     }
+    ]
+   },
+   "commissions": [
+    {
+     "code": "COMM",
+     "name": "Commission",
+     "price": {
+      "amount": 108.0,
+      "currencyCode": "USD",
+      "currencySymbol": "$",
+      "formatted": "$ 108.00",
+      "amountFormatted": "108.00",
+      "wholeNumber": 108.0,
+      "wholeNumberFormatted": "108"
+     },
+     "tooltipShowInFootnote": false,
+     "isTotal": true,
+     "isSpecialService": false,
+     "isItalic": false,
+     "isIndented": false
+    }
+   ],
+   "perks": [
+    {
+     "code": "POBC",
+     "name": "Total Onboard Credit",
+     "price": {
+      "amount": 0.0,
+      "currencyCode": "USD",
+      "currencySymbol": "$",
+      "formatted": "$ 0.00",
+      "amountFormatted": "0.00",
+      "wholeNumber": 0.0,
+      "wholeNumberFormatted": "0"
+     },
+     "tooltipShowInFootnote": false,
+     "isTotal": true,
+     "isSpecialService": false,
+     "isItalic": false,
+     "isIndented": false
+    }
+   ],
+   "summaryTotal": {
+    "code": "GRSS",
+    "name": "Gross Amount",
+    "price": {
+     "amount": 1552.0,
+     "currencyCode": "USD",
+     "currencySymbol": "$",
+     "formatted": "$ 1,552.00",
+     "amountFormatted": "1,552.00",
+     "wholeNumber": 1552.0,
+     "wholeNumberFormatted": "1,552"
+    },
+    "tooltipShowInFootnote": false,
+    "isTotal": true,
+    "isSpecialService": false,
+    "isItalic": false,
+    "isIndented": false
+   },
+   "averagePerPerson": {
+    "tooltipShowInFootnote": false,
+    "isTotal": false,
+    "isSpecialService": false,
+    "isItalic": false,
+    "isIndented": false
+   }
+  }
+ },
+ "paymentsSchedule": {
+  "netBalanceDue": {
+   "amount": 1219.0,
+   "currencyCode": "USD",
+   "currencySymbol": "$",
+   "formatted": "$ 1,219.00",
+   "amountFormatted": "1,219.00",
+   "wholeNumber": 1219.0,
+   "wholeNumberFormatted": "1,219"
+  },
+  "balanceDue": {
+   "amount": 1327.0,
+   "currencyCode": "USD",
+   "currencySymbol": "$",
+   "formatted": "$ 1,327.00",
+   "amountFormatted": "1,327.00",
+   "wholeNumber": 1327.0,
+   "wholeNumberFormatted": "1,327"
+  },
+  "hasDebt": true,
+  "finalPaymentDueDate": {
+   "rawValue": "2027-01-27T23:59:59-05:00",
+   "shortDate": "1/27/2027",
+   "longDate": "Wednesday, January 27, 2027",
+   "fullDateShortTime": "Wednesday, January 27, 2027 11:59 PM",
+   "fullDateTime": "Wednesday, January 27, 2027 11:59:59 PM",
+   "iso8601": "2027-01-27",
+   "iso8601WithTime": "2027-01-27T23:59:59.0000000-05:00",
+   "dateSelection": "01/27/2027",
+   "dateShortTime": "Jan 27, 2027 23:59",
+   "dateTime": "Jan 27, 2027 11:59 PM",
+   "dayOfWeek": "Wed",
+   "hhmm": "23:59",
+   "hhmmtt": "11:59 PM",
+   "mmmDate": "Jan 27, 2027",
+   "mmmmDate": "January 27, 2027"
+  },
+  "finalPaymentDueDateTimeZone": "USET",
+  "closestPaymentDueBy": {
+   "rawValue": "2027-01-27T23:59:59-05:00",
+   "shortDate": "1/27/2027",
+   "longDate": "Wednesday, January 27, 2027",
+   "fullDateShortTime": "Wednesday, January 27, 2027 11:59 PM",
+   "fullDateTime": "Wednesday, January 27, 2027 11:59:59 PM",
+   "iso8601": "2027-01-27",
+   "iso8601WithTime": "2027-01-27T23:59:59.0000000-05:00",
+   "dateSelection": "01/27/2027",
+   "dateShortTime": "Jan 27, 2027 23:59",
+   "dateTime": "Jan 27, 2027 11:59 PM",
+   "dayOfWeek": "Wed",
+   "hhmm": "23:59",
+   "hhmmtt": "11:59 PM",
+   "mmmDate": "Jan 27, 2027",
+   "mmmmDate": "January 27, 2027"
+  },
+  "closestPaymentDueByTimeZone": "USET"
+ }
+}

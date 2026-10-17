@@ -11,10 +11,15 @@ identical category counts (30 / 23 / 31, all from _form_12), including a real
 +$1,620 increase on 3000069. Switch to Edit Mode, the SlickGrid read, the
 price comparison and cancel-and-release all work with no display.
 
+GoCCL JOINED 2026-10-15 (Neon: "you mentioned we can run carnival headless
+this was not implemented in the gui"). It earned it the same way on
+2026-10-12: 7 bookings windowed and headless through /rate -> /category ->
+/review, 308 fields compared, 0 differences.
+
 NOT offered for the others. ESPRESSO can NEVER be headless - Akamai bot
 detection breaks it and scraper/base.py enforces that regardless of any
-argument passed. MSC and GoCCL have simply not been tested this way, and
-offering an untested toggle would be inviting the next silent failure.
+argument passed. MSC has simply not been tested this way, and offering an
+untested toggle would be inviting the next silent failure.
 """
 import os
 
@@ -34,14 +39,19 @@ def qt_app():
     return QApplication.instance() or QApplication([])
 
 
-def test_the_toggle_is_visible_on_ncl(qt_app):
-    panel = CruiseLinePanel(CruiseLine.NCL)
+# PRINCESS proven 2026-10-15 (3 bookings windowed vs headless, 0 differences).
+PROVEN = (CruiseLine.NCL, CruiseLine.GOCCL, CruiseLine.PRINCESS)
+
+
+@pytest.mark.parametrize("line", PROVEN)
+def test_the_toggle_is_visible_on_the_proven_lines(qt_app, line):
+    panel = CruiseLinePanel(line)
     panel.show()
     qt_app.processEvents()
     assert panel.headless_checkbox.isVisible()
 
 
-@pytest.mark.parametrize("line", [c for c in CruiseLine if c is not CruiseLine.NCL])
+@pytest.mark.parametrize("line", [c for c in CruiseLine if c not in PROVEN])
 def test_it_is_hidden_everywhere_else(qt_app, line):
     """ESPRESSO especially: offering a headless choice there would be
     offering something the browser layer will refuse."""
@@ -73,16 +83,22 @@ def test_it_governs_the_scan_not_only_the_login():
     assert "headless_checkbox.isChecked()" in call
 
 
-def test_a_non_ncl_panel_can_never_request_headless():
+def test_an_unproven_panel_can_never_request_headless():
     """Belt and braces: the call site also checks the cruise line, so a
-    stale checked box on another tab cannot leak through."""
+    stale checked box on another tab cannot leak through. Both call sites
+    (Check Login and Start's auto-login) go through the one list."""
     import inspect
 
+    from gui import windows
     from gui.windows import CruiseLinePanel as Panel
 
     src = inspect.getsource(Panel)
-    call = src[src.index("queue_manager.check_login("):][:400]
-    assert "CruiseLine.NCL" in call
+    calls = src.split("queue_manager.check_login(")[1:]
+    assert len(calls) == 2
+    for call in calls:
+        assert "HEADLESS_CAPABLE_LINES" in call[:400]
+    assert set(windows.HEADLESS_CAPABLE_LINES) == set(PROVEN)
+    assert CruiseLine.ESPRESSO not in windows.HEADLESS_CAPABLE_LINES
 
 
 def test_the_service_default_is_still_visible():

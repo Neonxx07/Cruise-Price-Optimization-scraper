@@ -204,12 +204,17 @@ async def test_same_market_reuses_the_live_scraper(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_omitted_market_reuses_whatever_is_live(monkeypatch):
-    """Every pre-existing caller passes no market at all. Those must keep
-    reusing the live session rather than tearing it down."""
+async def test_omitted_market_means_us_never_a_live_canada_session(monkeypatch):
+    """CHANGED 2026-10-16 (was ..._reuses_whatever_is_live). Every GUI caller
+    passes no market. That used to reuse WHATEVER was live - fine while the
+    GUI only ever used US, wrong once the NCL tab runs a Canada pass: the
+    next plain US scan would have reused the CA login and found no US
+    booking. An omitted market now means the default (US): a live US session
+    is still reused without a restart; a live CA one is replaced."""
     from services.booking_service import BookingService
 
     service = BookingService()
+    stops = []
 
     class _FakeNcl:
         cruise_line = CruiseLine.NCL
@@ -222,16 +227,19 @@ async def test_omitted_market_reuses_whatever_is_live(monkeypatch):
             pass
 
         async def stop(self):
-            raise AssertionError("an omitted market must not force a restart")
+            stops.append(self.market)
 
     monkeypatch.setattr(
         service, "_get_scraper",
         lambda cruise_line, market=None: _FakeNcl(market=market),
     )
 
-    a = await service.get_or_create_scraper(CruiseLine.NCL, market="CA")
-    b = await service.get_or_create_scraper(CruiseLine.NCL)
-    assert a is b
+    us = await service.get_or_create_scraper(CruiseLine.NCL)
+    assert await service.get_or_create_scraper(CruiseLine.NCL) is us and stops == []
+    ca = await service.get_or_create_scraper(CruiseLine.NCL, market="CA")
+    assert ca.market == "CA" and stops == ["US"]
+    back = await service.get_or_create_scraper(CruiseLine.NCL)
+    assert back.market == "US" and stops == ["US", "CA"]
 
 
 # ── the new status must be rendered everywhere ───────────────────

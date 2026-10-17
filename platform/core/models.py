@@ -21,6 +21,8 @@ class CruiseLine(str, Enum):
     NCL = "NCL"
     GOCCL = "GOCCL"
     MSC = "MSC"
+    # Princess POLAR Online (via OneSource), added to the GUI 2026-10-15.
+    PRINCESS = "PRINCESS"
 
 
 class BookingStatus(str, Enum):
@@ -69,6 +71,12 @@ class ScanJobStatus(str, Enum):
     COMPLETED = "COMPLETED"
     FAILED = "FAILED"
     STOPPED = "STOPPED"
+    # Ran to the end of its queue but did NOT check every booking it was
+    # given. Added 2026-10-07: job 104 abandoned 318 of 769 bookings to a
+    # dead session and still recorded COMPLETED, which told the suppression
+    # window the list was done and hid the job from resumable_jobs. Both
+    # already keyed off COMPLETED, so naming this honestly fixes both.
+    INCOMPLETE = "INCOMPLETE"
 
 
 # ── Booking Result ──────────────────────────────────────────────
@@ -255,6 +263,10 @@ class MscCheck(BaseModel):
     # group by value_unit before summing, never sum raw estimated_value
     # across mixed check types.
     value_unit: Optional[str] = None
+    # The discount's own rate (e.g. 15.0 for MSVG15W), set by the discount
+    # checks so evaluate_msc_booking can apply the reprice rule (MSC-D1/D2,
+    # msc_discount_beats_current). None = the rate is not known.
+    discount_pct: Optional[float] = None
 
 
 class MscBookingResult(BaseModel):
@@ -270,6 +282,20 @@ class MscBookingResult(BaseModel):
     checks: list[MscCheck] = Field(default_factory=list)
     has_any_opportunity: bool = False
     note: str = ""
+    # The two prices the scan read, shown as Old / New in the GUI (Neon
+    # 2026-10-15: "it is not showing old price and new price"). They were
+    # read all along (data/msc_control/rate_check_data.jsonl) but never
+    # carried here. None = not read - never a fabricated 0.
+    current_total_price: Optional[float] = None    # the booking's own total
+    today_price: Optional[float] = None            # today's, same category
+    due_amount: Optional[float] = None
+    # BEFORE / AFTER discounts (Neon 2026-10-15: save before and after for
+    # every line). before = what the booking holds, as read from its Price
+    # Breakdown ("MSCCLUB5 5%, SPECIAL OFFER 15% 15%"); today = what MSC
+    # offers on the sailing today (catalog codes + dropdown options).
+    # None = not read, "" = read and empty.
+    discounts_before: Optional[str] = None
+    discounts_today: Optional[str] = None
 
     checked_at: datetime = Field(default_factory=datetime.utcnow)
 

@@ -53,6 +53,22 @@ env/
 # and re-admit only the ones that are genuinely source.
 # Trailing wildcards matter: a real file was named
 # `watchlist.txt.bak_2026-08-17`, which ends in neither `.txt` nor `.bak`.
+# Booking-ID lists moved into a subfolder on 2026-10-16, which the rules
+# above (anchored at platform/ root) did not reach -- 877 real booking
+# numbers across 10 files. Ignore the whole directory, wherever it sits.
+# Exported session transcripts. tools/export_session.py is source and is
+# committed; its OUTPUT is a raw conversation dump -- the 2026-10-07 one was
+# 4.2 MB, 76k lines, and carried 794 real booking numbers.
+/platform/docs/sessions/
+**/docs/sessions/
+
+/platform/watchlists/
+**/watchlists/
+
+# Archives can carry anything, including the .pyc of a module whose source
+# is already committed beside it.
+*.zip
+
 /platform/*.txt
 /platform/*.txt.*
 /platform/*.bak*

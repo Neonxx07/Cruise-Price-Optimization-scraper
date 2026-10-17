@@ -12,13 +12,10 @@ from __future__ import annotations
 import keyring
 from keyring.errors import PasswordDeleteError
 
-from config.settings import settings
-
-CRUISE_LINES = {
-    "1": ("MSC", settings.msc_credential_service),
-    "2": ("ESPRESSO (Royal Caribbean / Celebrity)", settings.espresso_credential_service),
-    "3": ("NCL (Norwegian Cruise Line)", settings.ncl_credential_service),
-}
+# The SAME list save_login.py offers. This file used to keep its own copy,
+# which fell behind: NCL Canada, GoCCL and Princess OneSource could be
+# saved but never removed (found 2026-10-15).
+from save_login import CRUISE_LINES
 
 
 def main() -> None:

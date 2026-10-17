@@ -43,6 +43,13 @@ from core.models import BookingStatus
 RAW = pathlib.Path("data/raw_responses.jsonl")
 
 
+# PINNED TO THE CAPTURES THIS TEST WAS WRITTEN AGAINST (2026-10-16). It
+# used to take the NEWEST capture, so every later scan of 3001021 fed it
+# that day's prices - the 2026-10-16 ESPRESSO run turned 48.00 into 38.00.
+# Same fix as test_readd_perk_is_not_free_2026_10_13 (pinned by day).
+CAPTURED_ON_OR_BEFORE = "2026-10-01T23:59:59"
+
+
 def _capture(booking_id: str) -> dict:
     if not RAW.exists():
         pytest.skip("captured corpus not present")
@@ -56,6 +63,8 @@ def _capture(booking_id: str) -> dict:
             except ValueError:
                 continue
             if str(rec.get("booking_id")) != booking_id:
+                continue
+            if str(rec.get("captured_at") or "") > CAPTURED_ON_OR_BEFORE:
                 continue
             payload = rec.get("raw")
             if isinstance(payload, dict) and isinstance(payload.get("result"), dict):

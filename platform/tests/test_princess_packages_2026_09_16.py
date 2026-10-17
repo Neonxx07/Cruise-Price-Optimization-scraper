@@ -107,7 +107,8 @@ def test_the_refusal_explains_itself_in_business_terms():
 
 def test_sphere_class_ships_carry_the_higher_rate():
     """Sun and Star Princess price the packages above the rest of the fleet -
-    $70/$105 rather than $65/$100."""
+    $75/$110 rather than $70/$105 (Princess terms, purchases on or after
+    July 22, 2025; read 2026-10-15)."""
     assert is_sphere_class("SUN") and is_sphere_class("STAR")
     assert not is_sphere_class("CROWN")
     assert not is_sphere_class(None)

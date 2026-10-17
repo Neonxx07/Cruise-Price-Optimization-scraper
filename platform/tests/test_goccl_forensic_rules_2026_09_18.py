@@ -14,7 +14,7 @@ from scraper.goccl import GoCCLScraper
 
 # ── RULE ADV-001: the portal refuses, and says why ───────────────────────
 #
-# EVIDENCE. Four bookings (DEMO09, DEMO52, DEMO51, DEMO49) reached /guest and
+# EVIDENCE. Four bookings (DEMO09, DEMO20, DEMO19, DEMO16) reached /guest and
 # then timed out after 30s "waiting for section.rate__container". The DOM gave
 # no clue - the Change Offer/Rate control is byte-identical to a working
 # booking's and is not disabled. Capturing RESPONSE BODIES showed the reason:
@@ -75,8 +75,8 @@ def test_multiple_advisories_are_all_reported():
 # ── RULE PAY-001: a settled booking is not an opportunity ────────────────
 #
 # EVIDENCE. 6 of the 14 bookings surveyed were already settled
-# (netBalanceDue == 0): MZ81K0, MZ81X2, DEMO54, DEMO55, DEMO48, DEMO56. Two
-# were PAST their final payment date (DEMO54 8/23/2026, DEMO56 8/11/2026).
+# (netBalanceDue == 0): MZ81K0, MZ81X2, DEMO35, DEMO37, DEMO14, DEMO38. Two
+# were PAST their final payment date (DEMO35 8/23/2026, DEMO38 8/11/2026).
 # Every one had a working rate screen, so the scanner would have produced a
 # confident saving on a fully-paid booking.
 #
@@ -90,18 +90,18 @@ def test_paid_in_full_is_an_existing_status_not_a_new_one():
 
 
 @pytest.mark.parametrize("net_balance,settled", [
-    (0.0, True),        # DEMO54, MZ81K0, MZ81X2, DEMO55, DEMO48, DEMO56
+    (0.0, True),        # DEMO35, MZ81K0, MZ81X2, DEMO37, DEMO14, DEMO38
     (0.01, True),       # tolerance, matching the rest of the project
     (51.00, False),
-    (1187.40, False),   # DEMO49
-    (1575.50, False),   # DEMO52 / DEMO51
+    (1187.40, False),   # DEMO16
+    (1575.50, False),   # DEMO20 / DEMO19
 ])
 def test_the_settled_test_is_net_balance_due(net_balance, settled):
     assert (net_balance <= 0.01) is settled
 
 
 def test_balance_is_never_derived_as_gross_minus_paid():
-    """RULE PAY-002. On DEMO55 the two disagree:
+    """RULE PAY-002. On DEMO37 the two disagree:
         gross 1,987.31 - paid 1,766.81 = 220.50
         balanceDue                      =  51.00
         netBalanceDue                   =   0.00   (= net 1,766.81 - paid)
@@ -185,7 +185,7 @@ def test_an_empty_advisory_summary_yields_no_advisories():
 
 # ── the real state machine, as observed ──────────────────────────────────
 #
-# EVIDENCE: a full millisecond timeline of DEMO59 showed FIVE wizard steps,
+# EVIDENCE: a full millisecond timeline of DEMO42 showed FIVE wizard steps,
 # not four, each with its own availability endpoint:
 #
 #   /guest      guest-services
@@ -202,14 +202,14 @@ def test_an_empty_advisory_summary_yields_no_advisories():
 def test_the_wizard_has_a_stateroom_step_between_category_and_review():
     """Discovered by walking it. An earlier map went straight from
     /category to /review because the booking observed then could keep its
-    cabin; DEMO59 cannot, and must pass through /stateroom."""
+    cabin; DEMO42 cannot, and must pass through /stateroom."""
     observed = ["guest", "rate", "category", "stateroom", "review"]
     assert observed.index("stateroom") == observed.index("category") + 1
     assert observed.index("review") == observed.index("stateroom") + 1
 
 
 def test_keep_same_stateroom_is_conditional_not_guaranteed():
-    """On DEMO59 'Keep Same Stateroom' stayed DISABLED for a full 15s after
+    """On DEMO42 'Keep Same Stateroom' stayed DISABLED for a full 15s after
     the booking's own category (8A) was selected, while 'Continue' was
     enabled. So the same cabin cannot always be retained under a new rate,
     and a scraper that waits for that button will hang on such bookings."""
@@ -220,7 +220,7 @@ def test_keep_same_stateroom_is_conditional_not_guaranteed():
 
 
 def test_the_tile_price_is_not_a_strict_minimum():
-    """DEMO59: the OB7 BALCONY tile advertised 1,265.00 per person, but the
+    """DEMO42: the OB7 BALCONY tile advertised 1,265.00 per person, but the
     booking's own category 8A priced at 1,264 on /category - BELOW the
     "From" figure. So the tile is a display figure, not a floor, and must
     not be used to bound or sanity-check the category price."""

@@ -17,7 +17,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from main import _run_login_check, _run_scan, _run_watch  # noqa: E402
 
-WATCHLIST = "watchlist.txt"
+WATCHLIST = "watchlists/watchlist.txt"
 REPORTS_DIR = Path("reports")
 DATA_DIR = Path("data")
 

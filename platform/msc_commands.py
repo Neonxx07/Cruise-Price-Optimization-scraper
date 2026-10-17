@@ -29,6 +29,9 @@ Commands (one per line in data/msc_control/command.txt):
   lookup_booking:<id>        - read-only: open one booking, capture its
                                 summary + Price Breakdown text, append to
                                 data/msc_control/booking_data.jsonl
+  scan_passengers:<id>       - read-only passenger capture with an unedited
+                                booking-page screenshot; appends to the same
+                                booking-data corpus
   batch_lookup:<id1,id2,...> - same as lookup_booking, looped over a
                                 comma-separated list; one failure doesn't
                                 stop the rest
@@ -298,11 +301,13 @@ async def _read_booking_status_badge(page):
         return None
 
 
-async def _lookup_one_booking(page, booking_id: str) -> dict:
+async def _lookup_one_booking(page, booking_id: str,
+                              screenshot_path: str | None = None) -> dict:
     """Read-only: open a booking, capture its summary text and (if
     reachable) its itemized Price Breakdown. Never touches Categories/
     cabin selection/discounts — purely a lookup, safe to loop over many
-    bookings unattended.
+    bookings unattended. When requested by the passenger-scan command,
+    capture the verified passenger page before opening Price Breakdown.
 
     CONFIRMED REAL BUG, 2026-08-11: this function had NO session-expiry
     detection at all — a real session kick mid-batch ("Generic Error...
@@ -373,6 +378,19 @@ async def _lookup_one_booking(page, booking_id: str) -> dict:
         or "login" in page.url.lower()
     ):
         return {"booking_id": booking_id, "captured_at": datetime.now().isoformat(), "session_expired": True}
+
+    passenger_info = _extract_passengers(summary_text)
+    if screenshot_path:
+        if not passenger_info["passengers"]:
+            raise RuntimeError(
+                "No passengers could be verified from the booking page; "
+                "refusing to save a passenger-scan screenshot."
+            )
+        form_details = await _read_passenger_form_details(page)
+        _attach_verified_passenger_form_details(
+            passenger_info["passengers"], form_details
+        )
+        await page.screenshot(path=screenshot_path, full_page=True)
 
     breakdown_text = None
     try:
@@ -445,7 +463,6 @@ async def _lookup_one_booking(page, booking_id: str) -> dict:
         logger.warning("msc.breakdown_read_failed", error=str(e))
         breakdown_text = None
 
-    passenger_info = _extract_passengers(summary_text)
     # Structural, DOM-based confirmation of booking status — see
     # _read_booking_status_badge's docstring for why the CSS class alone
     # ('StatusConfirmed', even when canceled) can't be trusted and only
@@ -862,6 +879,77 @@ def _extract_passengers(text: str) -> dict:
         "senior_count": sum(1 for p in passengers if p["age"] >= 65),
         "has_voyagers": any(p["voyagers_number"] for p in passengers),
     }
+
+
+async def _read_passenger_form_details(page) -> list[dict]:
+    """Read only the verified passenger form fields in the loaded booking.
+
+    These IDs and labels were confirmed live on booking 3001060:
+    user-1-1-first-name, user-1-1-last-name, user-1-1-title,
+    user-1-1-birth-date, gender-1-1, and user-1-1-state-province.
+    """
+    return await page.evaluate(
+        """(() => Array.from(document.querySelectorAll(
+            'input[id^="user-"][id$="-first-name"]'
+        )).map(first => {
+            const prefix = first.id.slice(0, -"first-name".length);
+            const index = prefix.match(/^user-(\\d+-\\d+-)$/);
+            if (!index) return null;
+            const field = suffix => document.getElementById(prefix + suffix);
+            const state = field("state-province");
+            const option = state && state.selectedIndex >= 0
+                ? state.options[state.selectedIndex] : null;
+            const gender = document.querySelector(
+                'input[name="gender-' + index[1].slice(0, -1) + '"]:checked'
+            );
+            return {
+                first_name: first.value.trim(),
+                last_name: (field("last-name") || {}).value?.trim() || "",
+                title: (field("title") || {}).value?.trim() || "",
+                gender: gender ? gender.value.trim().toUpperCase() : "",
+                dob: (field("birth-date") || {}).value?.trim() || "",
+                state_code: state ? state.value.trim() : "",
+                state_label: option ? option.textContent.trim() : ""
+            };
+        }).filter(Boolean))()"""
+    )
+
+
+def _attach_verified_passenger_form_details(
+    passengers: list[dict], details: list[dict]
+) -> None:
+    """Attach form-only fields only when name and DOB match the summary."""
+    for passenger, detail in zip(passengers, details):
+        summary_name = " ".join(str(passenger.get("name", "")).split()).casefold()
+        form_name = " ".join(
+            f"{detail.get('first_name', '')} {detail.get('last_name', '')}".split()
+        ).casefold()
+        if summary_name != form_name:
+            continue
+
+        try:
+            summary_dob = datetime.strptime(passenger["dob"], "%m/%d/%Y").date()
+            form_dob = datetime.strptime(detail.get("dob", ""), "%m/%d/%Y").date()
+        except (KeyError, TypeError, ValueError):
+            continue
+        if summary_dob != form_dob:
+            continue
+
+        state_code = str(detail.get("state_code", "")).strip()
+        state_label = str(detail.get("state_label", "")).strip()
+        title = re.sub(r"[^A-Z]", "", str(detail.get("title", "")).upper())
+        gender = str(detail.get("gender", "")).strip().upper()
+        if title and gender in {"F", "M"} and state_code and state_label:
+            state = state_label.title()
+            state = re.sub(r"\bOf\b", "of", state)
+            passenger.update({
+                "first_name": str(detail["first_name"]).strip(),
+                "last_name": str(detail["last_name"]).strip(),
+                "title": title,
+                "gender": gender,
+                "state_of_residency": state,
+                "state_code": state_code,
+            })
 
 
 def _compute_required_occupancy(passengers: list) -> dict:
@@ -3819,6 +3907,32 @@ async def run_command(state: dict, command: str) -> str:
             f.write(json.dumps(data, ensure_ascii=False) + "\n")
         preview = (data["summary_text"] or "")[:800]
         return f"saved booking {booking_id} to {BOOKING_DATA_PATH}\n---\n{preview}"
+
+    if command.startswith("scan_passengers:"):
+        booking_id = command[len("scan_passengers:"):].strip()
+        if not is_valid_msc_booking_id(booking_id):
+            raise ValueError("MSC booking ID must be 6-9 digits.")
+        os.makedirs(SCREENSHOT_DIR, exist_ok=True)
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        screenshot_path = os.path.join(
+            SCREENSHOT_DIR, f"passengers_{booking_id}_{stamp}.png"
+        )
+        data = await _lookup_one_booking(
+            page, booking_id, screenshot_path=screenshot_path
+        )
+        if data.get("session_expired"):
+            return (
+                f"ERROR: MSC session expired; no passenger scan was saved "
+                f"for booking {booking_id}."
+            )
+        os.makedirs(os.path.dirname(BOOKING_DATA_PATH), exist_ok=True)
+        with open(BOOKING_DATA_PATH, "a", encoding="utf-8") as f:
+            f.write(json.dumps(data, ensure_ascii=False) + "\n")
+        passenger_count = len(data["passengers"])
+        return (
+            f"saved {passenger_count} passenger(s) for booking {booking_id} "
+            f"to {BOOKING_DATA_PATH}; booking screenshot: {screenshot_path}"
+        )
 
     if command.startswith("batch_lookup:"):
         ids = [b.strip() for b in command[len("batch_lookup:"):].split(",")

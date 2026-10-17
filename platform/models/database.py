@@ -326,6 +326,16 @@ class MscResultRecord(Base):
     is_paid_in_full = Column(Boolean, default=False)
     has_any_opportunity = Column(Boolean, default=False, index=True)
 
+    # ADDED 2026-10-15 (Neon: "it is not showing old price and new
+    # price"). Read on every scan, never stored until now. NULL on older
+    # rows = not recorded, never 0.
+    current_total_price = Column(Float, nullable=True)
+    today_price = Column(Float, nullable=True)
+    due_amount = Column(Float, nullable=True)
+    # Discounts BEFORE (held) and offered TODAY, 2026-10-15. NULL = not read.
+    discounts_before = Column(Text, nullable=True)
+    discounts_today = Column(Text, nullable=True)
+
     # Comma-separated opportunity types, for querying without parsing the
     # JSON ("PRICE_MATCH,DISCOUNT_ADD"). "" when there are none.
     opportunity_types = Column(String(200), default="")

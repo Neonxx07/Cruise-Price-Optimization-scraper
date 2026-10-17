@@ -97,11 +97,29 @@ class PackageValue:
     note: str
 
 
-#: 2026 per-guest-per-day rates. Sphere-class ships (Sun Princess, Star
-#: Princess) are priced higher than the rest of the fleet.
-_PER_DAY_2026 = {
-    PLUS: {"standard": 65.0, "sphere": 70.0},
-    PREMIER: {"standard": 100.0, "sphere": 105.0},
+#: Per-guest-per-day PRE-CRUISE rates (bought at least 96 hours before
+#: departure), from Princess's own terms page, read 2026-10-15: "purchased on or
+#: after July 22, 2025" - Plus $70 ($75 on Sun or Star Princess), Premier $105
+#: ($110). Onboard, or inside 96 hours, is $5 more per person per day. The
+#: September figures ($65/$100) were the older rates. Sphere-class ships (Sun
+#: Princess, Star Princess) are priced higher than the rest of the fleet.
+#:
+#: Rules from the same pages, recorded because they decide what a refare can
+#: lose (Neon 2026-10-15: "google this very well and its rules"):
+#:   * Packages apply to guests 1 and 2; guests 3 and 4 may opt in, but only to
+#:     the SAME package as guests 1 and 2.
+#:   * Plus -> Premier: pay the difference "based on the original package
+#:     price" - what a guest paid is fixed at purchase, so a refare that
+#:     re-buys the package can cost more than the old purchase did.
+#:   * Packages bought before July 22, 2025 keep their older benefits.
+#:   * "May not be combinable with other offers"; "contingent on ship capacity".
+#:   * Premier's shore-excursion credit ($100 for 6-9 days, $200 for 10-20,
+#:     $300 for 21+) and dining credits are forfeited at voyage end and are
+#:     not cash - the OBC rule applies to them.
+#:   * Crew appreciation inside a package cannot be removed or refunded.
+_PER_DAY = {
+    PLUS: {"standard": 70.0, "sphere": 75.0},
+    PREMIER: {"standard": 105.0, "sphere": 110.0},
 }
 
 #: Ships on which the higher Sphere-class rate applies.
@@ -152,7 +170,7 @@ def package_value(tier: str | None, nights: int | None,
             "Sanctuary Club, Sanctuary Restaurant and priority dining. Sun and "
             "Star Princess only, and very limited inventory, so it is never a "
             "like-for-like swap for an ordinary cabin")
-    rates = _PER_DAY_2026.get(tier)
+    rates = _PER_DAY.get(tier)
     if not rates or not nights:
         return PackageValue(tier, None, nights, None,
                             f"{tier} package - voyage length unknown, so its "
@@ -160,7 +178,7 @@ def package_value(tier: str | None, nights: int | None,
     per_day = rates["sphere" if is_sphere_class(ship_code) else "standard"]
     return PackageValue(
         tier, per_day, nights, round(per_day * nights, 2),
-        f"{tier} package at 2026 list rates is about ${per_day:.0f} per guest "
+        f"{tier} package at current pre-cruise list rates is about ${per_day:.0f} per guest "
         f"per day, roughly ${per_day * nights:,.0f} over {nights} nights")
 
 

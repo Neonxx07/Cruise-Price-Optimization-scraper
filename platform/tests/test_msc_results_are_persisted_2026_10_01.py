@@ -61,7 +61,8 @@ def _outcome(booking_id="3000026", status="checked", **kwargs):
     checks = kwargs.pop("checks", None)
     if status != "checked":
         return MscCheckOutcome(booking_id=booking_id, status=status,
-                               note=kwargs.get("note", ""))
+                               note=kwargs.get("note", ""),
+                               status_match=kwargs.get("status_match"))
     result = MscBookingResult(
         booking_id=booking_id,
         category=kwargs.get("category", "IB"),
@@ -71,7 +72,8 @@ def _outcome(booking_id="3000026", status="checked", **kwargs):
         cancelled_or_postponed=kwargs.get("cancelled_or_postponed", False),
     )
     return MscCheckOutcome(booking_id=booking_id, status="checked",
-                           result=result, note=kwargs.get("note", ""))
+                           result=result, note=kwargs.get("note", ""),
+                           status_match=kwargs.get("status_match"))
 
 
 # -- it gets written at all --------------------------------------------
@@ -106,6 +108,23 @@ async def test_an_errored_booking_is_stored(db):
     rows = await _rows(db)
     assert rows[0].status == "error"
     assert "session expired" in rows[0].note
+
+
+@pytest.mark.asyncio
+async def test_status_match_verdict_and_reason_are_persisted_with_the_scan(db):
+    await persist_outcome(_outcome(
+        note="no opportunity found",
+        status_match={
+            "verdict": "NOT_ELIGIBLE",
+            "reason": "discount applied: MSCCLUB5 5.0%",
+        },
+    ))
+
+    row = (await _rows(db))[0]
+    assert row.note.startswith(
+        "STATUS MATCH: NOT_ELIGIBLE - discount applied: MSCCLUB5 5.0%"
+    )
+    assert "no opportunity found" in row.note
 
 
 # -- fidelity: the four checks survive whole ---------------------------

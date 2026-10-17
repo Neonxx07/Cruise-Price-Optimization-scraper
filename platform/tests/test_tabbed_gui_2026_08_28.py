@@ -103,7 +103,16 @@ def test_login_confirmation_is_per_line(win):
 
 def test_footer_totals_span_every_tab(win):
     """Money found on a hidden tab must still appear in the footer -
-    otherwise switching tabs hides results."""
+    otherwise switching tabs hides results.
+
+    UPDATED 2026-10-07 for currency. These two results carry NO currency,
+    and the footer no longer prints a "$" in front of money whose currency
+    was never established - 35 CAD optimizations had been adding Canadian
+    dollars to a figure labelled in US ones. The assertion below pins what
+    this test is actually about (both tabs are in the total) rather than
+    the currency symbol, which has its own tests in
+    test_savings_by_currency_2026_10_07.py.
+    """
     for line, net in ((CruiseLine.NCL, 112.0), (CruiseLine.ESPRESSO, 60.0)):
         panel = win.panels[line]
         r = BookingResult(booking_id=f"X{line.value}", cruise_line=line,
@@ -114,8 +123,22 @@ def test_footer_totals_span_every_tab(win):
         panel._refresh_summary()
 
     footer = win.global_summary_label.text()
-    assert "$172.00" in footer, f"footer did not total both lines: {footer}"
+    assert "172.00" in footer, f"footer did not total both lines: {footer}"
     assert "2 optimization(s)" in footer
+
+
+def test_footer_totals_in_dollars_when_the_currency_is_known(win):
+    """And the ordinary case is unchanged: a known USD total still reads
+    with a dollar sign, so this fix cost the common case nothing."""
+    for line, net in ((CruiseLine.NCL, 112.0), (CruiseLine.ESPRESSO, 60.0)):
+        panel = win.panels[line]
+        r = BookingResult(booking_id=f"Y{line.value}", cruise_line=line,
+                          status=BookingStatus.OPTIMIZATION,
+                          net_saving=net, confidence=5, currency="USD")
+        panel.results.append(r)
+        panel._refresh_summary()
+
+    assert "$172.00" in win.global_summary_label.text()
 
 
 def test_footer_flags_unconfirmed_separately(win):
@@ -155,11 +178,24 @@ def test_shutdown_covers_every_panel(win):
             closed.append(_line)
         panel.shutdown = _fake
 
+    # NEVER LET THE REAL BACKSTOP FIRE INSIDE PYTEST. Found 2026-10-15:
+    # _shutdown_all arms a 3-second threading.Timer that calls os._exit(0).
+    # This test armed the real one, so 3 s later the WHOLE pytest process
+    # exited with code 0 and no summary - every "second half" run of the
+    # suite ended at ~97% with no result line, and earlier runs were left
+    # hanging. The Timer resolves self._force_exit when it is armed, so an
+    # instance attribute set first is what it calls.
+    fired = []
+    win._force_exit = lambda: fired.append(True)
+
     loop = asyncio.new_event_loop()
     try:
         loop.run_until_complete(win._shutdown_all())
     finally:
         loop.close()
+        timer = getattr(win, "_exit_timer", None)
+        if timer is not None:
+            timer.cancel()
     assert set(closed) == set(CruiseLine), f"only shut down {closed}"
 
 

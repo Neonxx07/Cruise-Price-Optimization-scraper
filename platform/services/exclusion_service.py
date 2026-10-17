@@ -111,14 +111,30 @@ class ExclusionService:
                                   total_price: float | None,
                                   final_payment_due: float | None,
                                   payment_state_readable: bool,
-                                  currency: str | None = None) -> bool:
+                                  currency: str | None = None,
+                                  booking_status: str | None = None) -> bool:
         """Permanently exclude a CONFIRMED paid-in-full booking.
 
         Returns True only if an exclusion was written. Every refusal is
         logged with its reason, because a booking that should have been
         excluded and was not is merely wasteful - while one excluded on
         thin evidence is invisible for ever.
+
+        `booking_status`, when the portal states one, must be an ordinary
+        live reservation. Added 2026-10-07 with NCL's first exclusions:
+        NCL labels reservations BOOKED / CLOSED / TERMINATED / CANCELED,
+        and a reservation that is not BOOKED has no balance - so it looks
+        paid in full to every figure-based test there is. Making that
+        permanent is unrecoverable, and this project has already made the
+        mistake once (ESPRESSO filed CX bookings as PAID_IN_FULL). CLOSED
+        and TERMINATED are not interpreted here, only refused: what they
+        mean is still an open question for Neon.
         """
+        if booking_status and booking_status.strip().upper() != "BOOKED":
+            logger.info("exclusion.refused", booking_id=booking_id,
+                        reason="portal_status_not_booked",
+                        portal_status=booking_status)
+            return False
         if not payment_state_readable:
             # The single most important guard. Unreadable is not zero.
             logger.info("exclusion.refused", booking_id=booking_id,

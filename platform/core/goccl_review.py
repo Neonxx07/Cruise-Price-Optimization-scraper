@@ -58,6 +58,14 @@ GROSS = "GRSS"
 
 ADMIN_FEE = "ADMN"
 NET_OBC = "NOBC"
+#: "TARGETED FUNPLAY AMOUNT" - casino FunPlay CREDIT on casino offers (FZD
+#: Perfect Balance $100 on DEMO20, FSA Players Club FunMatch $50 on DEMO16,
+#: both Neon's reviews 2026-10-13/15). Listed among the invoice lines but
+#: OUTSIDE GRSS: DEMO16 FSA = CNRF 369.50 + GTFE 158.50 = 528.00 = GRSS,
+#: with TFPA 50.00 beside it. Not under Perks either (the Perks box showed
+#: only the $200 onboard credit), so it is kept separate from OBC. It is
+#: never cash: never added to a price, never to a saving.
+FUNPLAY = "TFPA"
 
 #: Codes seen in real responses so far. NOT used to decide arithmetic - the
 #: isIndented flag does that - only to report drift when an unfamiliar code
@@ -102,13 +110,26 @@ class ReviewInvoice:
     indented: set[str] = field(default_factory=set)
     net_balance_due: Decimal | None = None
     balance_due: Decimal | None = None
+    #: Payment dates, ISO "2027-06-21". final_due = finalPaymentDueDate;
+    #: next_due = closestPaymentDueBy, the next payment of any kind - equal
+    #: to final_due when no deposit is pending (DEMO11, DEMO08).
+    final_due: str | None = None
+    next_due: str | None = None
+    #: A "Deposit" line in the /review page's Payment Schedule (read from
+    #: the page by the scraper; None = not looked at).
+    deposit_on_review: bool | None = None
     warnings: list[str] = field(default_factory=list)
 
     @property
     def line_codes(self) -> list[str]:
         """Invoice line codes only - commission and perks are not addends."""
         return [c for c in self.items
-                if c not in (COMMISSION, ONBOARD_CREDIT, NET_OBC)]
+                if c not in (COMMISSION, ONBOARD_CREDIT, NET_OBC, FUNPLAY)]
+
+    @property
+    def funplay(self) -> Decimal:
+        """Casino FunPlay credit (TFPA); 0 when the invoice has none."""
+        return self.items.get(FUNPLAY, Decimal("0"))
 
     @property
     def cruise_rate(self) -> Decimal | None:
@@ -187,7 +208,7 @@ def parse_review_changes(body: dict | None) -> ReviewInvoice:
                 # subtotal above it, so the figures that actually add up to
                 # GRSS are the NON-indented ones. Verified on two bookings:
                 #   DEMO11  CNRF 1224.46 + GTFE 327.54            = 1552.00
-                #   DEMO57  CNRF 2736.42 + GTFE 239.58 + ADMN 100 = 3076.00
+                #   DEMO39  CNRF 2736.42 + GTFE 239.58 + ADMN 100 = 3076.00
                 # while the indented CRUS/PTCH/RCFE are what CNRF is made
                 # of. Reading the flag instead of hardcoding a code list is
                 # what let ADMN "Administrative Fee" - a code never seen
@@ -228,6 +249,15 @@ def parse_review_changes(body: dict | None) -> ReviewInvoice:
     if isinstance(schedule, dict):
         inv.net_balance_due = money({"price": schedule.get("netBalanceDue")})
         inv.balance_due = money({"price": schedule.get("balanceDue")})
+        for attr, key in (("final_due", "finalPaymentDueDate"),
+                          ("next_due", "closestPaymentDueBy")):
+            node = schedule.get(key)
+            if isinstance(node, dict) and node.get("iso8601"):
+                setattr(inv, attr, str(node["iso8601"])[:10])
+        if inv.final_due is None:
+            inv.warnings.append("no finalPaymentDueDate - PAYMENT_SCHEDULE_UNVERIFIED")
+    # A body with no schedule at all leaves final_due None; apply_goccl_review
+    # refuses to confirm on that, so the safety does not depend on a warning.
 
     return inv
 

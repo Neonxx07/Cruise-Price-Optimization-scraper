@@ -56,6 +56,65 @@ checked.
 | **MSC-D6** | The promotional slot holds **one** discount — *"u can choose between one only i usually choose whatever is higher"*. Pick the highest; never sum | Neon |
 | **MSC-D7** | `MSCCLUB5` (5% loyalty) is a **separate slot** and stacks with the promotional one | evidence, 13 bookings |
 | **MSC-D8** | A **purchased** `OBS` line sits inside the booking total; subtract it before comparing against a cabin-only quote | evidence, 12 bookings |
+| **MSC-D9** | A **Voyagers discount cannot be applied on top of a military discount** — not the Club 5% (`MSCCLUB5`), not Voyagers Selection, not Voyagers Exclusives. Therefore a military booking **cannot be status-matched**: the match's whole value is a Voyagers tier discount | Neon, 2026-10-08 |
+| **MSC-D10** | A military discount may be **swapped** for a higher discount **only if a passenger has an MSC Voyagers Club membership** — *"if not then do not allow that at all"* | Neon, 2026-10-08 |
+
+### MSC-D9 — the military discount
+
+**How it appears.** A named line at the bottom of the booking page:
+
+```
+Discount Description: MIL-CIV-IL-DSCNT-05% - Discount Type: Percentage - Discount Rate: 5.0%
+```
+
+Seen at 5% (3001062) and 10% (3001058). Identified by `MIL-CIV` or
+`MILITARY` in the label — `core/calculator_msc.is_military_label`. The SRN
+line agrees: 3001062 shows $172.90 = $182.00 × 0.95 on a 7-night sailing.
+
+**What the automation does with it.**
+
+| Where | Behaviour |
+|---|---|
+| Price scan, `DISCOUNT_ADD` | `NO_OPPORTUNITY`, citing MSC-D9 — checked before the Group Rate branch, which would otherwise offer the Club 5% on top |
+| Price scan, `VOYAGERS_SELECTION` | `NO_OPPORTUNITY`, citing MSC-D9 |
+| Price scan, `DISCOUNT_TIER_UPGRADE` | swap offered only with a Voyagers member aboard, else `NO_OPPORTUNITY` citing MSC-D10 |
+| Price scan result note | starts `MILITARY DISCOUNT APPLIED - …` |
+| GUI MSC batch | `msc.military_discount` logged per booking |
+| Status-match flag | `NOT_ELIGIBLE - no status match: military discount applied …` |
+
+**The false positive it ends.** 3001058 (`MIL-CIV-IL-DSCNT-10%`, Voyagers
+members aboard) was reported in `live_check_results.jsonl` as
+`VOYAGERS_SELECTION: OPPORTUNITY — MSVG10W (10%) … confirmed to stack with
+the base 5% Club discount`. `_check_voyagers_selection` only treated
+`SPECIAL OFFER` / `VOYAGERS EXCLUSIV` as already applied, so a military
+line cleared every guard.
+
+### Status-match eligibility — the booking must be clean
+
+The MSC GUI shows a booking as `STATUS MATCH: ELIGIBLE` only when the capture
+proves that no passenger is already an MSC Voyagers member and no discount is
+applied. **Any** captured current discount blocks status matching, not only
+military or Voyagers discounts. Silent discounts (senior and Voyagers
+Exclusive) are checked through the SRN reference; if the capture cannot prove
+they are absent, the GUI says `CHECK_MANUALLY`, never `ELIGIBLE`. Expired or
+malformed captures are likewise not eligible. This rule is evaluated by
+`core/msc_status_match.py` and displayed in the MSC results row's Note.
+The separate MSC consumer application and its required fields/data gaps are
+documented in [MSC_STATUS_MATCH_FORM.md](../MSC_Status_Match_Toolkit/MSC_STATUS_MATCH_FORM.md)
+with its non-submitting helper. Booking eligibility is not approval for that
+application.
+
+**Separate, older rule.** CruiseIntel never *recommends* adding a military
+discount (Neon 2026-08-11, `_filter_out_disallowed_discounts`). MSC-D9 is
+about one already on the booking.
+
+**Swapping military out — MSC-D10.** `DISCOUNT_TIER_UPGRADE` suggests
+replacing a military discount with a higher one **only when a passenger is
+a Voyagers Club member**, and its note says the swap REPLACES military.
+With no member — or a passenger list that was not read — it returns
+`NO_OPPORTUNITY` citing MSC-D10. So 3001058 (members aboard) may be
+offered a swap; 3001062 (no members) never is. Non-military upgrades are
+unaffected.
 
 ---
 
@@ -223,6 +282,7 @@ promotional** discount (SPECIAL OFFER / SENIOR / VOYAGERS). Neon's "one only"
 governs the promotional slot — confirmed, never once violated.
 
 ## 10. Still open
+
 
 - Arithmetic proof of multiplicative stacking for club + special offer
   (needs one booking captured with its pre-discount base showing).

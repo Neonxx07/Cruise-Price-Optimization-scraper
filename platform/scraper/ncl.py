@@ -29,11 +29,12 @@ from config.settings import settings
 from core.calculator import (
     calculate_ncl,
     is_paid_in_full,
+    make_cancelled_result,
     make_error_result,
     make_not_on_this_account_result,
     make_paid_in_full_result,
 )
-from core.models import BookingResult, CruiseLine
+from core.models import BookingResult, BookingStatus, CruiseLine
 from utils.logging import get_logger
 
 from .base import BaseScraper, is_dead_browser_error
@@ -235,9 +236,16 @@ class NclScraper(BaseScraper):
         BaseScraper._storage_state_path). The default market keeps the
         original filename so an existing saved session is not orphaned."""
         path = super()._storage_state_path()
-        if path is None or self.market == settings.ncl_default_market.upper():
+        if path is None:
             return path
-        return path.replace(".json", f"_{self.market.lower()}.json")
+        if self.market != settings.ncl_default_market.upper():
+            path = path.replace(".json", f"_{self.market.lower()}.json")
+        # A parallel worker's OWN session file (2026-10-16): three workers
+        # sharing one file would share - and overwrite - one NCL session.
+        slot = getattr(self, "session_slot", None)
+        if slot:
+            path = path.replace(".json", f"_{slot}.json")
+        return path
 
     def _install_dialog_handler(self) -> None:
         """Install ONE persistent dialog handler for the whole session.
@@ -465,6 +473,37 @@ class NclScraper(BaseScraper):
             logger.warning("ncl.auto_login", result="ERROR", error=str(e))
             return f"ERROR: {e}"
 
+    async def _open_booking_for_viewing(self, booking_id: str) -> None:
+        """Open in portal (GUI button): search page, then the scan's own
+        _search_booking, and nothing after.
+
+        Dialogs on this tab: a `beforeunload` is the person navigating
+        away, so it is accepted (left alone, Playwright DISMISSES it and
+        the navigation silently fails - see _install_dialog_handler).
+        Everything else is dismissed, which is Playwright's default anyway:
+        auto-ACCEPTING a confirm the person never saw could change a real
+        booking."""
+        async def _on_dialog(dialog):
+            try:
+                if dialog.type == "beforeunload":
+                    await dialog.accept()
+                else:
+                    logger.warning("ncl.viewing_dialog_dismissed",
+                                   dialog_type=dialog.type,
+                                   message=(dialog.message or "")[:120])
+                    await dialog.dismiss()
+            except Exception as exc:
+                logger.warning("ncl.viewing_dialog_error", error=str(exc)[:200])
+        self.page.on("dialog", _on_dialog)
+
+        await self.navigate(settings.ncl_search_url)
+        try:
+            await self.wait_for("#SWXMLForm_SearchReservation_ResID", timeout=15000)
+        except Exception:
+            raise RuntimeError("NCL search page did not load - is the session "
+                               "logged in? Press Check login") from None
+        await self._search_booking(booking_id)
+
     async def _search_booking(self, booking_id: str) -> None:
         """Submit booking ID on the SeaWeb search page.
 
@@ -621,6 +660,13 @@ class NclScraper(BaseScraper):
         if result is None:
             logger.warning("ncl.addon_scrape_failed")
             self.log_action("addon_scrape_failed")
+            return None
+        # NO TABLE IS "NONE" ONLY ON A REAL SUMMARY PAGE (2026-10-16). Read
+        # off a page that has not finished loading, [] made every add-on
+        # look lost (3001044). Off the summary, it is "could not read".
+        if not result and not await self._on_reservation_summary():
+            logger.warning("ncl.addon_scrape_not_on_summary", url=(self.page.url or "")[:100])
+            self.log_action("addon_scrape_failed", reason="not on Reservation Summary")
             return None
         return result
 
@@ -1276,6 +1322,47 @@ class NclScraper(BaseScraper):
         else:
             logger.warning("ncl.stateroom_apply_button_not_found")
 
+    async def _recheck_if_everything_lost(self, before, after):
+        """THIRD GUARD (2026-10-16, Neon: "make sure that this is fixed
+        forever"). If EVERY add-on the booking had reads as lost after a
+        same-category re-price, it is almost certainly a bad read, not a real
+        loss: 5 bookings of one group (3001044/58/70/83/97) were false TRAPs
+        that way, every Wi-Fi, photo package and credit "lost". Re-read once;
+        if it still says everything is gone, return None ("could not read")
+        so no loss is priced from it - never a confident TRAP."""
+        if not before or after is None:
+            return after
+        from core.calculator import ncl_lost_addons
+        distinct_before = len(ncl_lost_addons(before, []))
+        if distinct_before < 2 or len(ncl_lost_addons(before, after)) < distinct_before:
+            return after
+        logger.warning("ncl.addons_all_lost_rechecking", before=distinct_before, after=len(after))
+        await asyncio.sleep(2)
+        await self._on_reservation_summary(timeout_s=10)
+        again = await self._scrape_addons()
+        if again is not None and len(ncl_lost_addons(before, again)) < distinct_before:
+            logger.info("ncl.addons_recheck_recovered", after=len(again))
+            return again
+        logger.warning("ncl.addons_all_lost_treated_unreadable", before=distinct_before)
+        self.log_action("addon_scrape_failed", reason="every add-on read as lost - treated as a bad read")
+        return None
+
+    async def _on_reservation_summary(self, timeout_s: float = 0) -> bool:
+        """Is the Reservation Summary page really loaded? Its own <h2> and
+        the /summary/ address (HAR of 3001047, 2026-10-16)."""
+        for _ in range(max(1, int(timeout_s * 2))):
+            try:
+                ok = "/summary" in (self.page.url or "") and await self.page.evaluate(
+                    "() => [...document.querySelectorAll('h2')].some("
+                    "h => h.textContent.trim() === 'Reservation Summary')")
+            except Exception:
+                ok = False
+            if ok:
+                return True
+            if timeout_s:
+                await asyncio.sleep(0.5)
+        return False
+
     async def _goto_reservation_summary_and_read_warning(self) -> str | None:
         """Navigate to the Reservation Summary tab and capture NCL's own
         OBC/amenity-drop warning banner text, if present.
@@ -1300,10 +1387,18 @@ class NclScraper(BaseScraper):
                 if (link) link.click();
             })()
         """)
-        try:
-            await self.wait_for('[class*="ReservationSummary"], .item.current', timeout=10000)
-        except Exception as e:
-            logger.warning("ncl.reservation_summary_after_select_timeout", error=str(e))
+        # WAIT FOR THE REAL SUMMARY (2026-10-16). The old wait,
+        # '[class*="ReservationSummary"], .item.current', matched on EVERY
+        # SeaWeb page (.item.current is the nav highlight on Category, Price
+        # Programs, Summary - Neon's HAR of 3001047) and the class name on
+        # none, so it never waited: the add-on table was read off a page
+        # still loading and 3001044 came back "lost" EVERY add-on (Wi-Fi,
+        # photo, excursion credit, $100 OBC...) - a false TRAP of a real
+        # $120 saving. The summary's own <h2>Reservation Summary</h2> is the
+        # marker (same HAR, all four pages checked).
+        if not await self._on_reservation_summary(timeout_s=15):
+            logger.warning("ncl.reservation_summary_after_select_timeout",
+                           url=(self.page.url or "")[:100])
         await asyncio.sleep(0.4)
         return await self.page.evaluate("""
             (() => {
@@ -1314,12 +1409,35 @@ class NclScraper(BaseScraper):
         """)
 
     async def check_booking(self, booking_id: str, capture_market_data: bool = False) -> BookingResult:
+        """_check_booking_market, with the ACCOUNT's currency on the result
+        (2026-10-16). Every NCL row read "UNKNOWN"; with the Canada account
+        now scanned from the same tab, a CAD price must never be summed with
+        a USD one (the 2026-10-07 audit's "CAD added to USD")."""
+        result = await self._check_booking_market(booking_id, capture_market_data)
+        currency = settings.ncl_market_currency.get(self.market)
+        if currency and (result.currency in (None, "", "UNKNOWN")):
+            result = result.model_copy(update={"currency": currency})
+        if self.market != settings.ncl_default_market.upper():
+            result = result.model_copy(update={
+                "note": f"[{self.market} account, {currency or '?'}] {result.note or ''}".strip()})
+        return result
+
+    async def _check_booking_market(self, booking_id: str,
+                                    capture_market_data: bool = False) -> BookingResult:
         """
         Full NCL booking check flow. ALWAYS unlocks in finally.
 
         Steps: navigate → search → read data → scrape addons →
         enter edit mode → load categories → find cheapest → calculate.
         """
+        # FORGET THE PREVIOUS BOOKING. NCL's own capture sits at the very
+        # end of this method, after several early returns (notably
+        # make_not_on_this_account_result), so without this the next
+        # booking inherits it - 49 bookings in the live database carry
+        # another booking's payment panel. See
+        # BaseScraper.reset_per_booking_state.
+        self.reset_per_booking_state()
+
         in_edit_mode = False
         addons: list[dict] = []
         old_total = 0.0
@@ -1489,6 +1607,51 @@ class NclScraper(BaseScraper):
                 and amount_due > 0 and abs(com_due - amount_due) < 0.01
             )
 
+            # PUBLISH THE PAYMENT EVIDENCE, in the same shape ESPRESSO's
+            # _read_payment_status returns.
+            #
+            # THE BUG, found 2026-10-07. ExclusionService.record_paid_in_full
+            # reads `scraper.last_payment_status`, which NclScraper never
+            # set - so every NCL paid-in-full booking failed the
+            # `payment_state_readable` guard and was refused. The database
+            # proves it: 215 ESPRESSO exclusions, 1 CANCELLED, and **zero
+            # NCL**, with 368 `exclusion.refused reason=payment_panel_
+            # unreadable` in the log.
+            #
+            # Neon's rule is explicit and non-negotiable: "IF THE BOOKING
+            # SURELY FOR 100% SURE IS PAID IN FULL THIS MUST BE STORED IN
+            # THE DATA BASE AND NEVER EVER BE RESCANNED AGAIN". For NCL it
+            # was never implemented - 122 of today's 188 NCL bookings were
+            # re-scanned in full for nothing.
+            #
+            # The figures were all here already; nothing new is read and no
+            # extra page load is involved. `payment_state_readable` is the
+            # SAME flag the scrape itself refuses to continue without, so
+            # this cannot be more permissive than the existing guard.
+            self.last_payment_status = {
+                "total_price": invoice_total,
+                # The outstanding balance, i.e. what ESPRESSO calls Final
+                # Payment Due. `amount_due` is the gross figure the portal
+                # shows; net_due is recorded alongside it rather than
+                # substituted, because balance_is_all_commission bookings
+                # legitimately differ between the two.
+                "final_payment_due": amount_due,
+                "payment_state_readable": payment_state_readable,
+                "currency": None,
+                "net_due": net_due,
+                "balance_is_all_commission": balance_is_all_commission,
+                # The portal's own word for what this reservation IS.
+                # Carried so ExclusionService can refuse to make anything
+                # but a plain BOOKED reservation permanent - see its
+                # record_paid_in_full. CLOSED and TERMINATED are left
+                # deliberately uninterpreted: this project does not know
+                # what they mean yet, and guessing is how a cancelled
+                # booking became "paid in full" in the first place.
+                "booking_status": str(
+                    (payment.get("bookingFacts") or {}).get("Status") or ""
+                ).strip().upper() or None,
+            }
+
             logger.info(
                 "ncl.commission", booking_id=booking_id,
                 commiss_earned=commiss_earned, invoice_total=invoice_total,
@@ -1540,6 +1703,44 @@ class NclScraper(BaseScraper):
                 balance_is_all_commission=balance_is_all_commission,
             )
 
+            # CANCELLED BEFORE PAID IN FULL - the same ordering ESPRESSO
+            # uses, and for the same reason.
+            #
+            # CONFIRMED 2026-10-07, in data this project had already been
+            # capturing for weeks. `payment.bookingFacts.Status` is present
+            # in 1,478 of 1,478 NCL captures and nothing had ever read it:
+            #
+            #     BOOKED 1295   CLOSED 133   CANCELED 32   TERMINATED 18
+            #
+            # A cancelled NCL booking has no balance, so `net_due <= 0.01`
+            # makes cruise_line_fully_paid true and it was filed as PAID IN
+            # FULL. Two real ones went out that way the same day this was
+            # found (3001043 and 3001046), plus 6 TERMINATED and 41
+            # CLOSED.
+            #
+            # This is the identical defect Neon called V-VIP on ESPRESSO -
+            # "status CX = CANCELLED, MUST be reported" - which was fixed
+            # there and never looked for here. See make_cancelled_result,
+            # whose own docstring describes this exact shape.
+            #
+            # Placed AFTER the market-data capture above on purpose: a
+            # cancelled booking's panel is still captured data and is never
+            # dropped.
+            booking_status = str(
+                (payment.get("bookingFacts") or {}).get("Status") or ""
+            ).strip().upper()
+            if booking_status == "CANCELED":
+                logger.info("ncl.cancelled", booking_id=booking_id,
+                            portal_status=booking_status)
+                self.log_action("cancelled", booking_id=booking_id)
+                # The promos the booking held are kept even when it is not
+                # priced (Neon 2026-10-15: save before/after for everything;
+                # 217 paid and 2 cancelled NCL rows since 10-08 had none).
+                return make_cancelled_result(
+                    booking_id, preload.get("category"), CruiseLine.NCL,
+                    detail=f"NCL booking status {booking_status}",
+                ).model_copy(update={"old_promos": preload.get("currentPromos", "") or ""})
+
             # CONFIRMED MISS, fixed 2026-08-28. Neon on booking 3000057:
             # "this booking is paid in full and the due amount is 43$ only
             # why it did not show that it is paid in full". This gate used
@@ -1569,7 +1770,7 @@ class NclScraper(BaseScraper):
                 )
                 return make_paid_in_full_result(
                     booking_id, preload.get("category"), CruiseLine.NCL, invoice_total,
-                )
+                ).model_copy(update={"old_promos": preload.get("currentPromos", "") or ""})
 
             current_category = preload.get("category")
             old_total = invoice_total
@@ -1754,6 +1955,7 @@ class NclScraper(BaseScraper):
             # NCL's own OBC/amenity-drop warning banner if it fired.
             warning_banner = await self._goto_reservation_summary_and_read_warning()
             new_addons = await self._scrape_addons()
+            new_addons = await self._recheck_if_everything_lost(addons, new_addons)
 
             new_data = await self._read_new_total(current_category)
             new_total = _resolve_new_total(new_data, live_price)
@@ -1815,6 +2017,15 @@ class NclScraper(BaseScraper):
                 result.note = f"{result.note} — addons changed: {addon_change_note}"
             if warning_banner:
                 result.note = f"{result.note} — NCL flagged: {warning_banner}"
+                # NCL's own words (3001042, 2026-10-15): "An OBC or AMENITY
+                # has been dropped due to a change in promotion/effective
+                # date". Something is lost - never a green saving.
+                if (result.status == BookingStatus.OPTIMIZATION
+                        and "obc or amenity has been dropped" in warning_banner.lower()):
+                    result.status = BookingStatus.NO_SAVING
+                    result.note = ("NCL no saving - NCL itself reports an OBC or amenity "
+                                   "dropped by this reprice; re-add it on Price Programs and "
+                                   "re-price by hand. Was: " + result.note)
             logger.info("ncl.result", booking_id=booking_id, status=result.status.value, net=result.net_saving)
             self.log_action("result", booking_id=booking_id, status=result.status.value, net_saving=result.net_saving)
             return result

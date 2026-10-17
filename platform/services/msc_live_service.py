@@ -24,6 +24,7 @@ import os
 import random
 import time
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Callable
 
 from playwright.async_api import async_playwright, Browser, BrowserContext, Page
@@ -31,6 +32,9 @@ from playwright.async_api import async_playwright, Browser, BrowserContext, Page
 import msc_commands
 from config.settings import settings
 from core.models import MscBookingResult
+from core.calculator_msc import military_discounts
+from core.msc_status_match import assess_status_match
+from services.status_match_service import latest_msc_booking
 from utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -53,6 +57,26 @@ class MscCheckOutcome:
     status: str
     result: MscBookingResult | None = None
     note: str = ""
+    # {"verdict", "reason"} from core.msc_status_match - no Voyagers
+    # membership and no discount. None when the booking was not read.
+    status_match: dict | None = None
+
+
+def _status_match_for(booking_id: str, read_since: str) -> dict:
+    """Assess the booking record captured during THIS run. An older record
+    in booking_data.jsonl would describe the booking as it used to be, so
+    it is not used."""
+    record = latest_msc_booking(booking_id)
+    if record and (record.get("captured_at") or "") < read_since:
+        record = None
+    # Measured on every scan (2026-10-08): military bookings are counted in
+    # the log, because rule MSC-D9 rules out every Voyagers discount and a
+    # status match for them.
+    military = military_discounts((record or {}).get("current_discounts"))
+    if military:
+        logger.info("msc.military_discount", booking_id=booking_id,
+                    labels=[d.get("label") for d in military])
+    return assess_status_match(record).as_dict()
 
 
 async def persist_outcome(outcome: "MscCheckOutcome") -> bool:
@@ -81,6 +105,14 @@ async def persist_outcome(outcome: "MscCheckOutcome") -> bool:
     result = outcome.result
     checks = []
     opportunities = []
+    note = outcome.note or ""
+    if outcome.status_match:
+        verdict = outcome.status_match.get("verdict")
+        reason = outcome.status_match.get("reason")
+        if verdict and reason:
+            status_note = f"STATUS MATCH: {verdict} - {reason}"
+            note = f"{status_note} | {note}" if note else status_note
+
     if result is not None:
         for check in result.checks:
             check_type = getattr(check.type, "value", check.type)
@@ -103,13 +135,18 @@ async def persist_outcome(outcome: "MscCheckOutcome") -> bool:
             session.add(MscResultRecord(
                 booking_id=str(outcome.booking_id),
                 status=outcome.status,
-                note=outcome.note or "",
+                note=note,
                 category=getattr(result, "category", None),
                 cancelled_or_postponed=bool(
                     getattr(result, "cancelled_or_postponed", False)),
                 is_paid_in_full=bool(getattr(result, "is_paid_in_full", False)),
                 has_any_opportunity=bool(
                     getattr(result, "has_any_opportunity", False)),
+                current_total_price=getattr(result, "current_total_price", None),
+                today_price=getattr(result, "today_price", None),
+                due_amount=getattr(result, "due_amount", None),
+                discounts_before=getattr(result, "discounts_before", None),
+                discounts_today=getattr(result, "discounts_today", None),
                 opportunity_types=",".join(opportunities),
                 checks_json=json.dumps(checks, default=str),
             ))
@@ -260,6 +297,32 @@ class MscLiveService:
                 return True
         return False
 
+    async def capture_passengers(self, booking_id: str) -> dict:
+        """Run the existing read-only passenger scan in this guarded session."""
+        if self._running:
+            raise RuntimeError("Cannot scan passengers while an MSC batch is running")
+        if not self.is_alive:
+            raise RuntimeError("No live MSC session — check login before scanning")
+
+        importlib.reload(msc_commands)
+        result = await msc_commands.run_command(
+            self._state, f"scan_passengers:{str(booking_id).strip()}"
+        )
+        if result.startswith("ERROR:"):
+            raise RuntimeError(result)
+
+        record = latest_msc_booking(str(booking_id).strip())
+        if record is None:
+            raise RuntimeError(
+                f"MSC passenger scan returned without saving booking {booking_id}"
+            )
+        logger.info(
+            "msc_live.passengers_captured",
+            booking_id=str(booking_id).strip(),
+            passenger_count=len(record.get("passengers") or []),
+        )
+        return record
+
     def stop_processing(self) -> bool:
         if not self._running:
             return False
@@ -291,6 +354,7 @@ class MscLiveService:
                     break
                 if on_progress:
                     on_progress(booking_id, i, len(booking_ids))
+                read_since = datetime.now().isoformat()
                 try:
                     # CONFIRMED REAL BUG, 2026-08-24: unlike
                     # msc_session_controller.py's console loop (which
@@ -324,6 +388,11 @@ class MscLiveService:
                         result=outcome_dict.get("result"),
                         note=_summarize_outcome(outcome_dict),
                     )
+                try:
+                    outcome.status_match = _status_match_for(booking_id, read_since)
+                except Exception as e:  # noqa: BLE001 - an extra, never fatal
+                    logger.warning("msc_live.status_match_failed",
+                                   booking_id=booking_id, error=str(e)[:200])
                 outcomes.append(outcome)
                 # WRITE IT DOWN. Before 2026-10-01 nothing did, which is
                 # why MSC had zero rows in every table. Persisted here, per

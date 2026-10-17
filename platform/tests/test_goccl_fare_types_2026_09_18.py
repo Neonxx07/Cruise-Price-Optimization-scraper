@@ -135,10 +135,23 @@ def test_moving_UP_a_tier_is_reported_as_such():
 def test_an_unreadable_tier_returns_no_verdict_rather_than_a_false_zero():
     """Silence beats a confident wrong answer - this must not look like
     "no change in terms"."""
-    delta, why = compare_fares("XYZZY", "SUPER SAVER")
+    delta, why = compare_fares("XYZZY", "FUN SELECT")
     assert delta == 0
     assert "could not be read" in why
     assert "no change in terms" not in why
+
+
+def test_into_super_saver_from_an_unknown_fare_is_a_downgrade():
+    """Changed 2026-10-12 (this test used XYZZY -> SUPER SAVER above and
+    expected no verdict). Live: DEMO26 on 'BOOKING BUCKS' had PSV SUPER SAVER
+    offered as a $308 saving. Super Saver's terms are known to lose price
+    protection, deposit refundability and cabin choice whatever the booking
+    is on now, and Neon's rule is that nothing may be lost."""
+    for current in ("BOOKING BUCKS", "XYZZY", None):
+        delta, why = compare_fares(current, "SUPER SAVER")
+        assert delta < 0, current
+        assert "DOWNGRADE" in why and "price protection" in why
+    assert compare_fares("BOOKING BUCKS", "PACK & GO SALE")[0] < 0
 
 
 def test_super_saver_terms_are_recorded_accurately():
@@ -169,7 +182,7 @@ def test_a_promotional_fares_terms_are_marked_UNKNOWN_not_assumed():
 
 from core.goccl_fare_types import best_and_cheapest, mentions_obc, rank_candidates
 
-# DEMO60's REAL BALCONY column, captured live 2026-09-18. 1 guest, current
+# DEMO44's REAL BALCONY column, captured live 2026-09-18. 1 guest, current
 # gross 1,362.04 on OCS "SAVE & SAIL: MORE TIME MORE PERKS SALE".
 DEMO60_OFFERS = [
     {"offer_code": "GO2", "offer_name": "BUNDLE & SAVE: UPGRADE YOUR FUN",

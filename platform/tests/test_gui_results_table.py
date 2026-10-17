@@ -262,6 +262,29 @@ def test_msc_row_shows_per_check_detail(window):
     assert _cell(window, "3000030", 7) == "BR1"
 
 
+def test_msc_row_leads_with_the_status_match_verdict(window):
+    """2026-10-08: no Voyagers membership + no discount, first in the Note."""
+    outcome = _msc_outcome()
+    outcome.status_match = {"verdict": "ELIGIBLE",
+                            "reason": "no Voyagers member on the booking and no discount applied"}
+    window._append_msc_result_row(outcome)
+    detail = _cell(window, "3000030", 9)
+    assert detail.startswith("STATUS MATCH: ELIGIBLE")
+    assert "PRICE_MATCH:OPPORTUNITY" in detail
+
+
+def test_msc_row_displays_the_discount_block_for_status_match(window):
+    outcome = _msc_outcome()
+    outcome.status_match = {
+        "verdict": "NOT_ELIGIBLE",
+        "reason": "discount applied: MSCCLUB5 5.0%",
+    }
+    window._append_msc_result_row(outcome)
+    detail = _cell(window, "3000030", 9)
+    assert detail.startswith("STATUS MATCH: NOT_ELIGIBLE")
+    assert "discount applied: MSCCLUB5" in detail
+
+
 def test_msc_row_does_not_invent_a_single_total(window):
     """MSC's four checks are independent levers; there is no single
     old/new total, so showing $0.00 would be a lie."""

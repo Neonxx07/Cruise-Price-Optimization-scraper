@@ -57,6 +57,11 @@ REAL = {
         "netBalanceDue": _price(1219.00),
         "balanceDue": _price(1327.00),
         "hasDebt": True,
+        # Added 2026-10-12: the real DEMO11 response carries both dates
+        # (data/goccl_safe_review/20260918T155107/DEMO11/responses.json);
+        # this copy had left them out. The payment rule reads them.
+        "finalPaymentDueDate": {"iso8601": "2027-01-27"},
+        "closestPaymentDueBy": {"iso8601": "2027-01-27"},
     },
 }
 
@@ -71,6 +76,7 @@ def test_the_real_review_response_parses_completely():
     assert inv.obc == Decimal("0.00")
     assert inv.cruise_rate == Decimal("720.00")
     assert inv.currency == "USD"
+    assert (inv.final_due, inv.next_due) == ("2027-01-27", "2027-01-27")
     assert inv.warnings == []
 
 
@@ -269,7 +275,7 @@ def test_the_code_constants_match_the_portals_own_names():
         ("CRUS", "COMM", "POBC", "GRSS", "CNRF")
 
 
-# ── DEMO57: the booking that proved the fail-safe works ──────────────────
+# ── DEMO39: the booking that proved the fail-safe works ──────────────────
 #
 # Second booking to reach /review on the safe path. It carried TWO codes
 # never seen on DEMO11 - ADMN "Administrative Fee" and NOBC "All Departments
@@ -283,7 +289,7 @@ def test_the_code_constants_match_the_portals_own_names():
 # parser that had guessed past the unknown code would have reported a
 # $184 saving that does not exist.
 
-DEMO57 = {
+DEMO39 = {
     "agentInvoice": {"summary": {
         "lineItems": [
             _item("CNRF", "Cruise Charges", 2736.42, isTotal=True),
@@ -309,7 +315,7 @@ DEMO57 = {
 def test_an_unfamiliar_line_code_is_handled_structurally():
     """ADMN had never been seen. The sum works because it reads the
     isIndented flag rather than a hardcoded list of codes."""
-    inv = parse_review_changes(DEMO57)
+    inv = parse_review_changes(DEMO39)
     assert inv.items["ADMN"] == Decimal("100.00")
     ok, why = inv.reconciles()
     assert ok, why
@@ -318,7 +324,7 @@ def test_an_unfamiliar_line_code_is_handled_structurally():
 def test_the_gross_is_the_sum_of_NON_indented_items():
     """CNRF 2,736.42 + GTFE 239.58 + INSU 0 + PKGS 0 + TADD 0 + ADMN 100
     = 3,076.00. The indented CRUS/PTCH/RCFE are what CNRF is made of."""
-    inv = parse_review_changes(DEMO57)
+    inv = parse_review_changes(DEMO39)
     assert inv.indented == {"CRUS", "PTCH", "RCFE"}
     addends = [c for c in inv.line_codes if c not in inv.indented]
     assert sum(inv.items[c] for c in addends) == Decimal("3076.00")
@@ -328,7 +334,7 @@ def test_the_gross_is_the_sum_of_NON_indented_items():
 def test_this_booking_is_a_price_INCREASE_not_a_saving():
     """THE HEADLINE. The per-person estimate claimed +$184; the portal says
     the new gross is HIGHER than the booking's own."""
-    inv = parse_review_changes(DEMO57)
+    inv = parse_review_changes(DEMO39)
     booking_gross = Decimal("3070.00")
     estimate = Decimal("1443.00") * 2          # per-person x 2 guests
     assert booking_gross - estimate == Decimal("184.00")   # what was claimed
@@ -340,7 +346,7 @@ def test_the_two_obc_lines_are_not_double_counted():
     """POBC "Total Onboard Credit" is the total; NOBC "All Departments
     Onboard Credit" is a component. Both read 50.00 - adding them would
     invent 50.00 of credit."""
-    inv = parse_review_changes(DEMO57)
+    inv = parse_review_changes(DEMO39)
     assert inv.obc == Decimal("50.00")          # POBC only
     assert inv.items["NOBC"] == Decimal("50.00")
     assert inv.obc != inv.items["POBC"] + inv.items["NOBC"]
@@ -348,7 +354,7 @@ def test_the_two_obc_lines_are_not_double_counted():
 
 def test_perks_and_commission_are_never_addends_of_the_gross():
     """They describe the gross, they do not compose it."""
-    inv = parse_review_changes(DEMO57)
+    inv = parse_review_changes(DEMO39)
     assert "COMM" not in inv.line_codes
     assert "POBC" not in inv.line_codes
     assert "NOBC" not in inv.line_codes

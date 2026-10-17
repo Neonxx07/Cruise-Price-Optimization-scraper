@@ -121,11 +121,19 @@ def test_a_waitlisted_booking_never_reports_a_saving():
 # -- the scraper actually asks for the price -----------------------------
 
 
-def test_both_sentinel_paths_read_the_payment_panel():
-    """Structural, from the AST: the builders can only record a price if
-    the scraper reads one. Taken from the tree so a comment mentioning
-    these calls cannot satisfy it - this project has been bitten by
-    prose-matching tests six times.
+def test_the_payment_panel_is_read_once_while_it_is_on_screen():
+    """CORRECTED 2026-10-05. This test used to assert that
+    `_read_payment_status()` is called at least THREE times - once per
+    sentinel path plus the main one.
+
+    That pinned the mechanism instead of the outcome, and the mechanism was
+    wrong: the two extra calls happened AFTER `_click_categories()` had
+    navigated away from the Reservation Summary, so they returned None on
+    all 135 restricted and all 86 waitlisted bookings in the first live
+    run. The test passed the whole time.
+
+    The real contract is that the panel is read ONCE, while it is on
+    screen, and the captured value is reused.
     """
     import ast
     import pathlib
@@ -133,19 +141,16 @@ def test_both_sentinel_paths_read_the_payment_panel():
     source = pathlib.Path("scraper/espresso.py").read_text(encoding="utf-8")
     tree = ast.parse(source)
 
-    reads: list[int] = []
-    for node in ast.walk(tree):
-        if (isinstance(node, ast.Await)
-                and isinstance(node.value, ast.Call)
-                and isinstance(node.value.func, ast.Attribute)
-                and node.value.func.attr == "_read_payment_status"):
-            reads.append(node.lineno)
+    reads = [n.lineno for n in ast.walk(tree)
+             if isinstance(n, ast.Await)
+             and isinstance(n.value, ast.Call)
+             and isinstance(n.value.func, ast.Attribute)
+             and n.value.func.attr == "_read_payment_status"]
 
-    # One for paid-in-full (pre-existing), one for skipRepriceModal, one
-    # for WLT. Fewer means a sentinel path stopped recording prices.
-    assert len(reads) >= 3, (
-        f"only {len(reads)} _read_payment_status call(s) - a sentinel path "
-        "is recording no price again")
+    assert reads, "the payment panel is never read at all"
+    assert len(reads) == 1, (
+        f"_read_payment_status is called {len(reads)} times. Extra calls "
+        "after _click_categories() return None - see the module docstring.")
 
 
 def test_the_sentinels_carry_the_total_back():
@@ -159,3 +164,78 @@ def test_the_sentinels_carry_the_total_back():
         window = source[start:start + 400]
         assert '"oldTotal"' in window, (
             f"{sentinel} no longer returns a price")
+
+
+# -- the 2026-10-05 live run: the first version of this fix did NOT work --
+#
+# 0 of 135 restricted bookings and 0 of 86 WLT bookings got a price. The
+# log said exactly why, on all 135:
+#
+#     espresso.skip_reprice  total_price=None
+#     espresso.skip_reprice_price_unreadable   0 occurrences
+#
+# No exception - so `_read_payment_status()` ran fine and simply found
+# nothing. It was pointed at the WRONG PAGE. Total Price lives on the
+# Reservation Summary, and by the time these branches run,
+# `_click_categories()` has already navigated to the category table:
+#
+#     1630  self.last_payment_status = payment_status   <- summary, price here
+#     1717  await self._click_categories()              <- page changes
+#     1734  WLT branch                                   <- too late
+#     1768  skipRepriceModal branch                      <- too late
+#
+# Both now read the value captured while the summary was on screen.
+#
+# AND a correctness risk that came with it: `last_payment_status` was
+# never cleared per booking, unlike last_market_data and
+# last_feature_fields. A booking short-circuiting early - a cancellation,
+# an early raise - would have inherited the PREVIOUS booking's price.
+# BookingService also decides a PERMANENT paid-in-full exclusion on that
+# attribute, so a stale read there is unrecoverable. It is reset now.
+
+
+def _espresso_source() -> str:
+    import pathlib
+    return pathlib.Path("scraper/espresso.py").read_text(encoding="utf-8")
+
+
+def test_the_price_is_read_before_the_page_navigates_away():
+    """Both branches must use the captured value, not re-read a page that
+    no longer shows the price."""
+    source = _espresso_source()
+
+    capture = source.index("self.last_payment_status = payment_status")
+    categories = source.index("await self._click_categories()")
+    assert capture < categories, (
+        "the payment panel is now read AFTER the page navigates away")
+
+    for marker in ('"_wlt": True', '"_skipRepriceModal": True'):
+        branch = source.index(marker)
+        window = source[max(0, branch - 1200):branch]
+        assert "last_payment_status" in window, (
+            f"the branch at {marker} no longer uses the captured price")
+        assert "await self._read_payment_status()" not in window, (
+            f"the branch at {marker} re-reads the panel - it will return "
+            "None, as it did on all 135 restricted bookings on 2026-10-05")
+
+
+def test_the_payment_status_is_cleared_for_each_booking():
+    """A stale value would hand the previous booking's price to this one -
+    and BookingService writes a PERMANENT exclusion off the same
+    attribute.
+
+    UPDATED 2026-10-07: the reset moved into
+    BaseScraper.reset_per_booking_state, which clears every cached
+    attribute for every scraper. NCL and GoCCL never had the hand-written
+    version this test originally pinned, and 42 bookings in the live
+    database carry another booking's payment panel as a result. The
+    behaviour asserted here is unchanged.
+    """
+    from scraper.base import BaseScraper
+
+    assert "last_payment_status" in BaseScraper.PER_BOOKING_STATE
+
+    source = _espresso_source()
+    reset = source.index("self.reset_per_booking_state()")
+    capture = source.index("self.last_payment_status = payment_status")
+    assert reset < capture, "the reset must come before the capture"

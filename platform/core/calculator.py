@@ -13,7 +13,9 @@ from decimal import Decimal, ROUND_HALF_UP
 
 from .confidence import calc_confidence
 from .goccl_fare_types import best_and_cheapest, rank_candidates
+from .goccl_review import ReviewInvoice
 from .models import BookingResult, BookingStatus, CruiseLine
+from .payment_schedule_rule import check_payment_schedule
 
 
 # ── Utility Functions ───────────────────────────────────────────
@@ -163,6 +165,65 @@ def total_optimization_savings(results) -> float:
     )
 
 
+def savings_by_currency(results) -> dict[str, float]:
+    """The same total as `total_optimization_savings`, split by currency.
+
+    THE LIMITATION THIS CLOSES, flagged 2026-08-13 and deliberately
+    deferred then: `total_optimization_savings` adds every `net_saving`
+    together and the caller prints a `$` in front of the result. The live
+    database says that is not a hypothetical -
+
+        OPTIMIZATION rows   USD 73 ($6,914.00)   CAD 35 (5,923.00 CAD)
+                            UNKNOWN 51           unrecorded 80
+
+    so **35 Canadian optimizations have been adding Canadian dollars to a
+    figure displayed in US dollars.**
+
+    The 2026-08-13 note gave a good reason for waiting: filtering would
+    have silently DROPPED results from an existing total, which is a worse
+    error than the one being fixed. Splitting drops nothing. Every result
+    still appears, under the currency it was actually recorded in, and a
+    result whose currency was never established appears under "UNKNOWN"
+    rather than being quietly counted as dollars.
+
+    Keys are the currency codes as recorded; None becomes "UNKNOWN", which
+    is BookingResult's own honest default. Returns {} for no results, so a
+    caller can tell "nothing found" from "nothing known".
+    """
+    out: dict[str, float] = {}
+    for r in results:
+        if r.status.value != "OPTIMIZATION" or _is_unconfirmed_candidate(r):
+            continue
+        code = (getattr(r, "currency", None) or "UNKNOWN").strip().upper() or "UNKNOWN"
+        out[code] = round(out.get(code, 0.0) + float(r.net_saving or 0), 2)
+    return out
+
+
+def format_savings_by_currency(totals: dict[str, float]) -> str:
+    """One short line for `savings_by_currency`, for a status bar.
+
+    Stays quiet when there is nothing to disambiguate: a single known
+    currency reads exactly as it always did ("$6,914.00 confirmed
+    savings"), because shouting about currency when only one is present is
+    noise. The moment a second one appears, both are named.
+    """
+    if not totals:
+        return "$0.00 confirmed savings"
+    if len(totals) == 1:
+        (code, amount), = totals.items()
+        if code == "USD":
+            return f"${amount:,.2f} confirmed savings"
+        if code == "UNKNOWN":
+            return f"{amount:,.2f} confirmed savings (currency not recorded)"
+        return f"{amount:,.2f} {code} confirmed savings"
+    parts = [
+        (f"${amount:,.2f}" if code == "USD" else f"{amount:,.2f} {code}")
+        for code, amount in sorted(totals.items(),
+                                   key=lambda kv: (kv[0] == "UNKNOWN", kv[0]))
+    ]
+    return " + ".join(parts) + " confirmed savings"
+
+
 def _is_unconfirmed_candidate(result) -> bool:
     """Whether a result declares ITSELF unverified.
 
@@ -172,6 +233,10 @@ def _is_unconfirmed_candidate(result) -> bool:
     ESPRESSO/NCL win that merely scored low.
     """
     return "unconfirmed" in (getattr(result, "note", "") or "").lower()
+
+
+# Public name for the GUI row tint and the Excel fill (2026-10-15).
+is_unconfirmed_candidate = _is_unconfirmed_candidate
 
 
 def unconfirmed_candidate_total(results) -> tuple[int, float]:
@@ -652,16 +717,68 @@ def calculate_espresso(raw_data: dict, booking_id: str, price_category: str | No
         # money that is not yet secured is the mistake the OBC rule exists
         # to prevent, pointed the other way. The verdict stays conservative
         # and the note states the ceiling.
+        #
+        # ONLY A DISCOUNT COMES BACK AS MONEY. Found 2026-10-13 on booking
+        # 3000067 (Neon's recording + HAR of Promotions -> Compare). The
+        # note said "ALL INC 2PK NRD (worth $2,100.00 — saving becomes
+        # $4,437.00 if re-added)". The portal's own Y prices per person:
+        #   Best Rate 1,609.50 · ALL INC 2PK NRD 2,659.50 (total 5,319)
+        # Re-adding the perk COSTS 1,050 pp = $2,100 - its CRUISE_PROMO line
+        # is +2,100, a charge, already in lost_pkg_value. So net ($2,337 =
+        # 7,656 - 5,319) is already the saving with the perk kept; adding
+        # its value again promised the perk back for free. abs() was right
+        # for a discount (Email Bonus NRD is -66: re-adding lowers the
+        # price) and wrong for a perk.
+        # A RE-ADDABLE PERK IS NOT LOST. Found the same day, same booking:
+        # 3000067 was TRAP on 2026-10-09 and 10-12 - "losing $2100 perk for
+        # only $1769 net". But net already has the perk's $2,100 taken off,
+        # and the portal re-adds it for exactly that price, so $1,769 was
+        # the real saving WITH the perk kept; the TRAP rule charged the perk
+        # a second time (it needs drop > 2 x perk). Corpus: 8 TRAP rows on
+        # 2 bookings (3000067 $1,769, 3001070 $142). A perk that cannot be
+        # re-added, or lost travel protection, stays a TRAP as before.
+        lost_perk_bases = {norm_str(n.split(" ($")[0]) for n in lost_pkg_names}
+        lost_perks_all_re_addable = bool(
+            lost_perk_bases
+            and not lost_travel_protection
+            and lost_perk_bases <= {norm_str(f) for f in re_addable_fares})
+
         re_add_note = ""
         if re_addable_fares:
             re_add_note = " — re-add: " + ", ".join(re_addable_fares)
-            re_add_value = round2(sum(
-                abs(old_promo_values.get(norm_str(name), 0.0))
-                for name in re_addable_fares))
-            if re_add_value > 0:
-                re_add_note += (
-                    f" (worth ${re_add_value:,.2f} — saving becomes "
-                    f"${net + re_add_value:,.2f} if re-added)")
+            discount_value = 0.0
+            perk_names: list[str] = []
+            perk_cost = 0.0
+            perk_cost_not_in_net = 0.0
+            for name in re_addable_fares:
+                amount = old_promo_values.get(norm_str(name), 0.0)
+                if amount > 0 or norm_str(name) in already_counted:
+                    perk_names.append(name)
+                    perk_cost += abs(amount)
+                    if norm_str(name) not in already_counted:
+                        perk_cost_not_in_net += abs(amount)
+                elif amount < 0:
+                    discount_value += -amount
+            discount_value = round2(discount_value)
+            perk_cost = round2(perk_cost)
+            details = []
+            if discount_value > 0:
+                details.append(
+                    f"worth ${discount_value:,.2f} — saving becomes "
+                    f"${net + discount_value:,.2f} if re-added")
+            if perk_cost > 0:
+                # A perk that is also a lost package (3000067, 3001020) has
+                # its price inside net already; one that is not must be
+                # paid out of net. Any discount re-added alongside it still
+                # comes back on top.
+                with_perk = round2(net + discount_value - perk_cost_not_in_net)
+                kept = (f"${with_perk:,.2f} is the saving with it kept" if with_perk >= 0
+                        else f"keeping it costs ${-with_perk:,.2f} more than now")
+                details.append(
+                    f"re-adding {', '.join(perk_names)} puts its "
+                    f"${perk_cost:,.2f} price back — {kept}")
+            if details:
+                re_add_note += " (" + "; ".join(details) + ")"
         # Surfaced regardless of status/branch below — a client losing trip
         # insurance/travel-protection coverage is worth flagging even on a
         # NO_SAVING or TRAP result, not just an OPTIMIZATION.
@@ -714,7 +831,8 @@ def calculate_espresso(raw_data: dict, booking_id: str, price_category: str | No
                 f"{obc_part}. OBC is not cash: it cannot pay the invoice and "
                 f"is usually onboard-only and non-refundable{re_add_note}"
             )
-        elif net > 0 and lost_pkg_value > 0 and net < lost_pkg_value:
+        elif (net > 0 and lost_pkg_value > 0 and net < lost_pkg_value
+              and not lost_perks_all_re_addable):
             # Net saving is positive on paper, but it's smaller than the
             # value of a package being given up to get it — the client is
             # trading a perk worth more than the "win" itself. Confirmed
@@ -788,6 +906,13 @@ def calculate_espresso(raw_data: dict, booking_id: str, price_category: str | No
             lost_fares=truly_lost_fares,
             re_addable_fares=re_addable_fares,
             gained_fares=gained_fares,
+            # BEFORE AND AFTER, IN FULL (Neon 2026-10-15: "MAKE SURE THAT
+            # FOR ALL THE CRUISE LINES WE ARE SAVING BEFORE AND AFTER").
+            # ESPRESSO had both lists here all along and stored only the
+            # difference - old_promos/new_promos were empty on all 15,346
+            # ESPRESSO rows. Same comma-separated form NCL uses.
+            old_promos=", ".join(old_fare_names),
+            new_promos=", ".join(new_fare_names),
             confidence=conf.score,
             old_cruise_fare=conf.old_cruise_fare,
             new_cruise_fare=conf.new_cruise_fare,
@@ -1315,6 +1440,24 @@ def calculate_ncl(
                 f"${round(abs(obc_change))} OBC (need "
                 f"{OBC_LOSS_MIN_RATIO:.0f}x): {', '.join(lost_addon_names)}"
             )
+        elif net > 0 and unpriced_lost:
+            # A PERK LOST WHOSE VALUE THE PAGE DOES NOT SHOW IS NOT A SAVING.
+            # Was OPTIMIZATION with a "verify by hand" note (2026-08-27: "we
+            # cannot prove a dollar loss"). Neon, 2026-10-15, booking
+            # 3001042: the "$85 saving" lost the FAS dining package
+            # (Specialty Dining 2 Meals, Wi-Fi 150 mins); with DISXIN re-added
+            # on Price Programs the invoice read $3,201.33 - its DIN SRV CHG
+            # $80.00 back - so the real saving was $4.78. The price drop WAS
+            # the perk. All 3 NCL OPTIMIZATIONs that day were this shape
+            # (3001056, 3001057: Wi-Fi + Excursion Credit for $60).
+            status = BookingStatus.NO_SAVING
+            note = (
+                f"NCL no saving - the ${round(price_drop)} drop loses perks whose value is "
+                f"not on the page: {', '.join(unpriced_lost)}. The drop may be only the "
+                f"price of those perks (3001042: $85 was the dining package's $80 service "
+                f"charge; re-added, the saving was $4.78). Re-add the promo on Price "
+                f"Programs and re-price by hand"
+            )
         elif net > 0:
             status = BookingStatus.OPTIMIZATION
             addon_note = (
@@ -1501,7 +1644,28 @@ def calculate_ncl(
 GOCCL_CANDIDATE_CONFIDENCE = 1
 
 
-def calculate_goccl(
+def calculate_goccl(*args, **kwargs) -> BookingResult:
+    """See _calculate_goccl. Records the offer BEFORE and AFTER on every
+    result, whichever return produced it (Neon 2026-10-15: "MAKE SURE THAT
+    FOR ALL THE CRUISE LINES WE ARE SAVING BEFORE AND AFTER" - GoCCL had
+    old_promos/new_promos empty on all 158 rows). Form: "CODE NAME"."""
+    import inspect
+
+    bound = inspect.signature(_calculate_goccl).bind(*args, **kwargs)
+    bound.apply_defaults()
+    a = bound.arguments
+    result = _calculate_goccl(*args, **kwargs)
+    before = " ".join(x for x in (a.get("current_offer_code"), a.get("current_offer_name")) if x)
+    after = ""
+    code = result.new_price_category
+    if code:
+        named = next((o for o in (a.get("available_offer_codes") or [])
+                      if isinstance(o, dict) and o.get("offer_code") == code), {})
+        after = " ".join(x for x in (code, named.get("offer_name") or named.get("name")) if x)
+    return result.model_copy(update={"old_promos": before, "new_promos": after})
+
+
+def _calculate_goccl(
     booking_id: str,
     price_category: str | None,
     current_stateroom_type: str,
@@ -1576,10 +1740,19 @@ def calculate_goccl(
         not a ready-to-act recommendation.
     """
     try:
+        # THE SAME CODE AT TODAY'S PRICE IS A CANDIDATE. Found live
+        # 2026-10-12: DEMO40 is on OCS "FUN ON THE WAY EARLY SAVER SALE" at
+        # $1,556 and today's rate screen offers OCS - renamed "LOOK FORWARD
+        # TO FUN & EARLY SAVER SAVINGS" - from $1,330, the same Early Saver
+        # tier. Excluding the booking's own code hid it and reported the
+        # Super Saver as "the only cheaper fare"; Neon had found $56 there
+        # (DEMO43 the same, $56.22). Carnival reuses a code for a new sale
+        # at a new price, so the code proves nothing. A fare that is not
+        # actually cheaper still drops out on price below (rank_candidates
+        # keeps only a positive drop), and /review gives the real figure.
         candidates = [
             o for o in available_offer_codes
             if o.get("stateroom_type") == current_stateroom_type
-            and o.get("offer_code") != current_offer_code
             and safe_float(o.get("price_per_person", 0)) > 0
         ]
 
@@ -1613,7 +1786,7 @@ def calculate_goccl(
         # to it, the booking would come back "no saving" while a perfectly
         # good option sat a few dollars further down the list.
         #
-        # Measured on the real DEMO60 BALCONY column:
+        # Measured on the real DEMO44 BALCONY column:
         #     PSV SUPER SAVER  saves 117.04  but loses the cabin choice,
         #                      price protection and a refundable deposit
         #     OB7 EARLY SAVER  saves  97.04  and ADDS price protection
@@ -1628,6 +1801,37 @@ def calculate_goccl(
             current_gross=round2(current_price_gross),
         )
         best, cheapest_candidate = best_and_cheapest(ranked)
+
+        # NOTHING LOST, OR NOTHING OFFERED. Neon 2026-10-12: "the main
+        # focus in carnival is not lose anything on the booking". On DEMO18
+        # the only cheaper fare was PSV SUPER SAVER ($554 vs $574 pp, $40):
+        # no price protection, non-refundable deposit, Carnival assigns the
+        # cabin - and the current fare's $25 onboard credit gone. He did not
+        # take it. Until then this fell back to that downgrade and reported
+        # it as a candidate. A cheaper fare that only exists as a downgrade,
+        # or by giving up advertised OBC, is now NO_SAVING, named so it is
+        # never hidden.
+        if best is None and cheapest_candidate is not None:
+            c = cheapest_candidate
+            lost = []
+            if c.is_downgrade:
+                lost.append(c.terms_note)
+            if c.obc_risk:
+                lost.append("the current fare's onboard credit")
+            return BookingResult(
+                cruise_line=CruiseLine.GOCCL,
+                status=BookingStatus.NO_SAVING,
+                note=(
+                    f"no saving - the only cheaper fare, '{c.offer_code}' "
+                    f"({c.offer_name}), saves about ${round(c.price_drop)} but "
+                    f"loses {'; '.join(lost) or 'booking terms'} - nothing may be "
+                    f"lost on the booking{guest_note}"
+                ),
+                booking_id=booking_id,
+                price_category=price_category,
+                old_total=round2(current_price_gross),
+                new_total=round2(current_price_gross),
+            )
         chosen = best or cheapest_candidate
 
         # What this switch does to the customer's terms, and - when the
@@ -1638,13 +1842,19 @@ def calculate_goccl(
         if chosen is not None:
             if chosen.tier_delta or chosen.is_downgrade:
                 terms_note = f" [TERMS: {chosen.terms_note}]"
+            # NO DOLLAR FIGURE for an offer that was not taken. DEMO45,
+            # 2026-10-15: the note said "a cheaper 'P2P' saves $382" and Neon
+            # went looking - P2P only offers category BL ("Carnival chooses
+            # your stateroom", non-refundable deposit), so it could never keep
+            # the booking's 8A/8B cabin. The figure is a rate-page teaser that
+            # was never taken to review or checked for the booking's category.
             if (best is not None and cheapest_candidate is not None
                     and best.offer_code != cheapest_candidate.offer_code):
-                gap = round2(cheapest_candidate.price_drop - best.price_drop)
                 terms_note += (
-                    f" [a cheaper '{cheapest_candidate.offer_code}' saves "
-                    f"${round(cheapest_candidate.price_drop)} "
-                    f"(${round(gap)} more) but {cheapest_candidate.terms_note}]"
+                    f" [not taken: '{cheapest_candidate.offer_code}' looks "
+                    f"cheaper on the offer page but {cheapest_candidate.terms_note}; "
+                    f"its price and whether it offers the booking's own "
+                    f"category were not checked]"
                 )
             if chosen.obc_risk:
                 terms_note += (
@@ -1745,6 +1955,205 @@ def calculate_goccl(
             booking_id=booking_id,
             price_category=price_category,
         )
+
+
+# ── GoCCL: the candidate, confirmed on Carnival's own review screen ──────
+#
+# Added 2026-10-12 (ROADMAP P2.2, "/review was never wired into
+# production"). calculate_goccl above ranks offer codes from the /rate
+# screen's per-person "From $" teasers and can only name a CANDIDATE
+# (confidence 1). scraper/goccl.py now takes that candidate to /review on
+# the safe path - the booking's own category, "Keep Same Stateroom", never
+# a different cabin, Confirm Changes blocked - and Carnival returns its own
+# coded invoice (core/goccl_review.py). This turns the candidate into a
+# confirmed result, or says plainly why it could not.
+#
+# The decision is made on CASH, never on OBC (hard rule 12):
+#   * no cash drop                       -> NO_SAVING, whatever OBC is gained
+#   * OBC given up, cash < 3x the loss   -> NO_SAVING (OBC_LOSS_MIN_RATIO)
+#   * otherwise                          -> OPTIMIZATION
+# net_saving keeps the project formula (cash drop + OBC change), the same
+# as ESPRESSO and NCL.
+#
+# Evidence: DEMO11, walked to /review live 2026-09-18 - candidate PHY
+# estimated at 1,542.00 from the teaser; Carnival's invoice said 1,552.00.
+# The estimate overstated a real $22 saving as $32 (31%).
+
+GOCCL_CONFIRMED_CONFIDENCE = 5
+#: Price confirmed but the review stated no onboard-credit line.
+GOCCL_CONFIRMED_OBC_UNKNOWN_CONFIDENCE = 3
+
+#: Why a candidate could not be taken to /review - scraper path names.
+GOCCL_REVIEW_PATH_REASONS = {
+    "REVIEW_PATH_BLOCKED": "Carnival kept 'Keep Same Stateroom' disabled, and "
+                           "another cabin is never chosen to force the review",
+    "OWN_CATEGORY_NOT_OFFERED": "the booking's own category is not offered "
+                                "under this fare",
+    "CANDIDATE_NOT_ON_SCREEN": "the candidate fare was not on the rate screen "
+                               "for this stateroom type",
+    "REVIEW_REFUSED": "Carnival refused the review request",
+    "STATEROOM_CHANGED": "the review showed a different stateroom - a cabin "
+                         "change is never offered as a saving",
+    "REVIEW_NOT_CAPTURED": "the review invoice was not received",
+}
+
+
+def _goccl_payment_refusal(estimate: BookingResult, original: ReviewInvoice,
+                           review: ReviewInvoice, code: str | None,
+                           cash_text: str, why: str) -> BookingResult:
+    """NO_SAVING for a fare that changes the payment schedule. The figures
+    stay visible so the refusal can be checked, never quietly dropped."""
+    old = float(original.gross) if original.gross is not None else estimate.old_total
+    new = float(review.gross) if review.gross is not None else estimate.new_total
+    priced = (f"would cost {review.gross:,.2f} vs {original.gross:,.2f} now "
+              f"({cash_text} less)" if review.gross is not None and original.gross is not None
+              else f"looked about ${round(estimate.price_drop)} cheaper")
+    return estimate.model_copy(update={
+        "status": BookingStatus.NO_SAVING,
+        "old_total": old,
+        "new_total": new,
+        "price_drop": 0.0, "net_saving": 0.0,
+        "new_price_category": code,
+        "confidence": GOCCL_CONFIRMED_CONFIDENCE,
+        "note": (f"no saving - '{code}' {priced} but {why}: never add a deposit "
+                 f"or bring a payment nearer (only a LATER final payment is allowed)"),
+    })
+
+
+def apply_goccl_review(
+    estimate: BookingResult,
+    original: ReviewInvoice,
+    review: ReviewInvoice | None,
+    path: str,
+    choice: dict | None = None,
+) -> BookingResult:
+    """The estimate from calculate_goccl, judged on Carnival's invoice.
+
+    `original` is the booking's own invoice (initialData.invoiceSummary.
+    agentInvoice, the same schema as /review). `path` is how far the
+    scraper got; anything but REVIEW_REACHED leaves the candidate
+    unconfirmed with the reason attached, never a guessed figure.
+    """
+    terms = " ".join(re.findall(r"\[[^\]]*\]", estimate.note or ""))
+    code = estimate.new_price_category
+
+    def unconfirmed(reason: str) -> BookingResult:
+        note = (f"{estimate.note} [REVIEW: not confirmed - {reason}; the "
+                f"figure above is still an estimate]")
+        return estimate.model_copy(update={"note": note})
+
+    # A CABIN THAT CANNOT BE KEPT IS AN ANSWER, NOT AN UNKNOWN. Neon
+    # 2026-10-12: "you must always make sure that keep same state room
+    # button is eenabled". Live the same day, DEMO26's PSV Super Saver
+    # never enabled it and was still shown as a $308 candidate. Blocked or
+    # cabin-changed is NO_SAVING with its reason; only technical gaps (no
+    # review received, refused, not on screen) stay unconfirmed candidates.
+    if path in ("REVIEW_PATH_BLOCKED", "STATEROOM_CHANGED"):
+        return estimate.model_copy(update={
+            "status": BookingStatus.NO_SAVING,
+            "new_total": estimate.old_total, "price_drop": 0.0, "net_saving": 0.0,
+            "confidence": GOCCL_CONFIRMED_CONFIDENCE,
+            "note": (f"no saving - '{estimate.new_price_category}' looked about "
+                     f"${round(estimate.price_drop)} cheaper but "
+                     f"{GOCCL_REVIEW_PATH_REASONS[path]}; the cabin must be kept"),
+        })
+    if path != "REVIEW_REACHED" or review is None:
+        return unconfirmed(GOCCL_REVIEW_PATH_REASONS.get(path, path.lower()))
+
+    # THE PAYMENT SCHEDULE RULE (core/payment_schedule_rule.py), Neon
+    # 2026-10-15: never add a deposit, never bring a payment nearer; the only
+    # allowed change is the final payment moving LATER. Checked FIRST, before
+    # any money figure and before the invoice-sum check: on DEMO16 the sum
+    # check returned "unconfirmed" on the TFPA FunPlay line, so this check
+    # never ran and an FSA fare adding a $200 deposit due 2026-07-28 showed
+    # as an $868 candidate. A refusal needs no price to be certain.
+    sched = check_payment_schedule(
+        original.final_due, review.final_due, original.next_due, review.next_due,
+        deposit_on_new=review.deposit_on_review)
+    if sched.allowed is False:
+        cash_text = (f"{original.gross - review.gross:,.2f}"
+                     if original.gross is not None and review.gross is not None else "?")
+        return _goccl_payment_refusal(estimate, original, review, code, cash_text,
+                                      sched.reason)
+
+    if original.gross is None:
+        return unconfirmed("the booking's own gross was not read")
+    if review.gross is None:
+        return unconfirmed("the review stated no gross amount")
+    ok, why = review.reconciles()
+    if not ok:
+        return unconfirmed(f"the review invoice does not add up ({why})")
+    # An unreadable schedule is never assumed unchanged.
+    if sched.allowed is None:
+        return unconfirmed(sched.reason)
+
+    cash = original.gross - review.gross
+    obc_change = (review.obc - original.obc
+                  if review.obc is not None and original.obc is not None else None)
+    net = cash + (obc_change or Decimal("0"))
+    base = {
+        "old_total": float(original.gross),
+        "new_total": float(review.gross),
+        "price_drop": float(cash),
+        "obc_change": float(obc_change or 0),
+        "net_saving": float(net),
+        "new_price_category": code,
+        "currency": review.currency or original.currency or estimate.currency,
+    }
+    figures = (f"CONFIRMED on Carnival's review: '{code}' gross {review.gross:,.2f} "
+               f"vs {original.gross:,.2f} now")
+    if sched.final_moved_later:
+        figures += f" [{sched.reason}]"
+    # Which category rate Carnival priced it at, and that the cabin stayed.
+    choice = choice or {}
+    rate_cat, own_cat = choice.get("category"), choice.get("own_category")
+    room = choice.get("stateroom_on_review") or choice.get("stateroom_before")
+    if rate_cat and own_cat and rate_cat != own_cat:
+        figures += (f" (priced at category {rate_cat} with the booking's "
+                    f"{own_cat} cabin{' ' + room if room else ''} kept)")
+    if any("stateroom label not shown" in w for w in review.warnings):
+        figures += " [cabin kept per Keep Same Stateroom; not re-read on review]"
+    obc_text = ("" if obc_change is None or obc_change == 0
+                else f", onboard credit {obc_change:+,.2f}")
+    # Casino FunPlay (TFPA) is a credit like OBC - never cash, never in net.
+    funplay_change = review.funplay - original.funplay
+    if funplay_change:
+        obc_text += f", casino FunPlay credit {funplay_change:+,.2f} (not cash)"
+
+    if cash <= 0:
+        gained = (" - the onboard credit gained does not count: OBC is not cash"
+                  if obc_change and obc_change > 0 else "")
+        return estimate.model_copy(update={
+            **base, "status": BookingStatus.NO_SAVING,
+            "net_saving": 0.0, "confidence": GOCCL_CONFIRMED_CONFIDENCE,
+            "note": f"no saving - {figures}{obc_text}{gained}. {terms}".strip()})
+
+    # Decimal(str(...)): the ratio is a float constant shared with ESPRESSO
+    # and NCL; the money here is exact Decimal and must stay so.
+    ratio = Decimal(str(OBC_LOSS_MIN_RATIO))
+    if obc_change is not None and obc_change < 0 and cash < ratio * -obc_change:
+        return estimate.model_copy(update={
+            **base, "status": BookingStatus.NO_SAVING,
+            "net_saving": 0.0, "confidence": GOCCL_CONFIRMED_CONFIDENCE,
+            "note": (f"no saving - {figures}{obc_text}: a {cash:,.2f} cash drop "
+                     f"for {-obc_change:,.2f} of onboard credit given up is under "
+                     f"the {OBC_LOSS_MIN_RATIO:.0f}x rule. {terms}").strip()})
+    if funplay_change < 0 and cash < ratio * -funplay_change:
+        return estimate.model_copy(update={
+            **base, "status": BookingStatus.NO_SAVING,
+            "net_saving": 0.0, "confidence": GOCCL_CONFIRMED_CONFIDENCE,
+            "note": (f"no saving - {figures}{obc_text}: a {cash:,.2f} cash drop "
+                     f"for {-funplay_change:,.2f} of casino FunPlay credit given up "
+                     f"is under the {OBC_LOSS_MIN_RATIO:.0f}x rule. {terms}").strip()})
+
+    confidence = (GOCCL_CONFIRMED_CONFIDENCE if obc_change is not None
+                  else GOCCL_CONFIRMED_OBC_UNKNOWN_CONFIDENCE)
+    obc_unknown = ("" if obc_change is not None
+                   else " [OBC_UNVERIFIED - check onboard credit before repricing]")
+    return estimate.model_copy(update={
+        **base, "status": BookingStatus.OPTIMIZATION, "confidence": confidence,
+        "note": (f"saving {cash:,.2f} - {figures}{obc_text}{obc_unknown} "
+                 f"{terms}").strip()})
 
 
 # ── ESPRESSO Free-Upgrade Detection ─────────────────────────────

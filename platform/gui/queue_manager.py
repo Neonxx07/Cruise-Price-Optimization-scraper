@@ -64,6 +64,10 @@ class BookingQueueManager:
         self._current_job_id: str | None = None
         self._job = None
         self._on_state_change: StateCallback | None = None
+        # NCL parallel workers' services and jobs (2026-10-16). Each helper
+        # service owns ONE headless browser with its OWN login.
+        self._helper_services: list[BookingService] = []
+        self._helper_jobs: list = []
 
     @property
     def is_running(self) -> bool:
@@ -103,11 +107,13 @@ class BookingQueueManager:
         done = sum(1 for item in items if item.status == QueueStatus.DONE)
         error = sum(1 for item in items if item.status == QueueStatus.ERROR)
         job = self._job
+        # With NCL parallel workers, progress is the sum over every job.
+        jobs = ([job] if job else []) + [j for _, j in getattr(self, "_helper_jobs", [])]
         return QueueSnapshot(
             items=items, queued=queued, running=running, done=done, error=error,
             current_booking_id=getattr(job, "current_booking_id", None) if job else None,
-            progress_done=getattr(job, "progress_done", 0) if job else 0,
-            progress_total=getattr(job, "progress_total", 0) if job else 0,
+            progress_done=sum(getattr(j, "progress_done", 0) for j in jobs),
+            progress_total=sum(getattr(j, "progress_total", 0) for j in jobs),
         )
 
     def add_booking(self, booking_id: str) -> bool:
@@ -182,6 +188,9 @@ class BookingQueueManager:
         checked in the browser this call opens.
         """
         await self.initialize()
+        # Remembered so an automatic second-market pass (NCL Canada) runs the
+        # way the operator chose - windowed or headless.
+        self._last_login_headless = headless
         return await self._service.check_login(
             cruise_line, timeout_minutes=timeout_minutes, headless=headless)
 
@@ -193,6 +202,15 @@ class BookingQueueManager:
         what an expired ESPRESSO session looks like.
         """
         return await self._service.session_is_logged_in(cruise_line)
+
+    async def open_booking_in_portal(self, cruise_line: CruiseLine, booking_id: str):
+        """Open one booking in a new tab of this panel's own logged-in
+        browser (GUI "Open in portal"). Refused while this panel scans: the
+        scan owns the browser and its session."""
+        if self._running:
+            raise RuntimeError("A scan is running - wait for it to finish, then Open")
+        await self.initialize()
+        return await self._service.open_booking_for_viewing(cruise_line, booking_id)
 
     async def close_live_session(self) -> None:
         """Close the shared browser session, if one is open. Call on app exit."""
@@ -269,6 +287,7 @@ class BookingQueueManager:
         capture_market_data: bool = False,
         capture_everything: bool = False,
         on_action: Callable[[dict], None] | None = None,
+        parallel: int = 1,
     ) -> None:
         if self._running:
             raise RuntimeError("Scan queue is already running")
@@ -282,6 +301,30 @@ class BookingQueueManager:
         await self.initialize()
 
         booking_ids = [item.booking_id for item in queued_items]
+        # NCL "3 AT ONCE" - separate logins, round-robin shards. The first
+        # shard runs in this tab's own (headless) browser exactly as before;
+        # each other shard in a helper service with its own login.
+        self._helper_jobs = []
+        workers = max(1, int(parallel or 1))
+        if cruise_line != CruiseLine.NCL or len(booking_ids) < workers * 2:
+            workers = 1
+        shards = [booking_ids[i::workers] for i in range(workers)]
+        booking_ids = shards[0]
+        for n, shard in enumerate(shards[1:], start=2):
+            while len(self._helper_services) < n - 1:
+                helper = BookingService()
+                helper.session_slot = f"w{len(self._helper_services) + 2}"
+                self._helper_services.append(helper)
+            helper = self._helper_services[n - 2]
+            self._helper_jobs.append((helper, await helper.start_scan(
+                shard, cruise_line, on_progress=self._on_progress,
+                bypass_cache=force_live_recheck, raw_dump_dir=raw_dump_dir,
+                capture_market_data=capture_market_data,
+                capture_everything=capture_everything, on_action=on_action,
+                keep_browser_open=False, headless=True)))
+        if workers > 1:
+            logger.info("gui.ncl_parallel_start", workers=workers,
+                        shard_sizes=[len(s) for s in shards])
         self._job = await self._service.start_scan(
             booking_ids,
             cruise_line,
@@ -302,12 +345,17 @@ class BookingQueueManager:
             on_state_change(self.get_snapshot())
 
         seen_booking_ids: set[str] = set()
+        helper_seen: dict[str, set[str]] = {}
         # Whether the stop has already been relayed to BookingService for
         # this run - see the loop below.
         stop_sent = False
         try:
-            while self._job.status.value in ("PENDING", "RUNNING"):
+            while (self._job.status.value in ("PENDING", "RUNNING")
+                   or any(j.status.value in ("PENDING", "RUNNING") for _, j in self._helper_jobs)):
                 self._sync_completed_results(on_result, on_state_change, seen_booking_ids)
+                for _svc, hjob in self._helper_jobs:
+                    self._sync_completed_results(on_result, on_state_change,
+                                                 helper_seen.setdefault(hjob.job_id, set()), job=hjob)
                 await asyncio.sleep(0.5)
                 # RELAY THE STOP ONCE, not on every poll.
                 #
@@ -324,14 +372,74 @@ class BookingQueueManager:
                 # flag is a request; once relayed, the service owns it.
                 if self._stop_requested and self._current_job_id and not stop_sent:
                     await self._service.stop_scan(self._current_job_id)
+                    for svc, hjob in self._helper_jobs:
+                        await svc.stop_scan(hjob.job_id)
                     stop_sent = True
             self._sync_completed_results(on_result, on_state_change, seen_booking_ids)
+            for _svc, hjob in self._helper_jobs:
+                self._sync_completed_results(on_result, on_state_change,
+                                             helper_seen.setdefault(hjob.job_id, set()), job=hjob)
+
+            # NCL CANADA, SAME TAB (Neon 2026-10-16: "I have added the
+            # seaweb cad ... within ncl tab and same enviromwent nothing
+            # extra"). Every booking the US account answered "not found" is
+            # re-checked on the CA account, with the CA login saved in
+            # SAVE_LOGIN option 4. bypass_cache: the US "not found" is cached
+            # and would otherwise be read straight back.
+            if (cruise_line == CruiseLine.NCL and settings.ncl_check_other_market
+                    and not self._stop_requested and self._job is not None):
+                await self._run_other_market_pass(
+                    on_result, on_state_change, raw_dump_dir, capture_market_data,
+                    capture_everything, on_action)
         finally:
             self._running = False
             self._stop_requested = False
             self._current_job_id = None
             if on_state_change:
                 on_state_change(self.get_snapshot())
+
+    async def _run_other_market_pass(self, on_result, on_state_change, raw_dump_dir,
+                                     capture_market_data, capture_everything, on_action) -> None:
+        every = list(self._job.results) + [r for _, j in self._helper_jobs for r in j.results]
+        not_here = [r.booking_id for r in every
+                    if r.status == BookingStatus.NOT_ON_THIS_ACCOUNT]
+        others = [m for m in settings.ncl_markets
+                  if m.upper() != settings.ncl_default_market.upper()]
+        if not not_here or not others:
+            return
+        market = others[0]
+        logger.info("gui.ncl_other_market_pass", market=market, bookings=len(not_here))
+        for bid in not_here:
+            item = self._find_item(bid)
+            if item is not None:
+                item.status = QueueStatus.QUEUED
+        if on_state_change:
+            on_state_change(self.get_snapshot())
+        logged_in = await self._service.check_login(
+            CruiseLine.NCL, timeout_minutes=5.0, market=market,
+            headless=getattr(self, "_last_login_headless", False))
+        if not logged_in:
+            logger.warning("gui.ncl_other_market_login_failed", market=market)
+            for bid in not_here:
+                item = self._find_item(bid)
+                if item is not None:
+                    item.status = QueueStatus.DONE      # the US answer stands
+            return
+        self._job = await self._service.start_scan(
+            not_here, CruiseLine.NCL, on_progress=self._on_progress,
+            bypass_cache=True, raw_dump_dir=raw_dump_dir,
+            capture_market_data=capture_market_data, capture_everything=capture_everything,
+            on_action=on_action, keep_browser_open=True, market=market)
+        self._current_job_id = self._job.job_id
+        seen: set[str] = set()
+        stop_sent = False
+        while self._job.status.value in ("PENDING", "RUNNING"):
+            self._sync_completed_results(on_result, on_state_change, seen)
+            await asyncio.sleep(0.5)
+            if self._stop_requested and not stop_sent:
+                await self._service.stop_scan(self._current_job_id)
+                stop_sent = True
+        self._sync_completed_results(on_result, on_state_change, seen)
 
     def stop_processing(self) -> bool:
         if not self._running:
@@ -377,10 +485,12 @@ class BookingQueueManager:
         on_result: ResultCallback | None,
         on_state_change: StateCallback | None,
         seen_booking_ids: set[str],
+        job=None,
     ) -> None:
-        if not self._job:
+        job = job if job is not None else self._job
+        if not job:
             return
-        for result in self._job.results:
+        for result in job.results:
             if result.booking_id in seen_booking_ids:
                 continue
             seen_booking_ids.add(result.booking_id)

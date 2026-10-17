@@ -33,10 +33,45 @@ def test_features_are_captured_inside_check_booking():
     assert "self.last_feature_fields = await self.read_feature_fields()" in src
 
 
+def _code_lines(func):
+    """(lineno, text) for real CODE only - comments stripped.
+
+    REWRITTEN 2026-10-07. This test used to compare raw character offsets
+    into the source:
+
+        src.index("last_feature_fields") < src.index("release_booking")
+
+    which passed for the wrong reason. The first textual occurrence of
+    `last_feature_fields` was the `= None` RESET near the top of the
+    method, not the capture, and `release_booking` first appears in a
+    COMMENT. When the reset moved into BaseScraper.reset_per_booking_state
+    the comparison inverted, while the real capture (line 142) and the
+    real release (line 450) had not moved at all.
+    """
+    import textwrap
+    src = textwrap.dedent(inspect.getsource(func))
+    return [(i, line.split("#", 1)[0])
+            for i, line in enumerate(src.splitlines(), 1)]
+
+
+def _first_line_containing(func, needle: str) -> int:
+    for lineno, text in _code_lines(func):
+        if needle in text:
+            return lineno
+    raise AssertionError(f"{needle!r} does not appear in {func.__name__}")
+
+
 def test_the_capture_happens_before_the_booking_is_released():
     """release_booking() navigates away; reading after it is the bug."""
-    src = inspect.getsource(EspressoScraper._check_booking_inner)
-    assert src.index("last_feature_fields") < src.index("release_booking")
+    capture = _first_line_containing(
+        EspressoScraper._check_booking_inner,
+        "self.last_feature_fields = await self.read_feature_fields()")
+    release = _first_line_containing(
+        EspressoScraper._check_booking_inner, "await self.release_booking(")
+    assert capture < release, (
+        f"the capture is at line {capture} and the release at {release} - "
+        "reading after release lands on the wrong page and silently "
+        "produces NULLs")
 
 
 def test_the_batch_no_longer_reads_the_page_itself():
@@ -54,11 +89,24 @@ def test_every_scraper_has_the_attribute():
 
 def test_it_is_cleared_per_booking():
     """A stale value would silently attribute the PREVIOUS booking's ship
-    and sail date to this one - worse than a NULL, because it looks real."""
-    src = inspect.getsource(EspressoScraper._check_booking_inner)
-    assert "self.last_feature_fields = None" in src
-    assert src.index("self.last_feature_fields = None") < src.index(
+    and sail date to this one - worse than a NULL, because it looks real.
+
+    UPDATED 2026-10-07: the clearing moved from a hand-written
+    `self.last_feature_fields = None` into
+    BaseScraper.reset_per_booking_state, which does the same for every
+    scraper and every cached attribute - NCL and GoCCL never had the
+    hand-written version, and 42 bookings in the live database carry
+    another booking's data because of it. The behaviour asserted here is
+    unchanged; only where it is implemented moved.
+    """
+    assert "last_feature_fields" in BaseScraper.PER_BOOKING_STATE
+
+    reset = _first_line_containing(
+        EspressoScraper._check_booking_inner, "self.reset_per_booking_state()")
+    capture = _first_line_containing(
+        EspressoScraper._check_booking_inner,
         "self.last_feature_fields = await self.read_feature_fields()")
+    assert reset < capture, "the clear happens after the capture"
 
 
 def test_a_failed_capture_does_not_break_the_booking():

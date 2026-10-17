@@ -33,6 +33,11 @@ def export_results_csv(results: list[BookingResult]) -> str:
         "Note", "Lost Packages", "Confidence", "Checked At",
         "Price Drop", "OBC Change", "Lost Fares", "Re-addable Fares", "Gained Fares",
         "Lost Travel Protection", "Promos Before", "Promos After",
+        # Appended last, like the columns above, so anything already
+        # reading this file by position keeps working. 623 of the
+        # ESPRESSO bookings in the live database are CAD; every money
+        # column here was previously silent about that.
+        "Currency",
     ])
 
     # Data rows
@@ -58,6 +63,7 @@ def export_results_csv(results: list[BookingResult]) -> str:
             "|".join(r.lost_travel_protection),
             r.old_promos,
             r.new_promos,
+            r.currency or "UNKNOWN",
         ])
 
     return output.getvalue()
@@ -80,7 +86,11 @@ def export_msc_results_csv(results: list[MscBookingResult]) -> str:
     writer = csv.writer(output, quoting=csv.QUOTE_ALL)
 
     check_types = [t.value for t in MscOpportunityType]
-    header = ["Booking ID", "Category", "Has Opportunity", "Note", "Checked At"]
+    # Prices and discounts BEFORE / TODAY added 2026-10-15 (Neon: save and
+    # show before and after for every line).
+    header = ["Booking ID", "Category", "Has Opportunity", "Note", "Checked At",
+              "Booked Price", "Today Price", "Due Amount",
+              "Discounts Held", "Discounts Offered Today"]
     for check_type in check_types:
         header += [check_type, f"{check_type} Note"]
     writer.writerow(header)
@@ -90,6 +100,11 @@ def export_msc_results_csv(results: list[MscBookingResult]) -> str:
         row = [
             r.booking_id, r.category or "", r.has_any_opportunity, r.note,
             r.checked_at.isoformat() if r.checked_at else "",
+            "" if r.current_total_price is None else r.current_total_price,
+            "" if r.today_price is None else r.today_price,
+            "" if r.due_amount is None else r.due_amount,
+            r.discounts_before if r.discounts_before is not None else "",
+            r.discounts_today if r.discounts_today is not None else "",
         ]
         for check_type in check_types:
             c = by_type.get(check_type)

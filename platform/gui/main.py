@@ -22,6 +22,7 @@ from utils.logging import (
     get_logger,
     install_crash_handlers,
     setup_logging,
+    track_background_task,
 )
 
 
@@ -41,6 +42,11 @@ def _handle_async_exception(loop, context):
 
 
 logger = get_logger(__name__)
+
+#: Strong references to startup tasks. Module scope because the loop
+#: outlives main()'s frame; track_background_task empties it as tasks
+#: finish. See its docstring for why a bare create_task is not enough.
+_startup_tasks: set = set()
 
 
 def main() -> int:
@@ -114,15 +120,34 @@ def main() -> int:
     # $3,175 looked like "zero optimization" on 2026-08-28. Scheduled on the
     # loop rather than awaited so the window paints immediately.
     async def _prime():
+        # PER PANEL, not all-or-nothing. One line's restore failing must
+        # not cost the others theirs - which is what a single raise here
+        # used to do.
         total = 0
-        for panel in window.panels.values():
-            total += await panel.load_todays_results()
-        await window.refresh_last_scan_label()
-        window._refresh_global_summary()
+        for name, panel in window.panels.items():
+            try:
+                total += await panel.load_todays_results()
+            except Exception as exc:  # noqa: BLE001
+                logger.error("gui.restore_failed", cruise_line=name,
+                             error=str(exc)[:300], exc_info=True)
+                window._append_activity(
+                    name, "could not restore today's results - see the log")
+        try:
+            await window.refresh_last_scan_label()
+            window._refresh_global_summary()
+        except Exception as exc:  # noqa: BLE001
+            logger.error("gui.restore_summary_failed",
+                         error=str(exc)[:300], exc_info=True)
         if total:
             window._append_activity("ALL", f"restored {total} result(s) from today")
 
-    loop.create_task(_prime())
+    # TRACKED, not fire-and-forget. This task exists precisely so a
+    # completed scan is not shown as "zero optimization" (2026-08-28: a
+    # 769-booking run that found 19 optimizations worth $3,175 looked
+    # empty). Left untracked, any exception inside it was reported
+    # NOWHERE and the tables simply stayed blank - the identical
+    # user-visible failure, now with no log line to find it by.
+    track_background_task(_startup_tasks, loop.create_task(_prime()))
 
     try:
         with loop:

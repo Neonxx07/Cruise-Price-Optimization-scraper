@@ -17,7 +17,7 @@ class Settings(BaseSettings):
 
     # ── App ─────────────────────────────────────────────────────
     app_name: str = "Cruise Intelligence System"
-    app_version: str = "1.1.0"
+    app_version: str = "1.2.0"
     debug: bool = False
 
     # ── API ─────────────────────────────────────────────────────
@@ -126,6 +126,7 @@ class Settings(BaseSettings):
         "NCL": 6,
         "GOCCL": 24,
         "MSC": 12,
+        "PRINCESS": 24,
     }
 
     # Outcomes that are NOT worth caching, whatever the window says.
@@ -204,10 +205,34 @@ class Settings(BaseSettings):
     # A signed-in dashboard exposes these; used to tell a live session from
     # one that has been bounced back to the login page.
     goccl_dashboard_url: str = "https://www.goccl.com/"
+    # The booking engine with the Carnival Guest Number lookup open. Taken
+    # from the SingleFile header of a real signed-in page saved 2026-10-08
+    # (Downloads/1b40c7e0-....htm). Used by GoCCLScraper.open_vifp_lookup
+    # for the MSC status-match branch.
+    goccl_vifp_lookup_url: str = "https://www.goccl.com/app/bookingengine?openLookup=yes"
+    # Take each GoCCL candidate to Carnival's /review screen (safe path,
+    # always discarded) to confirm its exact gross and onboard credit -
+    # added 2026-10-12, ROADMAP P2.2. False falls back to the old
+    # teaser-based, unconfirmed candidate.
+    goccl_confirm_on_review: bool = True
+    # ESPRESSO: when the cheaper price drops the client's perk (ALL INC 2PK /
+    # RETREAT), price it again WITH the perk on Promotions -> Compare (the
+    # booking's own perk and its NRD/refundable twin) - added 2026-10-13,
+    # booking 3000067. Never clicks Select or Continue. False = estimate only.
+    espresso_perk_compare: bool = True
+    # A booking opens directly at <this>/<booking number> - Neon 2026-10-12,
+    # and his DEMO18 recording starts there. Used before the search page.
+    goccl_booking_engine_url: str = "https://www.goccl.com/app/bookingengine"
     # OS credential-store service name, matching save_login.py. GoCCL was the
     # only line save_login.py did not offer, so a Carnival scan always needed
     # a human present.
     goccl_credential_service: str = "goccl_navigator_login"
+    # Princess OneSource (the way into POLAR), added 2026-10-15 to
+    # save_login.py / clear_login.py.
+    princess_credential_service: str = "princess_onesource_login"
+    # Where Check login lands for Princess: OneSource, from which Neon opens
+    # POLAR ("Book & Manage Cruises"). Same URL scraper/princess.py proved.
+    princess_login_url: str = "https://www.onesourcecruises.com/onesource/login"
     msc_home_url: str = "https://www.mscbook.com/us/home"
     # Param order here must stay byte-identical to what msc_commands.py's
     # three call sites have actually been sending (confirmed 2026-08-11
@@ -269,6 +294,22 @@ class Settings(BaseSettings):
     # keep working untouched; other markets get a suffixed service.
     ncl_markets: tuple[str, ...] = ("US", "CA")
     ncl_default_market: str = "US"
+    # The currency each NCL account books in (save_login.py's own labels:
+    # "NCL - US account (USD)", "NCL - Canada account (CAD)"). NCL results
+    # were "UNKNOWN" on every row - and the 2026-10-07 audit caught CAD being
+    # ADDED to USD, so a Canada result must never go out unlabelled.
+    ncl_market_currency: dict[str, str] = {"US": "USD", "CA": "CAD"}
+    # After an NCL scan, re-check every NOT_ON_THIS_ACCOUNT booking on the
+    # other market's account, inside the same NCL tab (Neon 2026-10-16:
+    # "within ncl tab and same environment nothing extra").
+    ncl_check_other_market: bool = True
+    # NCL "3 at once" (2026-10-16): workers, EACH ITS OWN LOGIN. Never tabs
+    # on one login - NCL keeps one "current reservation" per session and 3
+    # tabs returned another booking's data (3001052 came back as
+    # 3001055). Proven on 30 bookings with separate logins: 0 differences,
+    # 230 s vs 645 s. Used only when the NCL tab's "Run hidden" and "3 at
+    # once" are both ticked.
+    ncl_parallel_workers: int = 3
 
     # ── Concurrent multi-cruise-line scanning (added 2026-08-27) ──
     # How many bookings may be IN FLIGHT across ALL cruise lines at once.

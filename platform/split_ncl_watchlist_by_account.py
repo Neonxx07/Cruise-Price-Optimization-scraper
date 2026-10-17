@@ -29,7 +29,7 @@ that then succeeds on the CAD account is confirmed Canadian; any that fails
 on BOTH accounts needs a human look.
 
 USAGE
-    python split_ncl_watchlist_by_account.py                  # uses Watchlistncl.txt
+    python split_ncl_watchlist_by_account.py                  # uses watchlists/Watchlistncl.txt
     python split_ncl_watchlist_by_account.py --watchlist path/to/list.txt
     python split_ncl_watchlist_by_account.py --since 2026-08-27
 """
@@ -113,7 +113,7 @@ def _write(path: Path, ids: list[str], header: str) -> None:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    ap.add_argument("--watchlist", default="Watchlistncl.txt")
+    ap.add_argument("--watchlist", default="watchlists/Watchlistncl.txt")
     ap.add_argument("--db", default=DB)
     ap.add_argument(
         "--since", default=None,
@@ -135,13 +135,13 @@ def main() -> int:
     us, ca, recheck, unknown = _classify(conn, booking_ids, args.since)
 
     stem = wl.stem
-    _write(Path(f"{stem}_us.txt"), us,
+    _write(wl.with_name(f"{stem}_us.txt"), us,
            "READABLE on the US account (a real result was produced).")
-    _write(Path(f"{stem}_ca.txt"), ca,
+    _write(wl.with_name(f"{stem}_ca.txt"), ca,
            "CANDIDATES for the Canada (CAD) account — reported not-found on US. "
            "NOTE: another session's 30-min edit lock can also cause not-found, "
            "so a failure here is not proof of nationality.")
-    _write(Path(f"{stem}_recheck.txt"), recheck,
+    _write(wl.with_name(f"{stem}_recheck.txt"), recheck,
            "Errored for an UNRELATED reason (timeout, grid, session) — retry "
            "on the account that already sees them.")
 

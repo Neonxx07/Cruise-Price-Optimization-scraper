@@ -28,6 +28,51 @@ Nothing yet.
 
 ---
 
+## [1.2] — 2026-10-17
+
+### Added
+- **Princess (POLAR) is live — the fifth cruise line.** `scraper/princess.py` reads a
+  booking and prices its own category (read-only; it never commits a refare), and
+  `core/calculator_princess.py` was written *before* the scraper from figures that close
+  exactly, so the decision logic was settled independently of page scraping.
+  `CruiseLine.PRINCESS` now exists; behaviour recorded in `docs/PRINCESS_POLAR.md`.
+- **The payment-schedule rule** (`core/payment_schedule_rule.py`) — a deposit or payment
+  date is never added to a saving, applied across all five lines rather than re-derived
+  per scraper.
+- **Pricing a perk, not just naming it** (`core/espresso_perk_compare.py`) — reads
+  ESPRESSO's Promotions → Compare screen, so a booking that would give up its perk tier
+  now reports what *keeping* the perk costs.
+- **MSC status match** — `services/status_match_service.py` plus `MSC_Status_Match_Toolkit/`,
+  preparing one customer's evidence at a time.
+- **HubSpot booking import** (`services/hubspot_client.py`) — booking numbers read from
+  HubSpot instead of copy-paste; the token lives in the OS keyring.
+- **Saved lists per cruise line** (`gui/saved_list.py`), NCL parallel workers and a
+  Canada-market pass, GoCCL review-walk/confirm/category-bar handling, and
+  `docs/BUGS_AND_FIXES.md`.
+- `tools/export_session.py`, and `platform/CLAUDE.md` recording the project's working rules.
+
+### Security
+- **`.gitignore`: booking lists moved into `platform/watchlists/` on 2026-10-16 and the
+  existing rules — anchored at `platform/` root — did not reach them. 877 real booking
+  numbers across 10 files would have been committed.** The directory is now ignored
+  wherever it appears.
+- **Exported session transcripts are ignored.** `tools/export_session.py` is source and is
+  committed; its output is a raw conversation dump — the 2026-10-07 one was 4.2 MB and
+  76k lines, carrying 794 real booking numbers.
+- **Real customer PII removed from test fixtures and source.** A saved GoCCL guest page
+  carried a named individual's full name, date of birth and loyalty number, repeated in
+  the test's expectations and in two source modules. Replaced with a consistent
+  placeholder identity, so the tests still assert the same behaviour.
+- `*.zip` ignored — an archive duplicated a module whose source sits beside it, and
+  carried its `.pyc` files.
+
+### Removed
+- The five spent 2026-09-23 headless investigation scripts and `verify_upgrades.py`,
+  deleted in v1.1 and restored by a working-copy sync. Re-removed after re-checking that
+  nothing imports them.
+
+---
+
 ## [1.1] — 2026-10-03
 
 ### Added

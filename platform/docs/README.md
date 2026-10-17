@@ -8,6 +8,9 @@ Start with the roadmap; the rest are reference and history.
 |---|---|
 | [ROADMAP.md](ROADMAP.md) | **Start here.** Prioritised P0–P4, every item backed by a figure from the database or the log |
 | [ESPRESSO_PERK_TIERS.md](ESPRESSO_PERK_TIERS.md) | **Read before touching `core/calculator.py`.** The four mutually exclusive perk tiers, why a positive `CRUISE_PROMO` stays subtracted, and a documented dead end that tested green and was wrong |
+| [PRINCESS_POLAR.md](PRINCESS_POLAR.md) | How the POLAR portal behaves, and what the read-only Princess scraper may and may not do |
+| [BUGS_AND_FIXES.md](BUGS_AND_FIXES.md) | A running record of what broke and what fixed it |
+| [RESEARCH_TOOLS_2026_10_15.md](RESEARCH_TOOLS_2026_10_15.md) | Tooling notes from the 2026-10-15 research pass |
 | [MSC_DISCOUNT_RULES.md](MSC_DISCOUNT_RULES.md) | Which MSC discounts combine, which are agency-side, and which never apply |
 | [ESPRESSO_SESSION_BUGS_2026_09.md](ESPRESSO_SESSION_BUGS_2026_09.md) | The measured session and navigation failures, and what fixed them — including the evidence that ESPRESSO cannot run headless |
 

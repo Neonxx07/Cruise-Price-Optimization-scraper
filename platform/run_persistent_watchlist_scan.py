@@ -22,7 +22,11 @@ import sys
 from datetime import datetime
 
 from config.settings import settings
-from core.calculator import total_optimization_savings, unconfirmed_candidate_total
+from core.calculator import (
+    format_savings_by_currency,
+    savings_by_currency,
+    unconfirmed_candidate_total,
+)
 from core.models import CruiseLine
 from main import remove_paid_in_full_from_watchlist
 from models.database import init_db
@@ -31,7 +35,7 @@ from services.csv_export import export_results_csv
 from services.excel_export import export_results_excel
 from utils.logging import setup_logging
 
-WATCHLIST_PATH = "watchlist.txt"
+WATCHLIST_PATH = "watchlists/watchlist.txt"
 POLL_INTERVAL_S = 30
 
 
@@ -153,9 +157,11 @@ async def run_one_scan(service: BookingService, booking_ids: list[str]) -> None:
               f"Results are still in the database and the CSV above. {e}")
 
     opts = [r for r in job.results if r.status.value == "OPTIMIZATION"]
-    total_saving = total_optimization_savings(job.results)
+    # By currency - a single '$' total was adding CAD to USD.
+    # See core.calculator.savings_by_currency.
+    savings_line = format_savings_by_currency(savings_by_currency(job.results))
     unconf_n, unconf_total = unconfirmed_candidate_total(job.results)
-    print(f"\n💰 Total savings found: ${total_saving:.2f} across {len(opts)} booking(s)")
+    print(f"\n💰 Total savings found: {savings_line.replace(' confirmed savings', '')} across {len(opts)} booking(s)")
     if unconf_n:
         print(f"   {unconf_n} UNCONFIRMED candidate(s) worth ${unconf_total:,.2f} excluded from the total - verify before trusting")
 

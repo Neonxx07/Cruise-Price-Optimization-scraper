@@ -17,25 +17,28 @@ P0 is reliability. Everything else waits.
 | `P0.2` | Resumable jobs | ✅ done |
 | `P0.3` | Retry queue | ✅ done |
 | `P0.4` | Root‑cause the ESPRESSO session collapse | ◻ open |
-| `P0.5` | The release that fails | ✅ fixed, pending live verification |
+| `P0.6` | The scan logs back in | ✅ done |
+| `P0.7` | "COMPLETED" now means every booking was checked | ✅ done |
+| `P0.5` | The release that fails | ◻ open |
+| `P0.8` | Audit findings, 2026-10-07 | ◻ open |
 | `P1.1` | Outcome tracking | ✅ done |
 | `P1.2` | Calculator version stamp in the cache | ✅ done |
 | `P1.3` | Agency commission | — out of scope |
 | `P1.4` | Why we under-quoted | ✅ done |
-| `P2.1` | Turn MSC on | ⚠ persistence built, not yet scanning |
+| `P2.1` | Turn MSC on | ⚠ persists to msc_results, not the main flow |
 | `P2.2` | Revive GoCCL | ◻ open |
-| `P2.3` | Build Princess POLAR | ◻ open |
+| `P2.3` | Build Princess POLAR | ✅ done |
 | `P3.1` | Scheduling | ◻ open |
 | `P3.2` | A run you can judge from the log | ✅ done |
 | `P3.3` | `structure_watch` drift alerts | ✅ done |
 | `P4.1` | Make `release_booking` faster | ⚠ partial |
-| `P4.2` | Price the perk automatically | ◻ open |
+| `P4.2` | Price the perk automatically | ✅ done |
 | `P4.3` | Export | ⚠ partial |
 | `P4.4` | Backfill permanent exclusions | ◻ open |
 | `P4.5` | Revisit price prediction | ◻ open |
 | `P4.6` | Audit the silent exception swallows | ◻ open |
 
-**8 of 21 complete**, 3 partial. Detail below — each item states what it is measured against and what "done" means.
+**12 of 24 complete**, 3 partial. Detail below — each item states what it is measured against and what "done" means.
 
 ---
 
@@ -172,6 +175,64 @@ minutes, log in once by hand, and watch whether the session survives two
 minutes with the scanner off. That single observation separates "something
 else holds the account" from "we are being throttled".
 
+**Partly defused 2026‑10‑07 — see P0.6.** The collapse still has no
+explanation, but it no longer *ends a run*. Diagnosing it stays worthwhile;
+it is no longer the thing costing hundreds of bookings a night.
+
+---
+
+### P0.6 — The scan logs back in ✅ FIXED 2026‑10‑07
+
+Neon: *"we are still having the esspresso login bug issue idk when u will
+fix it"* — the same day a run checked **451 of 769** bookings.
+
+**`_check_login` is a detector and was wired straight to a raise.**
+`auto_login()` existed the whole time and was called from exactly one place:
+the GUI's Start button. When the session dropped mid‑scan nothing ever tried
+again.
+
+    14:45:59  gui.start_auto_login_ok          ← a login DID work
+    16:47:41  login.required  .../login
+    16:47:47  batch.error 3001037 "Not logged in"
+    16:49:31  batch.complete  checked=451 requested=769
+
+Across the whole log `auto_login` returns **OK 19 / ALREADY_LOGGED_IN 8 /
+FILLED_AWAITING_MFA 13 / NO_LOGIN_FORM 1** — about two thirds of drops are
+recoverable with nobody at the desk, including the 14:45 login on that very
+run.
+
+`_ensure_logged_in()` now re‑logs in and verifies the result (auto_login's
+own docstring records a false `ALREADY_LOGGED_IN` that made it do nothing).
+It does **not** pretend MFA can be automated: when a code is demanded the
+credential is already in the form, so it waits a bounded 3 minutes — once per
+scan, never 3 minutes × 318 remaining bookings.
+
+**Done when:** a run survives a mid‑scan `login.required` and logs
+`espresso.relogin_verified ok=True`.
+
+---
+
+### P0.7 — "COMPLETED" now means every booking was checked ✅ FIXED 2026‑10‑07
+
+The run above recorded **COMPLETED** with 318 bookings unchecked, because the
+for‑loop exited without raising. Two mechanisms key off that word and both
+were misled:
+
+* `recent_identical_scan` suppresses a rescan for 2 hours — Neon pressed
+  Start twice at 17:28 to pick up the leftovers and was refused
+  (`minutes_remaining: 81`) on the strength of a run that never touched them.
+* `resumable_jobs` selects `status != COMPLETED` — the job most worth
+  resuming was invisible to it.
+
+Both docstrings already said an interrupted run must not count. One line made
+it count anyway. New `ScanJobStatus.INCOMPLETE`; both mechanisms then work as
+already documented, with no further change.
+
+**Scale, measured in the live DB: 13 ESPRESSO jobs back to 2026‑09‑22 were
+marked COMPLETED while abandoning bookings** — two having checked 1 of 723.
+Not one ESPRESSO run in three weeks had genuinely finished. Relabelled
+INCOMPLETE; only the status column was touched, no result altered or removed.
+
 ---
 
 ### P0.5 — The release that fails
@@ -187,6 +248,59 @@ sibling note in `espresso-release-always` memory.
 ---
 
 ## P1 — Know whether any of it worked
+
+### P0.8 — Audit findings, 2026-10-07
+
+Four defects found by auditing the LIVE DATA rather than the code, each
+confirmed against the database before anything was changed.
+
+**Per-booking state leaked between bookings.** A scraper instance checks
+hundreds of bookings in a row and `BookingService` reads several cached
+attributes AFTER `check_booking` returns, keyed to that booking. NCL and
+GoCCL never cleared them. **21 payment payloads are stored against 42
+different bookings** — every group pairing a real booking with a
+NOT_ON_THIS_ACCOUNT one, which returns before its own capture. ESPRESSO had
+been fixed three times, one attribute at a time; the fix was never made
+general. Now `BaseScraper.reset_per_booking_state()` +
+`PER_BOOKING_STATE`. Affected rows are listed in
+`data/reference/misattributed_market_data_2026_10_07.json` — **not deleted**.
+
+**NCL could not report a cancelled booking at all.** ESPRESSO checks
+`is_cancelled()` before every pricing gate; NCL had nothing. A cancelled
+booking has no balance, so `net_due <= 0.01` filed it as PAID IN FULL. The
+portal states the status plainly in a field captured in **1,478 of 1,478**
+NCL snapshots and never read — BOOKED 1295, CLOSED 133, CANCELED 32,
+TERMINATED 18. Two real CANCELED bookings went out as PAID_IN_FULL the same
+day (3001043, 3001046), plus 6 TERMINATED and 41 CLOSED. CLOSED and
+TERMINATED are deliberately **not** interpreted.
+
+**NCL never honoured the never-rescan rule.** `record_paid_in_full` reads
+`last_payment_status`, which `NclScraper` never set, so every NCL booking
+failed the first guard: **215 ESPRESSO exclusions, 0 NCL**, 368
+`exclusion.refused payment_panel_unreadable` in one day. 122 of the 188
+bookings in that NCL run were paid-in-full and were all re-scanned. Fixed —
+and gated on the portal status above, because making the previous bullet's
+wrong calls permanent would have been unrecoverable.
+
+**Canadian dollars were added to American ones.** Flagged 2026-08-13 and
+deferred because filtering would have silently dropped results. Splitting
+drops nothing. **35 CAD optimizations** were inside a figure printed with a
+`$`; ESPRESSO alone holds 2,992 USD and 623 CAD rows. `savings_by_currency`
+now splits every total, the Excel and CSV exports carry a Currency column,
+and a single-currency total reads exactly as before.
+
+**Plus two reliability fixes.** A run now gives up after 3 consecutive
+unrecoverable-session failures instead of grinding through every remaining
+booking (there was no abort at all, only a cooldown), and the startup
+restore task is tracked, so the task that exists to stop results vanishing
+can no longer fail silently.
+
+**Still open:** NCL records no currency at all — its portal renders `$` for
+both the US and CA accounts and never a code, so it cannot be read from the
+page. The market (`US`/`CA`) is known and would settle it, but that is
+Neon's call, not a guess this project should make.
+
+---
 
 ### P1.1 — Outcome tracking ✅ BUILT 2026-10-01
 
@@ -334,7 +448,24 @@ accumulate into now, which it never had before.
 Confirmed live 2026‑09‑18, **5 bookings, dormant for two months**. `/review`
 was never wired into production.
 
-### P2.3 — Build Princess POLAR
+**2026‑10‑12: `/review` is now wired in** (`GoCCLScraper.confirm_candidate_on_review`
++ `core/calculator.apply_goccl_review`, setting `goccl_confirm_on_review`).
+Each candidate is walked to Carnival's review on the safe path proven live
+2026‑09‑18 (own category, Keep Same Stateroom, Confirm blocked, always
+discarded) and judged on the coded invoice: cash decides (rule 12), OBC
+loss needs 3×, a stopped walk stays an UNCONFIRMED candidate with its
+reason. Tested offline against a single‑page fake wizard serving DEMO11's
+real invoice. **Not yet run live** — needs a GoCCL booking list.
+
+Same day, from Neon's DEMO18 recordings: category rows tried **cheapest
+first, used only when Keep Same Stateroom enables**, cabin re-verified on
+/review; **nothing may be lost** (a downgrade-only or OBC-losing cheaper fare
+is NO_SAVING); bookings open by **direct link** `/app/bookingengine/<REF>`;
+the discard "Are you sure?" box is answered. **Open:** a fare switch can
+re-impose a deposit already past due (DEMO18: $300 due Aug 07 2026) — not yet
+checked; build it from the first live review capture.
+
+### P2.3 — Build Princess POLAR ✅ BUILT 2026-10-15
 
 Reverse‑engineered 2026‑09‑16 — 8‑step refare wizard, fares on CATEGORY FARE
 COMPARISONS — and never started. **Hazard already documented: CANCEL BOOKING
@@ -342,6 +473,10 @@ sits next to REBOOK.** Treat that as a hard constraint from day one.
 
 > **Every new line must use the `finally:` release pattern from day one.**
 > ESPRESSO left 389 of 624 bookings locked because it did not.
+
+**Shipped 2026-10-15:** `scraper/princess.py` (read-only; it never commits a refare)
+and `core/calculator_princess.py`, the latter written first from figures that close
+exactly. See [PRINCESS_POLAR.md](PRINCESS_POLAR.md).
 
 ---
 
@@ -437,13 +572,16 @@ line, kept separate from the existing `release_booking` stage so the 1,369
 historical records stay comparable. **The next real ESPRESSO run says which
 step to attack.**
 
-### P4.2 — Price the perk automatically
+### P4.2 — Price the perk automatically ✅ BUILT 2026-10-13
 
 The scanner flags *that* a perk tier is given up (134 bookings) but never
 *what keeping it costs* — that number lives only on the Promotions → Compare
 screen. Neon's 2026‑09‑30 recording has every selector, and the flow mutates
 nothing. Blocked on P0.4: it means more pages per booking against a portal
 whose session behaviour is not yet understood.
+
+**Shipped 2026-10-13:** `core/espresso_perk_compare.py` reads Promotions → Compare,
+so a flagged booking now reports what keeping the perk costs.
 
 ### P4.3 — Export ⚠ partly exists
 
@@ -469,7 +607,8 @@ call.
 Not viable as measured on 2026‑09‑21 (temporal AUC 0.686; 0.549 without
 scan‑cadence artifacts; 81% of prices never move). Root cause was **missing
 features**, and 14 driver columns are now captured per scan. Worth re‑measuring
-once P1.1 provides real outcomes. **No LLM — hard rule.**
+once P1.1 provides real outcomes. (Was "No LLM — hard rule"; that rule was
+replaced on 2026‑10‑15 by P5 below.)
 
 ### P4.6 — Audit the silent exception swallows
 
@@ -480,9 +619,51 @@ alerted on. Worth a pass with judgement, not a blanket rewrite.
 
 ---
 
+## P5 — The destination: an AI agent that runs CruiseIntel
+
+**Neon, 2026‑10‑15:** *"the roadmap at the end is make an ai agent doing all
+of this instead of a static codes running we need something more live brain
+like can learn can update can never lose focus can never ever make mistake so
+brilliant"*. This replaces the 2026‑08‑25 "no AI/LLM anywhere" rule.
+
+**What it should do** — the work Neon does by hand today:
+- run the scans, watch them, and recover them (logins, drops, stuck jobs);
+- investigate a disputed result the way the bug log was built: open the
+  booking read‑only, read the database and the log, find the cause;
+- notice portal changes (a moved button, a new pop‑up, a new fee code like
+  TFPA) and propose the fix with the evidence;
+- learn from outcomes (P1.1: which savings were applied, which Neon
+  rejected and why) and from every correction he has made;
+- explain each finding in plain words, with the figures.
+
+**Recommended design (Claude's recommendation, for Neon to decide):**
+- **"Never makes a mistake" cannot come from a model alone.** Models misread
+  numbers and are confidently wrong. The reliable version is a model on top
+  of the deterministic code this project already has: the agent decides
+  *what to look at and what to do next*; the calculator, the payment rule
+  and the reconcile checks remain the ONLY source of a money figure, and
+  their verdict cannot be overridden by the agent.
+- **The hard rules are enforced in code, not in a prompt** — no Confirm/
+  Save/Cancel controls exposed as tools at all; OBC never cash; payment
+  dates; never delete data; one ESPRESSO session.
+- **Staged rollout**, each stage measured against the corpus before the
+  next: (1) read‑only advisor that explains results and drafts
+  investigations; (2) run supervisor that restarts and triages scans;
+  (3) proposes code fixes with tests for Neon to approve; (4) anything
+  touching a live booking stays a human click.
+- **Evaluation set** from what already exists: Neon's corrections in
+  BUGS_AND_FIXES (DEMO16, 3001042, 3001014, 3000067, …), the 46 recorded
+  applied optimizations, and the 18,000+ booking rows.
+- **Not started.** Needs Neon's choices on provider, cost and where data may
+  be sent (client names and bookings would leave the machine).
+
+---
+
 ## Hard rules this roadmap must not break
 
-- **No AI/LLM/API keys anywhere, ever.**
+- **The AI agent (P5) is the destination**; until it is approved, no model
+  calls are added piecemeal. Every rule below binds the agent too, enforced
+  in code. API keys only through the OS keyring.
 - **Never delete captured data**, and never quietly reduce its fidelity.
 - **ESPRESSO never headless** — re‑tested three ways; every headless mode 404s
   at the CDN edge.

@@ -30,8 +30,15 @@ from glom import Coalesce, glom
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
 from config.settings import settings
-from core.calculator import calculate_goccl, make_error_result
+from core.calculator import (
+    apply_goccl_review,
+    calculate_goccl,
+    make_cancelled_result,
+    make_error_result,
+)
+from core.goccl_review import ReviewInvoice, parse_review_changes
 from core.models import BookingResult, BookingStatus, CruiseLine
+from core.vifp_guest import CarnivalGuestInfo, guest_info_from_fields, normalise_guest_number
 from utils.logging import get_logger, track_background_task
 
 from .base import BaseScraper, is_dead_browser_error
@@ -120,6 +127,12 @@ class FareCodeCandidateResult:
     new_obc_lines: dict = field(default_factory=dict)  # e.g. {"POBC": 25.0, "NOBC": 25.0}
 
 
+class BookingCancelled(Exception):
+    """GoCCL says the booking is cancelled (span#ctl00_DefaultContent_
+    lblErrorMessage "This booking is cancelled" - DEMO46, every run since
+    2026-10-13). A fact about the booking, reported as CANCELLED."""
+
+
 class GoCCLScraper(BaseScraper):
     """
     Playwright-based scraper for GoCCL Navigator (Carnival travel-agent portal).
@@ -204,6 +217,9 @@ class GoCCLScraper(BaseScraper):
         "submit payment",
         "make a payment",
         "pay with funship pay",
+        # A cancelled booking's page offers REACTIVATE BOOKING next to the
+        # "This booking is cancelled" message (DEMO46, 2026-10-16).
+        "reactivate",
     )
 
     def _assert_safe_click(self, label: str | None) -> None:
@@ -485,7 +501,7 @@ class GoCCLScraper(BaseScraper):
     # ── RULE ADV-001: the portal refuses, and says why ──────────────────
     #
     # Found 2026-09-18 by capturing API RESPONSE BODIES during the forensic
-    # sweep. Four bookings (DEMO09, DEMO52, DEMO51, DEMO49) reached /guest
+    # sweep. Four bookings (DEMO09, DEMO20, DEMO19, DEMO16) reached /guest
     # and then sat there until open_change_offer_rate timed out after 30
     # seconds with "waiting for section.rate__container". Nothing in the DOM
     # explained it - the Change Offer/Rate control is byte-identical to a
@@ -635,14 +651,51 @@ class GoCCLScraper(BaseScraper):
         """Non-blocking advisories, kept for evidence and schema-drift watch."""
         return [a for a in self.last_advisories if not a.get("blocking", True)]
 
+    async def _open_booking_directly(self, booking_number: str) -> bool:
+        """Open the booking at /app/bookingengine/<number>. True only when
+        the booking page arrived AND it is this booking.
+
+        Neon 2026-10-12: "the link does not change ... i just keep changing
+        after /" - his DEMO18 recording starts at exactly that address, and
+        the captured DEMO08 page there carries the same #booked-root the
+        search path waits for. The booking number is then checked against
+        the page's own initialData, so a redirect can never hand us another
+        booking's data. False (e.g. a signed-out session landing on a login
+        page) falls back to the search page.
+        """
+        ref = booking_number.strip().upper()
+        url = f"{settings.goccl_booking_engine_url}/{ref}"
+        self.log_action("open_booking_direct", booking_id=ref, url=url)
+        try:
+            await self.navigate(url, wait_until="domcontentloaded")
+        except Exception as exc:  # noqa: BLE001 - the search path still works
+            if is_dead_browser_error(exc):
+                raise
+            return False
+        if not await self._search_landed(timeout=20000):
+            return False
+        shown = await self.page.evaluate(
+            "() => (window.initialData && window.initialData.bookingNumber) || null")
+        if str(shown or "").strip().upper() != ref:
+            logger.warning("goccl.direct_link_other_booking", requested=ref, shown=shown)
+            return False
+        return True
+
     async def search_booking(self, booking_number: str) -> None:
-        # Reach the booking engine through the real flow (popup and all)
-        # rather than deep-linking into it.
-        await self.open_booking_tool()
         # Advisories are per booking - clear them, then listen. Attached
-        # here rather than in start() so the listener is bound to the page
-        # the wizard actually runs on (the booking engine, not the portal).
+        # to the page the wizard actually runs on (the booking engine, not
+        # the portal).
         self.last_advisories = []
+
+        # FASTEST, AND PROVEN: the direct booking address (2026-10-12).
+        if await self._open_booking_directly(booking_number):
+            self._attach_advisory_listener()
+            self.log_action("search_submitted", booking_id=booking_number, via="direct_link")
+            await self.dump_page_snapshot(booking_number, "after_search")
+            return
+
+        # Otherwise the real flow through the search page (popup and all).
+        await self.open_booking_tool()
         self._attach_advisory_listener()
 
         booking_input = self.page.locator(self.SEARCH_INPUT)
@@ -689,8 +742,19 @@ class GoCCLScraper(BaseScraper):
             if await self._search_landed(timeout=15000):
                 submitted_by = name
                 break
+            refusal = await self._search_refusal()
+            if refusal:
+                break
 
         if submitted_by is None:
+            refusal = await self._search_refusal()
+            if refusal and refusal[0] == "cancelled":
+                raise BookingCancelled(refusal[1])
+            if refusal and refusal[0] == "maintenance":
+                raise RuntimeError(
+                    f"GoCCL showed its maintenance page for {booking_number} "
+                    f"('{refusal[1][:90]}') - a portal problem with this booking, "
+                    f"not a scraper fault; check it by hand")
             raise RuntimeError(
                 f"GoCCL search for {booking_number} never reached the booking "
                 f"page (#booked-root) after trying the Search link, the "
@@ -698,6 +762,47 @@ class GoCCLScraper(BaseScraper):
             )
         self.log_action("search_submitted", booking_id=booking_number, via=submitted_by)
         await self.dump_page_snapshot(booking_number, "after_search")
+
+    async def _open_booking_for_viewing(self, booking_id: str) -> None:
+        """Open in portal (GUI button): the scan's own search_booking.
+
+        search_booking also resets advisories and may follow the booking
+        engine into a popup (setting portal_page); none of that may leak
+        into the scan's state, so it is saved and put back. The page that
+        ends up holding the booking stays in self._page for the caller.
+        """
+        saved = (self.portal_page, self.last_advisories, self._advisory_listener_attached)
+        # Never attach the advisory listener to the person's tab: whatever
+        # they browse there during a later scan would land in that scan's
+        # booking advisories.
+        self._advisory_listener_attached = True
+        try:
+            await self.search_booking(booking_id)
+        finally:
+            (self.portal_page, self.last_advisories,
+             self._advisory_listener_attached) = saved
+
+    # GoCCL's search page states its refusal in this label (read live on
+    # DEMO46 2026-10-16: "This booking is cancelled").
+    _SEARCH_MESSAGE = "#ctl00_DefaultContent_lblErrorMessage"
+
+    async def _search_refusal(self) -> tuple[str, str] | None:
+        """("cancelled" | "maintenance", text) when GoCCL refused to open the
+        booking, else None. Never raises."""
+        try:
+            label = self.page.locator(self._SEARCH_MESSAGE)
+            if await label.count():
+                text = (await label.first.inner_text()).strip()
+                if "cancel" in text.lower():
+                    return "cancelled", text
+            body = (await self.page.inner_text("body"))[:2000]
+            # DEMO47 2026-10-15/16: "Oops...the site is not currently
+            # available, but we're working on it. ... routine site maintenance"
+            if "not currently available" in body.lower():
+                return "maintenance", " ".join(body.split())[:160]
+        except Exception:
+            return None
+        return None
 
     async def _search_landed(self, timeout: int = 15000) -> bool:
         """Has the booking page arrived? The only trustworthy success signal."""
@@ -804,12 +909,12 @@ class GoCCLScraper(BaseScraper):
             # core/calculator_msc.py 6, GoCCL had zero - and 6 of the 14
             # bookings surveyed on 2026-09-18 were already SETTLED
             # (netBalanceDue == 0), two of them past their final payment
-            # date (DEMO54 8/23/2026, DEMO56 8/11/2026). Every one had a
+            # date (DEMO35 8/23/2026, DEMO38 8/11/2026). Every one had a
             # working rate screen, so the scanner would have reported a
             # confident saving on a booking that is fully paid.
             #
             # netBalanceDue is the field to trust, NOT gross - paid. On
-            # DEMO55 gross 1,987.31 - paid 1,766.81 = 220.50 while
+            # DEMO37 gross 1,987.31 - paid 1,766.81 = 220.50 while
             # balanceDue read 51.00; netBalanceDue was 0.00 and reconciled
             # exactly against net - paid. What balanceDue represents when
             # the two disagree is UNKNOWN and is deliberately not guessed at
@@ -1013,11 +1118,40 @@ class GoCCLScraper(BaseScraper):
                     self._assert_safe_click(await btn.inner_text())
                     await btn.click(timeout=5000)
                     self.log_action("discard_changes", selector=selector)
+                    await self._answer_discard_confirmation()
                     await self.page.wait_for_load_state("networkidle", timeout=10000)
                     return True
             except Exception:
                 continue
         return False
+
+    #: The "Are you sure? Navigating away from this page will discard any
+    #: selections..." box. Recorded by Neon on DEMO18, 2026-10-12: Discard
+    #: All Changes on /review opens it, and nothing is discarded until
+    #: "Yes, Discard Changes" is pressed.
+    _DISCARD_CONFIRM = 'div[role="dialog"] button:has-text("Yes, Discard Changes")'
+
+    async def _answer_discard_confirmation(self) -> bool:
+        """Press "Yes, Discard Changes" if the confirmation box appears.
+
+        Without this the booking was left parked mid-edit behind an
+        unanswered dialog - the same hazard discard_changes exists to end.
+        Not every step asks (Discard Changes on /rate and /category did not
+        in any capture), so its absence is fine. Never raises."""
+        yes = self.page.locator(self._DISCARD_CONFIRM).first
+        try:
+            await yes.wait_for(state="visible", timeout=3000)
+        except Exception:
+            return False
+        try:
+            self._assert_safe_click(await yes.inner_text())
+            await yes.click(timeout=5000)
+            await yes.wait_for(state="hidden", timeout=5000)
+            self.log_action("discard_confirmed")
+            return True
+        except Exception as exc:  # noqa: BLE001 - discard runs on error paths
+            logger.warning("goccl.discard_confirm_failed", error=str(exc)[:200])
+            return False
 
     async def read_obc_breakdown(self) -> dict:
         """Reads the PERKS section of the price breakdown on the review screen —
@@ -1035,6 +1169,289 @@ class GoCCLScraper(BaseScraper):
             result[code] = self._parse_price(value_attr) if value_attr else 0.0
         return result
 
+    # ── confirming a candidate on /review (ROADMAP P2.2, 2026-10-12) ─────
+    #
+    # The click sequence is the one walked live on 2026-09-18 by
+    # goccl_safe_review.py (data/goccl_safe_review/): DEMO11 and DEMO39
+    # reached /review, DEMO42 stopped at REVIEW_PATH_BLOCKED. Every
+    # selector below was read off those captured pages and
+    # data/goccl_watch/20260918T113403/:
+    #   /rate      div.rate-code-tile[data-rate-code] button[data-rate-meta-name]
+    #              button[data-comp="goto-next-page"]   "Continue"
+    #   /category  tr[data-cat="<own>"] button          "Select $1,391"
+    #              button[data-comp="continue-to-review"] "Keep Same Stateroom"
+    #   /review    GET .../manage/<ref>/review-changes  the coded invoice
+    #
+    # PATH A ONLY (Neon, 2026-09-18): the booking keeps its own category
+    # and stateroom. If "Keep Same Stateroom" stays disabled the walk STOPS
+    # (REVIEW_PATH_BLOCKED) - another cabin is never picked to force the
+    # review. "Confirm Changes" stays blocked by _assert_safe_click, and
+    # check_booking discards on every path.
+
+    _REVIEW_CHANGES_RE = re.compile(
+        r"/app/bookingengine/api/v1\.0/manage/[^/?]+/review-changes", re.I)
+    _KEEP_SAME = 'button[data-comp="continue-to-review"]'
+    #: How long Keep Same Stateroom is given to enable, PER CATEGORY ROW tried
+    #: (the live walker of 2026-09-18 used 16s for its one row).
+    _KEEP_SAME_WAIT_S = 10.0
+    #: At most this many category rows are tried per candidate, cheapest first.
+    _MAX_CATEGORY_TRIES = 6
+    #: The cabin label on /review - "Stateroom #1114" on DEMO08
+    #: (data/goccl_watch/20260918T113403/009_win2_review.html).
+    _STATEROOM_LABEL = '[data-component="offer-details-bar-stateroom-label"]'
+    #: Which category row the last confirmation used (see confirm_candidate_on_review).
+    last_review_choice: dict | None = None
+
+    async def _keep_same_enabled(self, keep, wait_s: float) -> bool:
+        """Is Keep Same Stateroom present and enabled? Polled, because it
+        enables a moment after a row is selected. `disabled` alone is not
+        trusted - aria-disabled is checked too, as the live walker did."""
+        deadline = time.monotonic() + wait_s
+        while True:
+            try:
+                if (await keep.count() and await keep.is_enabled()
+                        and (await keep.get_attribute("aria-disabled")) != "true"):
+                    return True
+            except Exception:
+                pass
+            if time.monotonic() >= deadline:
+                return False
+            await asyncio.sleep(1.0)
+
+    def original_stateroom(self) -> str | None:
+        """The booking's cabin number, from the page it loaded with."""
+        room = (self.last_initial_data or {}).get("stateroom")
+        code = room.get("code") if isinstance(room, dict) else None
+        return str(code).strip().upper() if code else None
+
+    #: The "Current Selections" bar on /rate and /category. Neon 2026-10-12:
+    #: "check the category from here". Real markup (captured on DEMO40's and
+    #: DEMO43's rate and category pages the same day):
+    #:   <article data-component="booking-details-bar" data-component-name=
+    #:            "category" data-detail="8D" data-metaname="BALCONY"
+    #:            data-upgrade-to="Upgraded to: " ...>
+    #: data-detail is the RATE category; when Carnival has upgraded the cabin
+    #: the bar also reads "Upgraded to: 6B" (DEMO18: "6A Upgraded to: 6B").
+    _CATEGORY_BAR = ('article[data-component="booking-details-bar"]'
+                     '[data-component-name="category"]')
+
+    async def read_category_bar(self) -> dict | None:
+        """{"category", "stateroom_type", "upgraded_to"} from the bar, or None."""
+        bar = self.page.locator(self._CATEGORY_BAR).first
+        try:
+            if not await bar.count():
+                return None
+            detail = ((await bar.get_attribute("data-detail")) or "").strip().upper()
+            meta = ((await bar.get_attribute("data-metaname")) or "").strip().upper()
+            text = " ".join((await bar.inner_text()).split())
+        except Exception:
+            return None
+        up = re.search(r"Upgraded to:\s*([A-Z0-9]+)", text, re.I)
+        return {"category": detail or None, "stateroom_type": meta or None,
+                "upgraded_to": up.group(1).upper() if up else None}
+
+    async def _deposit_on_review(self) -> bool | None:
+        """Does /review's Payment Schedule list a Deposit? None if the box
+        was not found. Neon's DEMO18 screenshot (2026-10-12) shows it as
+        its own line - "Deposit $300.00 / Due Date Aug07, 2026" - above
+        "Final Payment"; the captured DEMO08 review lists only Final Payment
+        and Due Date under the "Payment Schedule" title."""
+        try:
+            lines = await self.page.evaluate("""() => {
+                const out = [];
+                for (const line of document.querySelectorAll('[data-component="price-breakdown-line"]')) {
+                    const sec = line.closest('[data-component="price-breakdown-children"], [data-component="price-breakdown"]');
+                    const title = sec && sec.querySelector('[data-component="price-breakdown-children__title"], [data-component="price-breakdown__header"]');
+                    const d = line.querySelector('[data-component="price-breakdown-line__description"]');
+                    out.push([(title && title.innerText || '').trim(), (d && d.innerText || '').trim()]);
+                }
+                return out;
+            }""")
+        except Exception:
+            return None
+        schedule = [desc for title, desc in lines if "payment schedule" in title.lower()]
+        if not schedule:
+            return None
+        return any(desc.lower().startswith("deposit") for desc in schedule)
+
+    async def _stateroom_on_review(self) -> str | None:
+        """The cabin number /review shows, or None if the label is absent."""
+        label = self.page.locator(self._STATEROOM_LABEL).first
+        try:
+            await label.wait_for(state="attached", timeout=5000)
+            text = (await label.inner_text()).strip()
+        except Exception:
+            return None
+        match = re.search(r"#\s*([A-Z0-9]+)", text, re.I)
+        return match.group(1).upper() if match else None
+
+    def original_invoice(self) -> ReviewInvoice:
+        """The booking's own invoice, from the page it loaded with.
+
+        initialData.invoiceSummary.agentInvoice has the SAME schema as the
+        review-changes response, so before and after are read by the same
+        parser and compared like for like (DEMO08: gross 1,365.81, POBC 50,
+        reconciles to the cent)."""
+        data = self.last_initial_data or {}
+        agent = (data.get("invoiceSummary") or {}).get("agentInvoice")
+        # The booking page names it paymentSchedule; /review paymentsSchedule.
+        return parse_review_changes({"agentInvoice": agent,
+                                     "paymentsSchedule": data.get("paymentSchedule")})
+
+    async def confirm_candidate_on_review(
+        self, offer_code: str, stateroom_type: str, own_category: str | None,
+    ) -> tuple[str, ReviewInvoice | None]:
+        """From the /rate screen, take ONE candidate to /review and return
+        (path, invoice). path is REVIEW_REACHED or the reason it stopped.
+        Leaves the wizard where it stopped - the caller discards."""
+        # Never let one CANDIDATE's choice reach the next candidate's note.
+        # Across bookings, reset_per_booking_state() already clears it
+        # (PER_BOOKING_STATE); this is the per-candidate reset inside one
+        # booking. {} reads exactly like None to every consumer
+        # (`choice or {}`).
+        self.last_review_choice = {}
+        page = self.page
+        tile_button = page.locator(
+            f'div.rate-code-tile[data-rate-code="{offer_code}"] '
+            f'button[data-rate-meta-name="{stateroom_type}"]')
+        if await tile_button.count() != 1:
+            return "CANDIDATE_NOT_ON_SCREEN", None
+        await tile_button.first.click()
+        await page.wait_for_load_state("networkidle", timeout=20000)
+
+        cont = page.locator('button[data-comp="goto-next-page"]').first
+        self._assert_safe_click((await cont.inner_text()).strip())
+        await cont.click()
+        # The category SCREEN, not a row: Keep Same Stateroom is always on
+        # /category (captured 2026-09-18), so an empty table reports
+        # OWN_CATEGORY_NOT_OFFERED at once instead of a 25s row timeout.
+        await page.wait_for_selector(f"{self._KEEP_SAME}, tr[data-cat]", timeout=25000)
+        await page.wait_for_load_state("networkidle", timeout=20000)
+        try:
+            # The button may draw before the rows; give the rows a moment
+            # before concluding the table is genuinely empty.
+            await page.wait_for_selector("tr[data-cat]", timeout=8000)
+        except PlaywrightTimeoutError:
+            pass
+
+        # CHEAPEST CATEGORY THAT KEEPS THE SAME STATEROOM. Neon 2026-10-12:
+        # "i always in category choose the cheapest but you must always make
+        # sure that keep same state room button is eenabled ... not lose
+        # anything on the booking". On DEMO18 he took 6A at $574 for cabin
+        # R162 (category 6B, $579): 6A's "Upgrade up to: 6C" covers 6B, so
+        # Carnival kept the cabin at the cheaper rate - $46 saved against
+        # $36 at the booking's own row. So: rows cheapest first, never above
+        # the booking's own category price, and a row is used only once
+        # Carnival enables Keep Same Stateroom for it. Replaces the
+        # 2026-09-18 own-row-only rule; the cabin rule itself is unchanged
+        # and is now also VERIFIED on /review (_stateroom_on_review).
+        rows = await page.evaluate(
+            "() => [...document.querySelectorAll('tr[data-cat]')]"
+            ".map(r => [r.dataset.cat, r.dataset.catPrice])")
+        priced = []
+        for cat, price in rows:
+            try:
+                priced.append((float(str(price).replace(",", "")), cat))
+            except (TypeError, ValueError):
+                continue
+        priced.sort()
+        own_price = next((p for p, c in priced if c == own_category), None)
+        tries = [(p, c) for p, c in priced if own_price is None or p <= own_price]
+        if not tries:
+            return "OWN_CATEGORY_NOT_OFFERED", None
+        # THE OWN ROW IS ALWAYS TRIED. On DEMO15 (2026-10-12) the table had
+        # 16+ rows; Keep Same Stateroom enabled only on the booking's own 8D
+        # ($667), after the cheaper $617/$652 rows did not. A plain cap could
+        # run out of tries before reaching it. Cheapest first, own row last.
+        own_row = [(p, c) for p, c in tries if c == own_category]
+        cheaper = [(p, c) for p, c in tries if c != own_category]
+        tries = cheaper[:self._MAX_CATEGORY_TRIES - len(own_row)] + own_row
+
+        keep = page.locator(self._KEEP_SAME).first
+        chosen = None
+        for price, cat in tries:
+            row = page.locator(f'tr[data-cat="{cat}"] button').first
+            if not await row.count():
+                continue
+            self._assert_safe_click((await row.inner_text()).strip())
+            await row.click()
+            await page.wait_for_load_state("networkidle", timeout=20000)
+            if await self._keep_same_enabled(keep, self._KEEP_SAME_WAIT_S):
+                chosen = (price, cat)
+                break
+            self.log_action("keep_same_disabled", offer_code=offer_code, category=cat)
+        if chosen is None:
+            self.log_action("review_path_blocked", offer_code=offer_code,
+                            tried=[c for _, c in tries])
+            return "REVIEW_PATH_BLOCKED", None
+        self.last_review_choice = {"category": chosen[1], "row_price": chosen[0],
+                                   "own_category": own_category}
+        self.log_action("category_chosen", offer_code=offer_code,
+                        category=chosen[1], row_price=chosen[0],
+                        own_category=own_category)
+
+        # READ THE BODY THE MOMENT IT ARRIVES. Caught 2026-10-12 by the fake
+        # wizard test, which hung: Keep Same Stateroom fires the request and
+        # then routes to /review, and awaiting response.json() AFTER that
+        # navigation can stall indefinitely in Chromium. The live walker of
+        # 2026-09-18 read bodies from a response listener for the same
+        # reason. Bounded at both ends so a scan can never hang here.
+        captured: asyncio.Future = asyncio.get_running_loop().create_future()
+
+        def on_response(resp):
+            if captured.done() or not self._REVIEW_CHANGES_RE.search(resp.url):
+                return
+
+            async def read():
+                body = None
+                if resp.status < 400:
+                    try:
+                        body = await asyncio.wait_for(resp.json(), timeout=20)
+                    except Exception:
+                        body = None
+                if not captured.done():
+                    captured.set_result((resp.status, body))
+            track_background_task(self._background_tasks, asyncio.ensure_future(read()))
+
+        self._assert_safe_click((await keep.inner_text()).strip())
+        page.on("response", on_response)
+        try:
+            await keep.click()
+            status, body = await asyncio.wait_for(captured, timeout=30)
+        except asyncio.TimeoutError:
+            return "REVIEW_NOT_CAPTURED", None
+        finally:
+            page.remove_listener("response", on_response)
+        if status >= 400:
+            self.log_action("review_refused", offer_code=offer_code, status=status)
+            return "REVIEW_REFUSED", None
+        if body is None:
+            return "REVIEW_NOT_CAPTURED", None
+        review = parse_review_changes(body)
+
+        # THE CABIN, VERIFIED. Keep Same Stateroom being enabled is
+        # Carnival's promise; the label on /review is the proof. A different
+        # cabin is never a saving - stop. An absent label is recorded, not
+        # guessed past silently.
+        original_room = self.original_stateroom()
+        review_room = await self._stateroom_on_review()
+        self.last_review_choice = {**(self.last_review_choice or {}),
+                                   "stateroom_before": original_room,
+                                   "stateroom_on_review": review_room}
+        if original_room and review_room and review_room != original_room:
+            self.log_action("stateroom_changed", offer_code=offer_code,
+                            before=original_room, on_review=review_room)
+            return "STATEROOM_CHANGED", None
+        if not review_room:
+            review.warnings.append("stateroom label not shown on /review - "
+                                   "cabin kept per Keep Same Stateroom, not re-read")
+        review.deposit_on_review = await self._deposit_on_review()
+
+        self.log_action("review_reached", offer_code=offer_code,
+                        gross=str(review.gross), obc=str(review.obc),
+                        stateroom=review_room)
+        return "REVIEW_REACHED", review
+
     async def check_booking(self, booking_id: str, capture_market_data: bool = False) -> BookingResult:
         """
         Full read-only check: current price, current OBC, current category, and
@@ -1047,6 +1464,11 @@ class GoCCLScraper(BaseScraper):
         To actually confirm one candidate (which requires clicking through),
         use preview_fare_code() afterward for one human-selected candidate at a time.
         """
+        # See BaseScraper.reset_per_booking_state. GoCCL caches
+        # last_initial_data and last_market_data on self, and BookingService
+        # reads both AFTER this returns.
+        self.reset_per_booking_state()
+
         current_category: str | None = None
         try:
             await self.search_booking(booking_id)
@@ -1080,6 +1502,10 @@ class GoCCLScraper(BaseScraper):
                     old_total=round(float(current["current_price_gross"]), 2),
                     new_total=round(float(current["current_price_gross"]), 2),
                     currency=current.get("currency") or "UNKNOWN",
+                    # The booking's own offer, kept even when it is not
+                    # priced (Neon 2026-10-15: save before for everything).
+                    old_promos=" ".join(x for x in (current.get("current_offer_code"),
+                                                    current.get("current_offer_name")) if x),
                     note=(
                         f"paid in full — net balance due "
                         f"{net_balance:,.2f}"
@@ -1092,6 +1518,19 @@ class GoCCLScraper(BaseScraper):
             await self.open_modify_booking()
             await self.open_change_offer_rate()
             await self.dump_page_snapshot(booking_id, "offer_code_comparison")
+            # The booking's own category, read from the Current Selections
+            # bar (Neon 2026-10-12: "check the category from here"). It
+            # decides which category rows are cheaper than the booking's own.
+            # When it disagrees with the page data the bar wins, logged.
+            bar = await self.read_category_bar()
+            own_category = (bar or {}).get("category") or current_category
+            if bar and bar.get("category") and bar["category"] != (current_category or "").upper():
+                logger.warning("goccl.category_mismatch", booking_id=booking_id,
+                               bar=bar["category"], page_data=current_category,
+                               upgraded_to=bar.get("upgraded_to"))
+            self.log_action("category_bar", booking_id=booking_id,
+                            category=(bar or {}).get("category"),
+                            upgraded_to=(bar or {}).get("upgraded_to"))
 
             offer_codes = await self.read_offer_code_comparison()
             logger.info(
@@ -1166,6 +1605,33 @@ class GoCCLScraper(BaseScraper):
                 current_offer_name=current.get("current_offer_name"),
                 current_disclaimer=current.get("current_rate_disclaimer"),
             )
+            # CONFIRM THE CANDIDATE ON /review (2026-10-12). Only an
+            # OPTIMIZATION with an offer code is a candidate; everything else
+            # is already final. We are still on /rate here.
+            if (settings.goccl_confirm_on_review
+                    and result.status == BookingStatus.OPTIMIZATION
+                    and result.new_price_category):
+                try:
+                    path, review = await self.confirm_candidate_on_review(
+                        result.new_price_category,
+                        current["current_stateroom_type"], own_category)
+                except Exception as exc:  # noqa: BLE001 - stays a candidate
+                    if is_dead_browser_error(exc):
+                        raise
+                    logger.warning("goccl.review_failed", booking_id=booking_id,
+                                   error=str(exc)[:200])
+                    path, review = "REVIEW_NOT_CAPTURED", None
+                logger.info("goccl.review_path", booking_id=booking_id, path=path,
+                            offer_code=result.new_price_category)
+                if review is not None:
+                    self.dump_raw(booking_id, {"review_invoice": {
+                        "offer_code": result.new_price_category,
+                        "gross": str(review.gross), "obc": str(review.obc),
+                        "items": {k: str(v) for k, v in review.items.items()},
+                        "warnings": review.warnings}})
+                result = apply_goccl_review(result, self.original_invoice(),
+                                            review, path,
+                                            choice=self.last_review_choice)
             logger.info("goccl.result", booking_id=booking_id, status=result.status.value, net=result.net_saving)
             self.log_action("result", booking_id=booking_id, status=result.status.value, net_saving=result.net_saving)
             # BACK OUT OF THE WIZARD. Added 2026-09-18 after driving the real
@@ -1179,6 +1645,12 @@ class GoCCLScraper(BaseScraper):
             await self.discard_changes()
             return result
 
+        except BookingCancelled as e:
+            # CLAUDE.md rule 7: recorded, reported every run, never re-scanned.
+            logger.info("goccl.cancelled", booking_id=booking_id, message=str(e))
+            self.log_action("cancelled", booking_id=booking_id)
+            return make_cancelled_result(booking_id, current_category, CruiseLine.GOCCL,
+                                         detail=f"GoCCL: {e}")
         except Exception as e:
             logger.error("goccl.error", booking_id=booking_id, error=str(e))
             self.log_action("error", booking_id=booking_id, error=str(e))
@@ -1266,3 +1738,176 @@ class GoCCLScraper(BaseScraper):
             new_price_gross=new_price_gross, new_obc_total=obc_total,
         )
         return result
+
+    # ── Carnival guest (VIFP) lookup - MSC status-match branch ───────────
+    #
+    # Added 2026-10-08. Every selector below was read off a real signed-in
+    # page saved with SingleFile (Downloads/1b40c7e0-....htm, url
+    # /app/bookingengine?openLookup=yes) and is pinned by
+    # tests/test_vifp_guest_lookup_2026_10_08.py:
+    #
+    #   <input id=vifpNumber_0 class="... vifp-widget__field-input"
+    #          placeholder="Carnival Guest #">
+    #   <button class="vifp-widget__field-button">  (magnifying glass)
+    #   <div role=dialog class="ReactModal__Content ... cmodal vifp__modal">
+    #     <div class=vifp-guest-info>  label/text pairs, READ-ONLY spans
+    #     <div class=vifp-guest-info__add><button>Add Number</button>
+    #   <select id=StateOfResidency class=state-of-residency__select>
+    #     options value=GA text=Georgia ...
+    #
+    # Each selector is a union of GoCCL's id and its own class, so it also
+    # matches the hand-annotated regression fixture, which renamed the ids.
+    #
+    # The guest's name, title and date of birth are never typed anywhere:
+    # GoCCL displays them, this reads them. See core/vifp_guest.py.
+
+    VIFP_INPUT = "input#vifpNumber_0, input.vifp-widget__field-input"
+    VIFP_SEARCH_BUTTON = "button.vifp-widget__field-button"
+    VIFP_DIALOG = '[role="dialog"].vifp__modal'
+    VIFP_GUEST_INFO = ".vifp-guest-info"
+    VIFP_ADD_BUTTON = ".vifp-guest-info__add button"
+    STATE_OF_RESIDENCY = "select#StateOfResidency, select.state-of-residency__select"
+
+    _READ_GUEST_INFO_JS = """(root) => {
+        const out = {}, dupes = [];
+        for (const label of root.querySelectorAll('.vifp-guest-info__label')) {
+            const key = label.innerText.trim();
+            const txt = label.parentElement.querySelector('.vifp-guest-info__txt');
+            if (key in out) dupes.push(key);
+            out[key] = txt ? txt.innerText : '';
+        }
+        return {fields: out, dupes};
+    }"""
+
+    async def _exactly_one(self, selector: str, what: str):
+        loc = self.page.locator(selector)
+        count = await loc.count()
+        if count != 1:
+            raise RuntimeError(f"GoCCL {what}: expected 1 element for "
+                               f"{selector!r}, found {count}")
+        return loc
+
+    async def open_vifp_lookup(self) -> None:
+        """Reach the booking engine with the guest-number lookup showing.
+
+        Needs a signed-in session, like open_booking_tool. Does nothing if
+        the lookup is already on screen.
+        """
+        if await self.page.locator(self.VIFP_INPUT).count():
+            return
+        self.log_action("open_vifp_lookup", url=settings.goccl_vifp_lookup_url)
+        await self.navigate(settings.goccl_vifp_lookup_url, wait_until="domcontentloaded")
+        try:
+            await self.page.wait_for_selector(self.VIFP_INPUT, timeout=20000)
+        except PlaywrightTimeoutError:
+            raise RuntimeError(
+                "GoCCL guest lookup did not load (no Carnival Guest # box) - "
+                f"is the session signed in? Landed on {self.page.url}"
+            ) from None
+
+    async def _read_vifp_dialog(self) -> CarnivalGuestInfo:
+        info_root = await self._exactly_one(
+            f"{self.VIFP_DIALOG} {self.VIFP_GUEST_INFO}", "guest info window")
+        raw = await info_root.evaluate(self._READ_GUEST_INFO_JS)
+        if raw["dupes"]:
+            raise RuntimeError(f"GoCCL guest info repeats labels {raw['dupes']} "
+                               f"- refusing to guess which is right")
+        return guest_info_from_fields(raw["fields"])
+
+    async def lookup_vifp_guest(self, guest_number: str,
+                                screenshot_path: str | None = None) -> CarnivalGuestInfo:
+        """Look one guest up by Carnival Guest Number and read the record.
+
+        detect -> act -> verify:
+          1. type the number and confirm the box holds exactly it
+          2. open the guest window (magnifying glass)
+          3. read every field by its label
+          4. confirm the window shows THIS guest number - a window left
+             open for someone else must never be taken as this guest's
+          5. screenshot the window, unedited, as the evidence
+
+        Does not click Add Number - see add_vifp_guest.
+        """
+        wanted = normalise_guest_number(guest_number)
+        if not wanted:
+            raise ValueError(f"not a Carnival Guest Number: {guest_number!r}")
+
+        box = (await self._exactly_one(self.VIFP_INPUT, "guest number box")).first
+        await box.fill(wanted)
+        typed = normalise_guest_number(await box.input_value())
+        if typed != wanted:
+            raise RuntimeError(f"GoCCL guest number box holds {typed!r} after "
+                               f"typing {wanted!r}")
+        self.log_action("vifp_number_entered")
+
+        dialog = self.page.locator(self.VIFP_DIALOG).filter(
+            has=self.page.locator(self.VIFP_GUEST_INFO))
+        if await dialog.count() and await dialog.first.is_visible():
+            # A window is already open. Only acceptable if it is this guest.
+            already = await self._read_vifp_dialog()
+            if already.guest_number != wanted:
+                raise RuntimeError(
+                    "a GoCCL guest window for a different guest number is "
+                    "already open - close it and look the guest up again")
+            self.log_action("vifp_dialog_already_open")
+        else:
+            button = (await self._exactly_one(self.VIFP_SEARCH_BUTTON, "guest lookup button")).first
+            await button.click()
+            try:
+                await dialog.first.wait_for(state="visible", timeout=15000)
+            except PlaywrightTimeoutError:
+                await self.dump_failure_snapshot(f"vifp_{wanted}", "vifp_lookup",
+                                                 "guest window never opened")
+                raise RuntimeError(
+                    "GoCCL guest window never opened for this guest number - "
+                    "the number may be wrong (GoCCL advisory 5108 reads "
+                    "'The VIFP number is incorrect.')") from None
+
+        info = await self._read_vifp_dialog()
+        if info.guest_number != wanted:
+            raise RuntimeError(f"GoCCL returned guest number {info.guest_number!r} "
+                               f"for a lookup of {wanted!r}")
+
+        if screenshot_path:
+            await dialog.first.screenshot(path=screenshot_path)
+        self.log_action("vifp_guest_read", tier=info.tier,
+                        screenshot=bool(screenshot_path))
+        return info
+
+    async def add_vifp_guest(self, info: CarnivalGuestInfo) -> str:
+        """Click Add Number, then set State of Residency from the record.
+
+        Add Number puts the guest number on a NEW booking search; it does
+        not touch any existing booking. The state is chosen by matching
+        GoCCL's own option text to the record's "State of Residency", so no
+        state table lives here. Returns the selected state code, verified.
+        """
+        add = (await self._exactly_one(self.VIFP_ADD_BUTTON, "Add Number button")).first
+        label = (await add.inner_text()).strip()
+        self._assert_safe_click(label)
+        await add.click()
+        # Verified: the number must still be in the box afterwards. Whether
+        # GoCCL also closes the window has not been seen live yet, so it is
+        # recorded rather than asserted - the first live run settles it.
+        box = self.page.locator(self.VIFP_INPUT).first
+        if normalise_guest_number(await box.input_value()) != info.guest_number:
+            raise RuntimeError("the Carnival Guest # box no longer holds this "
+                               "guest's number after Add Number")
+        dialog_still_open = await self.page.locator(self.VIFP_DIALOG).first.is_visible()
+        self.log_action("vifp_add_number_clicked", dialog_still_open=dialog_still_open)
+
+        select = (await self._exactly_one(self.STATE_OF_RESIDENCY, "State of Residency")).first
+        options = await select.evaluate(
+            "s => [...s.options].map(o => [o.value, o.text.trim()])")
+        wanted = info.state_of_residency.strip().lower()
+        codes = [v for v, text in options if v and text.lower() == wanted]
+        if len(codes) != 1:
+            raise RuntimeError(f"State of Residency has {len(codes)} options "
+                               f"named {info.state_of_residency!r}")
+        await select.select_option(value=codes[0])
+        chosen = await select.input_value()
+        if chosen != codes[0]:
+            raise RuntimeError(f"State of Residency shows {chosen!r} after "
+                               f"selecting {codes[0]!r}")
+        self.log_action("vifp_residency_selected", state=chosen)
+        return chosen

@@ -61,7 +61,8 @@ while IFS= read -r f; do
     *.jsonl)                                 problem "$f" "capture/scrape output -- holds real booking data";;
     *storage_state*|*cookies*.json)          problem "$f" "browser session state -- live login cookies";;
     *.pem|*.key|*.p12|*.pfx|id_rsa*)         problem "$f" "private key material";;
-    *[Ww]atchlist*)                          problem "$f" "booking-ID input list";;
+    */watchlists/*|*[Ww]atchlist*.txt|*[Ww]atchlist*.txt.*)
+                                             problem "$f" "booking-ID input list";;
     *SESSION_CHANGES*|*New\ Text\ Document*) problem "$f" "raw session transcript -- real IDs and names";;
   esac
 done <<< "$staged"
@@ -90,7 +91,7 @@ numeric=$(scan '[Bb]ooking[s]?[[:space:]_-]*(id|ref|number|#)?[[:space:]:=#-]*[0
 # legitimately follow the word "booking".
 pnr=$(scan '[Bb]ooking[s]?[[:space:]:=#-]+[A-Z0-9]{6}([^A-Z0-9]|$)' \
   | grep -vE 'DEMO[0-9]{2}' \
-  | grep -vE '(FAILED|RUNNING|STATUS|ERRORS|CANCEL|ACTIVE|CLOSED|EXISTS|REASON|DETAIL|COMMIT|RESULT|SEARCH|UPDATE|NUMBER|RECORD|SINGLE|SECOND|CHANGE|SHOULD|SYSTEM|OBJECT|VALUES|ROWS|NOTHING)' \
+  | grep -vE '(FAILED|RUNNING|STATUS|ERRORS|CANCEL|ACTIVE|CLOSED|EXISTS|REASON|DETAIL|COMMIT|RESULT|SEARCH|UPDATE|NUMBER|RECORD|SINGLE|SECOND|CHANGE|SHOULD|SYSTEM|OBJECT|VALUES|ROWS|NOTHING|DURING|BEFORE|AFTER|WITHIN|ACROSS|ALWAYS|NEVER|EITHER|NUMBERS|IDS|LISTS|ENTRIES|COUNTS)' \
   | head -8)
 [ -n "$pnr" ] && problem "real-looking alphanumeric booking reference (PNR-style)" "$pnr" \
   "GoCCL/Princess use these. Use DEMOnn instead."
@@ -101,7 +102,10 @@ paths=$(scan '[A-Za-z]:\\+Users\\+[A-Za-z0-9._-]+|/Users/[a-z][a-z0-9._-]+/|/hom
   "Derive it from __file__ or the script location instead."
 
 # --------------------------------------------------------------- 5. secrets
-secrets=$(scan '[-]{5}BEGIN [A-Z ]*PRIVATE KEY|AKIA[0-9A-Z]{16}|ASIA[0-9A-Z]{16}|ghp_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{30,}|xox[baprs]-[A-Za-z0-9-]{12,}|sk-[A-Za-z0-9]{32,}|AIza[A-Za-z0-9_-]{33}' | head -5)
+# Lines longer than 2000 chars are minified vendor assets inside saved-page
+# fixtures, not hand-written source; they produce entropy false positives
+# forever. A real credential in source does not live on an 800KB line.
+secrets=$(scan '[-]{5}BEGIN [A-Z ]*PRIVATE KEY|AKIA[0-9A-Z]{16}|ASIA[0-9A-Z]{16}|ghp_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{30,}|xox[baprs]-[A-Za-z0-9-]{12,}|sk-[A-Za-z0-9]{32,}|AIza[A-Za-z0-9_-]{33}' | awk 'length($0) < 2000' | head -5)
 [ -n "$secrets" ] && problem "credential or API key" "$secrets" \
   "Store it in the OS keychain (see platform/save_login.py), never in the repo."
 

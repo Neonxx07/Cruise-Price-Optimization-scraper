@@ -145,6 +145,23 @@ def compare_fares(current_name: str | None, new_name: str | None) -> tuple[int, 
     a decision rather than an accident.
     """
     cur, new = fare_tier(current_name), fare_tier(new_name)
+    # INTO A RESTRICTED FARE FROM AN UNKNOWN ONE IS A DOWNGRADE. Found live
+    # 2026-10-12: DEMO26 is on "BOOKING BUCKS" (no recognised tier) and PSV
+    # SUPER SAVER read as "no verdict", so a $308 Super Saver was offered as
+    # a saving. Super Saver and Pack & Go are known to give up price
+    # protection, deposit refundability and the guest's choice of cabin
+    # location, whatever the booking is on now; Neon's rule is that nothing
+    # may be lost. Every other unknown pairing still returns no verdict.
+    if cur is None and new in (SUPER_SAVER, PACK_AND_GO):
+        t = TERMS[new]
+        lost = [what for what, kept in (("price protection", t.price_protection),
+                                         ("a refundable deposit", t.deposit_refundable),
+                                         ("the guest's choice of stateroom location",
+                                          t.guest_picks_cabin))
+                if not kept]
+        return -1, (f"DOWNGRADE (assumed) - the current fare {current_name!r} has "
+                    f"unrecognised terms, and {_label(new)} gives up "
+                    f"{', '.join(lost)}")
     if cur is None or new is None:
         unknown = current_name if cur is None else new_name
         return 0, (

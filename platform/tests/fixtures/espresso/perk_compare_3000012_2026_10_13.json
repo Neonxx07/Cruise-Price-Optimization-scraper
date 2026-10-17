@@ -1,0 +1,439 @@
+{
+ "_source": "Neon 2026-10-13, sanitized HAR of Promotions -> Compare on booking 3000067 (Downloads/secure.cruisingpower.coms.har). Price data only: no guest, agent or cookie data.",
+ "promotion_values": [
+  "BESTRATE^Best Rate^FIT",
+  "DC501142^NOPERK NRD^FIT^D",
+  "DC508753^RETREAT NRD^FIT^D",
+  "DC508837^BOGO50^FIT^N",
+  "DC508897^BOGO75 NRD^FIT^D",
+  "DJ028141^ALL INC 2PK^FIT^N",
+  "DJ065340^ALL INC 2PK NRD^FIT^D",
+  "DK954264^RETREAT^FIT^N",
+  "DK958352^NOPERK^FIT^N",
+  "DQ755984^SAVEUPTO100^FIT^N",
+  "DQ755986^SAVEUPTO100 NRD^FIT^D",
+  "LA715914^BONUS SAV^FIT^N",
+  "LA715915^BONUS SAV NRD^FIT^D",
+  "LL264762^BOOKNOWSAV^FIT^N",
+  "LL284672^BOOKNOWSAVNRD^FIT^D",
+  "LM767049^STANDARD^FIT^"
+ ],
+ "compare_posts": [
+  "promotions=DJ065340^ALL INC 2PK NRD^FIT^D&promotions=BESTRATE^Best Rate^FIT",
+  "promotions=DJ028141^ALL INC 2PK^FIT^N&promotions=BESTRATE^Best Rate^FIT"
+ ],
+ "categories_after_compare_nrd": {
+  "matrix_Y": {
+   "INDIVIDUAL-BESTRATE": [
+    {
+     "id": 47,
+     "columnPricePromo": {
+      "requestedCode": "BESTRATE",
+      "requestedModeTypeCode": "IBR",
+      "name": "Best Rate",
+      "columnType": "INDIVIDUAL",
+      "url": "#",
+      "nonRefundablePromo": false
+     },
+     "category": {
+      "priorityNumber": 24,
+      "code": "Y",
+      "name": "Guarantee - Oceanview",
+      "type": "Oceanview",
+      "url": "#",
+      "accessible": false,
+      "connectingCabin": false,
+      "familyStaterooms": false,
+      "rank": 0,
+      "superCategoryClassCode": "",
+      "superCategoryClass": "",
+      "leadCategory": false
+     },
+     "pricePromo": {
+      "requestedCode": "BESTRATE",
+      "requestedModeTypeCode": "IBR",
+      "priceCode": "LM767049",
+      "promoCode": "DC508897",
+      "name": "BOGO75 NRD",
+      "types": {
+       "89": "NRP Promo Code G - RCI",
+       "23": "NRP Promo Code B",
+       "135": "NRP Targeted Offer 2",
+       "71": "NRP Post Cruise",
+       "74": "NRP Promo Code F - RCI"
+      },
+      "columnType": "INDIVIDUAL",
+      "url": "#",
+      "nonRefundablePromo": true
+     },
+     "status": {
+      "VP": "TODO#low",
+      "OTA": "47",
+      "RAPI": "G",
+      "I18NKey": "com.rccl.models.views.CategorySingleView.CategoryStatus.G",
+      "I18NName": "GTY"
+     },
+     "accessiblePlus": false,
+     "connectingStateroomsPlus": false,
+     "familyStateroomsPlus": false,
+     "accessibleConnectingFamilyStateroomsPlus": false,
+     "accessibleAndConnectingStateroomsPlus": false,
+     "accessibleAndFamilyStateroomsPlus": false,
+     "connectingAndFamilyStateroomsPlus": false,
+     "accessible": 0,
+     "connectingStaterooms": 0,
+     "familyStaterooms": 0,
+     "accessibleAndConnectingStaterooms": 0,
+     "accessibleAndFamilyStaterooms": 0,
+     "connectingAndFamilyStaterooms": 0,
+     "accessibleConnectingFamilyStaterooms": 0,
+     "available": 10,
+     "availablePlus": true,
+     "bestValue": false,
+     "pricing": {
+      "FIRST_SECOND": {
+       "price": 1609.5,
+       "credit": 0,
+       "priceView": "1,609.50",
+       "creditView": "0"
+      }
+     },
+     "hidden": false,
+     "hasGroupGty": false,
+     "fallBack": true,
+     "bestRateFB": false
+    }
+   ],
+   "INDIVIDUAL-DJ065340": [
+    {
+     "id": 48,
+     "columnPricePromo": {
+      "requestedCode": "DJ065340",
+      "requestedModeTypeCode": "ISR",
+      "name": "ALL INC 2PK NRD",
+      "columnType": "INDIVIDUAL",
+      "url": "#",
+      "nonRefundablePromo": false
+     },
+     "category": {
+      "priorityNumber": 24,
+      "code": "Y",
+      "name": "Guarantee - Oceanview",
+      "type": "Oceanview",
+      "url": "#",
+      "accessible": false,
+      "connectingCabin": false,
+      "familyStaterooms": false,
+      "rank": 0,
+      "superCategoryClassCode": "",
+      "superCategoryClass": "",
+      "leadCategory": false
+     },
+     "pricePromo": {
+      "requestedCode": "DJ065340",
+      "requestedModeTypeCode": "ISR",
+      "priceCode": "LM767049",
+      "promoCode": "DJ065340",
+      "name": "ALL INC 2PK NRD",
+      "types": {
+       "89": "NRP Promo Code G - RCI",
+       "23": "NRP Promo Code B",
+       "135": "NRP Targeted Offer 2",
+       "71": "NRP Post Cruise",
+       "74": "NRP Promo Code F - RCI"
+      },
+      "columnType": "INDIVIDUAL",
+      "url": "#",
+      "nonRefundablePromo": true
+     },
+     "status": {
+      "VP": "TODO#low",
+      "OTA": "47",
+      "RAPI": "G",
+      "I18NKey": "com.rccl.models.views.CategorySingleView.CategoryStatus.G",
+      "I18NName": "GTY"
+     },
+     "accessiblePlus": false,
+     "connectingStateroomsPlus": false,
+     "familyStateroomsPlus": false,
+     "accessibleConnectingFamilyStateroomsPlus": false,
+     "accessibleAndConnectingStateroomsPlus": false,
+     "accessibleAndFamilyStateroomsPlus": false,
+     "connectingAndFamilyStateroomsPlus": false,
+     "accessible": 0,
+     "connectingStaterooms": 0,
+     "familyStaterooms": 0,
+     "accessibleAndConnectingStaterooms": 0,
+     "accessibleAndFamilyStaterooms": 0,
+     "connectingAndFamilyStaterooms": 0,
+     "accessibleConnectingFamilyStaterooms": 0,
+     "available": 10,
+     "availablePlus": true,
+     "bestValue": false,
+     "pricing": {
+      "FIRST_SECOND": {
+       "price": 2659.5,
+       "credit": 0,
+       "priceView": "2,659.50",
+       "creditView": "0"
+      }
+     },
+     "hidden": false,
+     "hasGroupGty": false,
+     "fallBack": true,
+     "bestRateFB": false
+    }
+   ]
+  },
+  "allocations": {
+   "reservationsSummary": [
+    {
+     "category": "Y",
+     "count": 1,
+     "fare": {
+      "rates": [
+       {
+        "code": "DJ028141",
+        "name": "ALL INC 2PK"
+       },
+       {
+        "code": "DQ755984",
+        "name": "SAVEUPTO100"
+       },
+       {
+        "code": "LA715914",
+        "name": "BONUS SAV"
+       },
+       {
+        "code": "LL264762",
+        "name": "BOOKNOWSAV"
+       },
+       {
+        "code": "DC508837",
+        "name": "BOGO50"
+       }
+      ]
+     },
+     "reservationStatus": "BK"
+    }
+   ],
+   "categoryCount": 1,
+   "totalInvoiceAmount": 5945.0,
+   "grandSuiteWarningMessageFlag": false
+  },
+  "sailingModel": {
+   "adults": 2,
+   "children": 0,
+   "occupancy": "2",
+   "currency": "CAD"
+  }
+ },
+ "categories_after_compare_refundable": {
+  "matrix_Y": {
+   "INDIVIDUAL-BESTRATE": [
+    {
+     "id": 47,
+     "columnPricePromo": {
+      "requestedCode": "BESTRATE",
+      "requestedModeTypeCode": "IBR",
+      "name": "Best Rate",
+      "columnType": "INDIVIDUAL",
+      "url": "#",
+      "nonRefundablePromo": false
+     },
+     "category": {
+      "priorityNumber": 24,
+      "code": "Y",
+      "name": "Guarantee - Oceanview",
+      "type": "Oceanview",
+      "url": "#",
+      "accessible": false,
+      "connectingCabin": false,
+      "familyStaterooms": false,
+      "rank": 0,
+      "superCategoryClassCode": "",
+      "superCategoryClass": "",
+      "leadCategory": false
+     },
+     "pricePromo": {
+      "requestedCode": "BESTRATE",
+      "requestedModeTypeCode": "IBR",
+      "priceCode": "LM767049",
+      "promoCode": "DC508897",
+      "name": "BOGO75 NRD",
+      "types": {
+       "89": "NRP Promo Code G - RCI",
+       "23": "NRP Promo Code B",
+       "135": "NRP Targeted Offer 2",
+       "71": "NRP Post Cruise",
+       "74": "NRP Promo Code F - RCI"
+      },
+      "columnType": "INDIVIDUAL",
+      "url": "#",
+      "nonRefundablePromo": true
+     },
+     "status": {
+      "VP": "TODO#low",
+      "OTA": "47",
+      "RAPI": "G",
+      "I18NKey": "com.rccl.models.views.CategorySingleView.CategoryStatus.G",
+      "I18NName": "GTY"
+     },
+     "accessiblePlus": false,
+     "connectingStateroomsPlus": false,
+     "familyStateroomsPlus": false,
+     "accessibleConnectingFamilyStateroomsPlus": false,
+     "accessibleAndConnectingStateroomsPlus": false,
+     "accessibleAndFamilyStateroomsPlus": false,
+     "connectingAndFamilyStateroomsPlus": false,
+     "accessible": 0,
+     "connectingStaterooms": 0,
+     "familyStaterooms": 0,
+     "accessibleAndConnectingStaterooms": 0,
+     "accessibleAndFamilyStaterooms": 0,
+     "connectingAndFamilyStaterooms": 0,
+     "accessibleConnectingFamilyStaterooms": 0,
+     "available": 10,
+     "availablePlus": true,
+     "bestValue": false,
+     "pricing": {
+      "FIRST_SECOND": {
+       "price": 1609.5,
+       "credit": 0,
+       "priceView": "1,609.50",
+       "creditView": "0"
+      }
+     },
+     "hidden": false,
+     "hasGroupGty": false,
+     "fallBack": true,
+     "bestRateFB": false
+    }
+   ],
+   "INDIVIDUAL-DJ028141": [
+    {
+     "id": 48,
+     "columnPricePromo": {
+      "requestedCode": "DJ028141",
+      "requestedModeTypeCode": "ISR",
+      "name": "ALL INC 2PK",
+      "columnType": "INDIVIDUAL",
+      "url": "#",
+      "nonRefundablePromo": false
+     },
+     "category": {
+      "priorityNumber": 24,
+      "code": "Y",
+      "name": "Guarantee - Oceanview",
+      "type": "Oceanview",
+      "url": "#",
+      "accessible": false,
+      "connectingCabin": false,
+      "familyStaterooms": false,
+      "rank": 0,
+      "superCategoryClassCode": "",
+      "superCategoryClass": "",
+      "leadCategory": false
+     },
+     "pricePromo": {
+      "requestedCode": "DJ028141",
+      "requestedModeTypeCode": "ISR",
+      "priceCode": "LM767049",
+      "promoCode": "DJ028141",
+      "name": "ALL INC 2PK",
+      "types": {
+       "134": "Targeted Offer 2",
+       "69": "Promo Code G",
+       "129": "Promo Code F",
+       "91": "Promo Code B2",
+       "86": "Post Cruise Offer"
+      },
+      "columnType": "INDIVIDUAL",
+      "url": "#",
+      "nonRefundablePromo": false
+     },
+     "status": {
+      "VP": "TODO#low",
+      "OTA": "47",
+      "RAPI": "G",
+      "I18NKey": "com.rccl.models.views.CategorySingleView.CategoryStatus.G",
+      "I18NName": "GTY"
+     },
+     "accessiblePlus": false,
+     "connectingStateroomsPlus": false,
+     "familyStateroomsPlus": false,
+     "accessibleConnectingFamilyStateroomsPlus": false,
+     "accessibleAndConnectingStateroomsPlus": false,
+     "accessibleAndFamilyStateroomsPlus": false,
+     "connectingAndFamilyStateroomsPlus": false,
+     "accessible": 0,
+     "connectingStaterooms": 0,
+     "familyStaterooms": 0,
+     "accessibleAndConnectingStaterooms": 0,
+     "accessibleAndFamilyStaterooms": 0,
+     "connectingAndFamilyStaterooms": 0,
+     "accessibleConnectingFamilyStaterooms": 0,
+     "available": 10,
+     "availablePlus": true,
+     "bestValue": false,
+     "pricing": {
+      "FIRST_SECOND": {
+       "price": 2972.5,
+       "credit": 0,
+       "priceView": "2,972.50",
+       "creditView": "0"
+      }
+     },
+     "hidden": false,
+     "hasGroupGty": false,
+     "fallBack": true,
+     "bestRateFB": false
+    }
+   ]
+  },
+  "allocations": {
+   "reservationsSummary": [
+    {
+     "category": "Y",
+     "count": 1,
+     "fare": {
+      "rates": [
+       {
+        "code": "DJ028141",
+        "name": "ALL INC 2PK"
+       },
+       {
+        "code": "DQ755984",
+        "name": "SAVEUPTO100"
+       },
+       {
+        "code": "LA715914",
+        "name": "BONUS SAV"
+       },
+       {
+        "code": "LL264762",
+        "name": "BOOKNOWSAV"
+       },
+       {
+        "code": "DC508837",
+        "name": "BOGO50"
+       }
+      ]
+     },
+     "reservationStatus": "BK"
+    }
+   ],
+   "categoryCount": 1,
+   "totalInvoiceAmount": 5945.0,
+   "grandSuiteWarningMessageFlag": false
+  },
+  "sailingModel": {
+   "adults": 2,
+   "children": 0,
+   "occupancy": "2",
+   "currency": "CAD"
+  }
+ },
+ "allocate_total_nrd_Y": 5319.0,
+ "allocate_total_refundable_Y": 5945.0
+}

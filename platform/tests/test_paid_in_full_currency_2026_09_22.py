@@ -111,7 +111,7 @@ def test_ncl_has_the_same_guard():
 
     from scraper.ncl import NclScraper
 
-    src = inspect.getsource(NclScraper.check_booking)
+    src = inspect.getsource(NclScraper._check_booking_market)
     assert "payment_state_unreadable" in src
     assert "payment_state_readable" in src
 

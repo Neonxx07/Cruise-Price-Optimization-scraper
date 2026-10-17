@@ -298,6 +298,8 @@ class BaseScraper(ABC):
         # of data already fetched, nothing new is requested because of it.
         self.raw_dump_dir: Optional[str] = None
         self.last_market_data: dict | None = None
+        # GoCCL: the category/cabin used to reach /review (PER_BOOKING_STATE).
+        self.last_review_choice: dict | None = None
         # Structure-drift checks (see check_structure_drift) only need to
         # run once per browser session, not once per booking — the page
         # layout doesn't change between bookings within the same run.
@@ -309,6 +311,17 @@ class BaseScraper(ABC):
         # memory; written to raw_dump_dir/actions.jsonl when set.
         self.action_log: list[dict] = []
         self.on_action: Optional[Callable[[dict], None]] = None
+        # Whether start() launched without a window (None: unknown, e.g. a
+        # pooled browser). A booking opened for a person to look at needs a
+        # window - see open_booking_in_new_tab.
+        self.launched_headless: Optional[bool] = None
+        # True while open_booking_in_new_tab has self._page pointed at the
+        # person's tab; keep-alive must not navigate it.
+        self.viewing_in_progress = False
+        # Tabs opened for a person. Never adopted as the scan's page (see
+        # EspressoScraper._adopt_authenticated_tab) - the scan would drive
+        # a tab someone is reading.
+        self._viewing_tabs: set = set()
 
         # When True, also capture full page HTML + a best-effort structured
         # extraction of every page visited, and every network request/
@@ -583,6 +596,7 @@ class BaseScraper(ABC):
                     track_background_task(self._background_tasks, asyncio.create_task(self._capture_response(r)))
                 self._page.on("response", _on_response)
 
+            self.launched_headless = launch_args["headless"]
             logger.info(
                 "browser.started", cruise_line=self.cruise_line.value,
                 headless=launch_args["headless"], restored_session=bool(context_args),
@@ -753,6 +767,12 @@ class BaseScraper(ABC):
     #: Crucially it carries `payment_state_readable`, which separates "owes
     #: nothing" from "we could not see what it owes".
     last_payment_status: dict | None = None
+    #: NCL: which category/fare was actually selected, as read back from
+    #: the page rather than from what we asked for.
+    last_selection_evidence: dict | None = None
+    #: GoCCL: the wizard's own bootstrap payload, which carries the price
+    #: drivers core.booking_features reads for that line.
+    last_initial_data: dict | None = None
 
     async def navigate(self, url: str, wait_until: str = "domcontentloaded", attempts: int = 3) -> None:
         """Navigate to a URL and wait for load, retrying a transient hang.
@@ -1000,6 +1020,56 @@ class BaseScraper(ABC):
     # Persistent ACROSS runs (unlike raw_dump_dir, which is per-scan) --
     # a baseline needs to survive to be compared against every future
     # run, not just this one.
+    #: Attributes that hold data read from ONE booking's pages. Cleared at
+    #: the start of every check_booking - see reset_per_booking_state.
+    PER_BOOKING_STATE = (
+        "last_market_data",
+        "last_feature_fields",
+        "last_payment_status",
+        "last_selection_evidence",
+        "last_initial_data",
+        # GoCCL: which category row /review was priced at (2026-10-12).
+        "last_review_choice",
+    )
+
+    def reset_per_booking_state(self) -> None:
+        """Forget everything read from the PREVIOUS booking.
+
+        A scraper object outlives the booking it is scraping: one instance
+        checks hundreds in a row. Anything cached on `self` therefore
+        survives into the next booking unless it is cleared, and
+        BookingService reads several of these attributes AFTER
+        check_booking returns and writes them to the database keyed to
+        THAT booking:
+
+            await self._save_market_data_to_db(result, scraper.last_market_data)
+            extract_booking_features(..., market_data=..., initial_data=...)
+
+        So a booking that returns before its own capture is attributed the
+        PREVIOUS booking's figures.
+
+        CONFIRMED IN THE LIVE DATABASE, 2026-10-07. 21 distinct
+        `ncl_booking_details` payloads are stored against **49 different
+        bookings** - byte-identical payment panels, same final-payment date
+        and same amount, under two or three booking ids. Every one of those
+        groups pairs a real booking with a NOT_ON_THIS_ACCOUNT one, which
+        returns from NclScraper.check_booking long before the capture at
+        the end of it. The pattern repeats in every scan since the capture
+        was added.
+
+        ESPRESSO had already been fixed one attribute at a time - three
+        separate resets added on three separate days, the last of them
+        (`last_payment_status`, 2026-10-05) because BookingService decides
+        a PERMANENT paid-in-full exclusion on it. NCL and GoCCL never got
+        the same treatment, because the fix was never made general.
+
+        This is that general fix: every scraper clears every piece of
+        per-booking state in one place, and a new attribute is protected by
+        adding its name to PER_BOOKING_STATE.
+        """
+        for name in self.PER_BOOKING_STATE:
+            setattr(self, name, None)
+
     STRUCTURE_BASELINE_DIR = "data/structure_baselines"
 
     #: How long a structure snapshot may take. Deliberately small: this is
@@ -1190,6 +1260,51 @@ class BaseScraper(ABC):
     async def check_booking(self, booking_id: str, capture_market_data: bool = False) -> BookingResult:
         """Check a single booking for optimization opportunities."""
         ...
+
+    # ── "Open in portal" (GUI button), added 2026-10-09 ──────────────────
+    #
+    # Neon: "an open button that when i press it it opens the booking
+    # number in the portal". It opens the booking in a NEW TAB OF THIS
+    # SCRAPER'S OWN BROWSER - same context, same cookies, same session.
+    # Never a separate browser: that would be a second login, and ESPRESSO
+    # allows one session per account (rule 6) - exactly what knocked the
+    # scan out twice at 15:32-15:33 that morning.
+    #
+    # Each line opens the booking with the SAME search code its scan uses
+    # (_open_booking_for_viewing), so no new selector is introduced. The
+    # person takes over the tab from there; nothing is read, decided or
+    # released on their behalf.
+
+    async def open_booking_in_new_tab(self, booking_id: str):
+        """Open one booking for a person in a new tab; return that page.
+
+        The scan's own page is restored afterwards, whatever happens, so
+        the next scan keeps working in its own tab.
+        """
+        if self.launched_headless:
+            raise RuntimeError(
+                f"{self.cruise_line.value} is running without a window (Headless) - "
+                f"untick Headless and press Check login, then Open again")
+        scan_page = self.page
+        tab = await scan_page.context.new_page()
+        self._viewing_tabs.add(tab)
+        self.viewing_in_progress = True
+        self._page = tab
+        try:
+            await self._open_booking_for_viewing(booking_id)
+            shown = self._page          # GoCCL may have followed a popup
+            self._viewing_tabs.add(shown)
+        finally:
+            self._page = scan_page
+            self.viewing_in_progress = False
+        await shown.bring_to_front()
+        self.log_action("booking_opened_for_viewing", booking_id=booking_id)
+        return shown
+
+    async def _open_booking_for_viewing(self, booking_id: str) -> None:
+        """Bring `self.page` (a fresh tab) to this booking. Per line."""
+        raise NotImplementedError(
+            f"Open in portal is not available for {self.cruise_line.value}")
 
     async def __aenter__(self):
         await self.start()

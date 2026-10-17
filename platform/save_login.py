@@ -55,6 +55,10 @@ CRUISE_LINES = {
     # no way to save a credential, so every Carnival scan needed a human to
     # sign in by hand first — and nothing could run unattended.
     "5": ("GoCCL Navigator (Carnival)", settings.goccl_credential_service),
+    # ADDED 2026-10-15 (Neon: "no onseource in save login"). Princess POLAR
+    # is reached through OneSource; the login is needed before POLAR can be
+    # tested headless (docs/PRINCESS_POLAR.md section 8).
+    "6": ("Princess OneSource (POLAR)", settings.princess_credential_service),
 }
 
 # Strips bracketed-paste escape sequences some terminals wrap pasted text
@@ -281,6 +285,13 @@ def main() -> None:
             "NOT an email address — that's the form the real sign-in page takes.\n"
             "Sign-in happens at www.goccl.com/accounts/login; the booking engine "
             "then opens in a separate POPUP window.\n"
+        )
+
+    if service_name == settings.princess_credential_service:
+        print(
+            "Note: this is your OneSource login (www.onesourcecruises.com/onesource/login). "
+            "Saving it does not sign in yet - automatic OneSource sign-in is not built; "
+            "it is what the headless test needs first.\n"
         )
 
     username = _clean(input(f"{label} username / agent ID: "))

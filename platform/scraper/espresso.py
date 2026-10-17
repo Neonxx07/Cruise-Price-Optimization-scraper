@@ -24,6 +24,7 @@ import asyncio
 import json
 import re
 import time
+from urllib.parse import urljoin
 
 from config.settings import settings
 from core.calculator import (
@@ -37,6 +38,13 @@ from core.calculator import (
     make_skip_reprice_result,
     make_upgrade_available_result,
     make_wlt_result,
+)
+from core.espresso_perk_compare import (
+    compare_targets,
+    is_perk,
+    merge_perk_compare,
+    perk_columns,
+    worth_repricing,
 )
 from core.models import BookingResult, BookingStatus, CruiseLine
 from utils.logging import get_logger
@@ -195,6 +203,25 @@ def _append_dual_rate_note(note: str, market_data: dict | None) -> str:
     return note + detail + ". Verify by hand — switching rate program is not automatic]"
 
 
+_REFUSALS = (
+    re.compile(r"ACCESS TO BOOKING ID \S+ IS DENIED[^\n]{0,60}", re.I),
+    re.compile(r"No Reservations found for '[^']{0,30}'", re.I),
+)
+
+
+def search_refusal(text: str) -> str | None:
+    """ESPRESSO's own reason for not opening a booking, or None.
+
+    Seen 2026-10-16 in the failure snapshots: 3001034 "ACCESS TO BOOKING ID
+    3001034 IS DENIED. SECURED BOOKING", DEMO05 "No Reservations found for
+    'DEMO05 '"."""
+    for pattern in _REFUSALS:
+        m = pattern.search(text or "")
+        if m:
+            return " ".join(m.group(0).split())
+    return None
+
+
 class EspressoScraper(BaseScraper):
     """Scraper for ESPRESSO (Royal Caribbean / Celebrity) portal."""
 
@@ -226,6 +253,53 @@ class EspressoScraper(BaseScraper):
     def credential_service(self) -> str:
         """Where save_login.py stores this account's credential."""
         return settings.espresso_credential_service
+
+    # How long ESPRESSO's sign-in redirect chain (login -> auth.cruisingpower
+    # .com -> /oauth/callback -> app) is given to land before a login is
+    # judged. Measured 2026-10-08: eight re-logins in a row reached the app
+    # 10.1s after the credential was submitted, with nobody at the desk.
+    _SSO_LANDING_SECONDS = 30.0
+
+    async def _login_state(self) -> str:
+        """Where the sign-in is right now, without waiting or logging.
+
+        "LOGGED_IN"  on ESPRESSO, not an auth page, no password box
+        "LOGIN_FORM" a password box is showing
+        "IN_FLIGHT"  an auth/callback page or anything else - still moving
+        """
+        from urllib.parse import urlsplit
+
+        url = (self.page.url or "").lower()
+        parts = urlsplit(url)
+        on_auth = parts.netloc.startswith(self._AUTH_HOST_PREFIXES) or any(
+            seg in parts.path for seg in self._AUTH_PATH_SEGMENTS)
+        try:
+            has_password = await self.page.locator(
+                "input[type='password']:visible").count() > 0
+        except Exception:
+            return "IN_FLIGHT"
+        if has_password:
+            return "LOGIN_FORM"
+        if on_auth or "cruisingpower.com" not in url:
+            return "IN_FLIGHT"
+        return "LOGGED_IN"
+
+    async def _wait_for_login_outcome(self, timeout_s: float,
+                                      until: tuple = ("LOGGED_IN", "LOGIN_FORM")) -> str:
+        """Poll _login_state until it rests on one of `until` for two
+        consecutive looks (a /home bootstrap flashes a login form for a
+        moment - see _check_login), or the time runs out. Returns the last
+        state seen."""
+        deadline = time.monotonic() + timeout_s
+        previous = None
+        state = await self._login_state()
+        while True:
+            if state in until and state == previous:
+                return state
+            if time.monotonic() >= deadline:
+                return state
+            await asyncio.sleep(1.0)
+            previous, state = state, await self._login_state()
 
     async def auto_login(self) -> str:
         """Fill the ESPRESSO login form from the saved credential.
@@ -282,6 +356,21 @@ class EspressoScraper(BaseScraper):
             await self._settle_navigation(timeout_ms=15000, quiet_ms=1500)
             if await self._check_login():
                 logger.info("espresso.auto_login", result="ALREADY_LOGGED_IN")
+                return "ALREADY_LOGGED_IN"
+
+            # A CALLBACK PAGE IS A LOGIN IN PROGRESS, NOT A MISSING FORM.
+            # Fixed 2026-10-08. Five re-logins that afternoon returned
+            # NO_LOGIN_FORM from
+            #     /oauth/callback?code=...&iss=auth.cruisingpower.com...
+            # - the redirect chain finishing a sign-in on its own. There is
+            # no password box on a callback page because nothing needs
+            # typing. NO_LOGIN_FORM was final, so the booking failed; the
+            # scan only recovered at 17:03 because a later retry happened
+            # to sample after the chain had landed. Wait for it to land.
+            state = await self._wait_for_login_outcome(self._SSO_LANDING_SECONDS)
+            if state == "LOGGED_IN" and await self._check_login():
+                logger.info("espresso.auto_login", result="ALREADY_LOGGED_IN",
+                            via="sso_redirect_landed")
                 return "ALREADY_LOGGED_IN"
 
             # Evidence for the future: no ESPRESSO login page has ever been
@@ -376,16 +465,25 @@ class EspressoScraper(BaseScraper):
             else:
                 await pass_box.press("Enter")
 
-            # Short settle only. Anything longer would be waiting on MFA,
-            # which is the human's job - blocking here would look like a
-            # hang with no explanation.
             try:
                 await self.page.wait_for_load_state("networkidle", timeout=15000)
             except Exception:
                 pass
 
+            # LET THE SIGN-IN LAND BEFORE CALLING IT MFA. Fixed 2026-10-08.
+            # networkidle fires while the page is still on /login, before
+            # the redirect chain starts, so this used to judge about a
+            # second after submitting. The log that afternoon:
+            #     16:30:45 auto_login result=FILLED_AWAITING_MFA
+            #     16:30:55 relogin_mfa_completed waited_s=10.1
+            # eight times in a row - no human enters a code in ten seconds;
+            # the chain simply had not landed yet. Those were plain
+            # successful logins reported as MFA. Only a sign-in that has
+            # not landed after _SSO_LANDING_SECONDS is now called MFA.
+            await self._wait_for_login_outcome(self._SSO_LANDING_SECONDS,
+                                               until=("LOGGED_IN",))
             if await self._check_login():
-                logger.info("espresso.auto_login", result="OK")
+                logger.info("espresso.auto_login", result="OK", url=(self.page.url or "")[:160])
                 return "OK"
 
             logger.info("espresso.auto_login", result="FILLED_AWAITING_MFA",
@@ -479,6 +577,9 @@ class EspressoScraper(BaseScraper):
         SESSION_KEEPALIVE_SECONDS. Never raises - a failed keepalive must
         not take down a scan that might still be perfectly fine.
         """
+        if self.viewing_in_progress:
+            # self.page is the person's tab right now (Open in portal).
+            return False
         last = getattr(self, "_last_navigation_at", None)
         idle = time.monotonic() - last if last is not None else None
         if not force and (idle is None or idle < self.SESSION_KEEPALIVE_SECONDS):
@@ -528,6 +629,8 @@ class EspressoScraper(BaseScraper):
         for candidate in list(getattr(context, "pages", []) or []):
             if candidate is self.page or candidate.is_closed():
                 continue
+            if candidate in getattr(self, "_viewing_tabs", ()):
+                continue        # a person's "Open in portal" tab - never adopt it
             try:
                 url = (candidate.url or "").lower()
                 if "cruisingpower.com" not in url:
@@ -552,6 +655,222 @@ class EspressoScraper(BaseScraper):
             self._page = candidate
             return True
         return False
+
+    # How long to wait for a human to finish an MFA challenge before
+    # abandoning the scan, and how often to look.
+    _MFA_WAIT_SECONDS = 180.0
+    _MFA_POLL_SECONDS = 5.0
+
+    # Set once per scraper when an MFA wait has already timed out. The
+    # operator is demonstrably not at the desk, so the remaining bookings
+    # fail fast instead of burning three minutes each.
+    _mfa_wait_exhausted = False
+    # True from a mid-scan sign-out until a login is confirmed again; tells
+    # _ensure_logged_in to report the recovery to the GUI exactly once.
+    _login_trouble = False
+
+    async def _ensure_logged_in(self) -> bool:
+        """Logged in, logging back in if we are not. True when authenticated.
+
+        THE BUG THIS FIXES, 2026-10-07. Neon: *"we are still having the
+        esspresso login bug issue idk when u will fix it"* - and, the same
+        day, 242 bookings that were never scanned.
+
+        `_check_login` is a DETECTOR. It was wired straight to a raise:
+
+            if not await self._check_login():
+                raise RuntimeError("Not logged in - please log into ESPRESSO first")
+
+        So when the session dropped at 16:47:41 on job 104 the run simply
+        stopped asking. The log shows the whole thing:
+
+            14:45:59  gui.start_auto_login_ok      <- a login DID work
+            16:47:41  login.required .../login
+            16:47:47  batch.error 3001037 "Not logged in"
+            16:49:31  batch.complete  checked=451 requested=769
+
+        `auto_login()` existed the entire time and was called exactly once,
+        from the GUI's Start button. Nothing re-tried it mid-scan.
+
+        WHY THIS IS WORTH DOING even though ESPRESSO can demand MFA. Across
+        every auto_login recorded in the log:
+
+            OK                  19      fully unattended
+            ALREADY_LOGGED_IN    8
+            FILLED_AWAITING_MFA 13      needs a human-entered code
+            NO_LOGIN_FORM        1
+
+        Two thirds need no human at all, and the 14:45 login on this very
+        run was one of them. So this is not a hypothetical recovery path.
+
+        It does NOT pretend MFA can be automated. When a code is demanded
+        the credential is already in the form and only the code is missing,
+        so we wait a bounded three minutes for the operator - and if they
+        are not there, `_mfa_wait_exhausted` makes every later booking fail
+        in seconds rather than three minutes apiece.
+
+        Never raises: a failure to recover returns False and the caller
+        still raises its own "Not logged in", exactly as before.
+        """
+        if await self._check_login():
+            # A working session ends any earlier "nobody is at the desk"
+            # verdict - see _mfa_wait_exhausted below - and any login
+            # warning the GUI is still showing (e.g. the MFA code was typed
+            # after the wait had already timed out).
+            self._mfa_wait_exhausted = False
+            if self._login_trouble:
+                self._login_trouble = False
+                self.log_action("login_recovered", result="session_back")
+            return True
+
+        logger.warning(
+            "espresso.session_lost", url=(self.page.url or "")[:120],
+            msg="session dropped mid-scan - attempting to log back in",
+        )
+        # Every step below is also sent to the GUI (log_action -> on_action)
+        # so the window says what is happening, not just the log file.
+        self._login_trouble = True
+        self.log_action("login_session_lost")
+        try:
+            result = await self.auto_login()
+        except Exception as exc:  # noqa: BLE001 - recovery must not crash a run
+            logger.error("espresso.relogin_crashed", error=str(exc)[:200])
+            self.log_action("login_relogin_failed", result="crashed")
+            return False
+
+        logger.info("espresso.relogin", result=result)
+
+        if result in ("OK", "ALREADY_LOGGED_IN"):
+            # VERIFY ON THE PAGE THE SCAN NEEDS, NOT THE PAGE WE LANDED ON.
+            # Fixed 2026-10-15. Neon: "esspresso is still having a log in
+            # issue i need to log in manually usually twice". The log: the
+            # session ends about every 60 minutes (14 Oct 15:31 -> 16:33 ->
+            # 17:34 -> 18:37), and the first re-login after it often
+            # "succeeds" without holding - relogin_verified ok=True was
+            # logged 6 ms after auto_login OK (a re-read of the same page),
+            # then the search waited 60 s and found /login again:
+            #     14 Oct 17:34:17 OK -> 17:35:47 login form again
+            #     14 Oct 15:26:37 OK -> 15:27:50 login form again
+            #     15 Oct 16:28:27 OK x6 in a row before one held
+            # So: prove it by opening reservations and seeing the search
+            # box, and if that fails, log in once more at once - the
+            # second login Neon was doing by hand.
+            landed = (self.page.url or "")[:160]
+            recovered, proved_on = await self._prove_session()
+            if not recovered:
+                logger.warning("espresso.relogin_not_holding", landed=landed,
+                               now=proved_on, msg="login reported OK but reservations "
+                               "did not open - logging in a second time")
+                result = await self.auto_login()
+                landed = (self.page.url or "")[:160]
+                logger.info("espresso.relogin_second", result=result, landed=landed)
+                if result in ("OK", "ALREADY_LOGGED_IN"):
+                    recovered, proved_on = await self._prove_session()
+            if result in ("OK", "ALREADY_LOGGED_IN") or recovered:
+                logger.info("espresso.relogin_verified", ok=recovered,
+                            landed=landed, proved_on=proved_on)
+                if recovered:
+                    self._mfa_wait_exhausted = False
+                    self._login_trouble = False
+                self.log_action("login_recovered" if recovered else "login_relogin_failed",
+                                result=result)
+                return recovered
+            # The second attempt asked for MFA (or failed): handled below.
+
+        if result != "FILLED_AWAITING_MFA":
+            # NO_CREDENTIALS_SAVED, NO_LOGIN_FORM or ERROR. This booking
+            # fails; the NEXT booking starts here again and re-tries the
+            # login from scratch - that per-booking retry is the loop.
+            self.log_action("login_relogin_failed", result=result)
+            return False
+
+        if self._mfa_wait_exhausted:
+            # An earlier 3-minute wait found nobody at the desk, so do not
+            # block for another 3 minutes per booking. The login itself was
+            # still attempted above (and given _SSO_LANDING_SECONDS to land),
+            # and the next booking tries again. Before 2026-10-08 this flag
+            # was never cleared, so one timeout at 16:45 turned every later
+            # re-login into an instant skip even after logins worked again.
+            logger.warning("espresso.relogin_mfa_skipped",
+                           msg="an earlier MFA wait already timed out")
+            self.log_action("login_awaiting_mfa", waiting_s=0)
+            return False
+
+        deadline = time.monotonic() + self._MFA_WAIT_SECONDS
+        logger.warning(
+            "espresso.relogin_awaiting_mfa",
+            wait_s=self._MFA_WAIT_SECONDS,
+            msg="credential submitted - waiting for the MFA code to be entered",
+        )
+        self.log_action("login_awaiting_mfa", waiting_s=int(self._MFA_WAIT_SECONDS))
+        while time.monotonic() < deadline:
+            await asyncio.sleep(self._MFA_POLL_SECONDS)
+            if await self._check_login():
+                logger.info(
+                    "espresso.relogin_mfa_completed",
+                    waited_s=round(self._MFA_WAIT_SECONDS
+                                   - (deadline - time.monotonic()), 1),
+                )
+                self._mfa_wait_exhausted = False
+                self._login_trouble = False
+                self.log_action("login_recovered", result="mfa_completed")
+                return True
+
+        self._mfa_wait_exhausted = True
+        logger.error(
+            "espresso.relogin_mfa_timeout", waited_s=self._MFA_WAIT_SECONDS,
+            msg="nobody entered the MFA code - later bookings will fail fast",
+        )
+        self.log_action("login_mfa_timeout")
+        return False
+
+    # How long the reservations page gets to show its search box when a
+    # re-login is proven (a healthy load: navigate_reservations ~1.1 s +
+    # search box, espresso.timings 2026-10-15).
+    _PROVE_SESSION_MS = 25000
+
+    async def _prove_session(self) -> tuple[bool, str]:
+        """Require the reservation search box - the one test that a login
+        really holds. Returns (proved, url). Never raises.
+
+        ON /home, NEVER reservations.do (changed 2026-10-16). Live trace
+        that morning, every login: /home OK, then
+            GET /espresso/protected/reservations.do -> 302 ../../SecureLogin.do
+            GET /SecureLogin.do -> 301 /logout -> endSession -> /login
+        ESPRESSO moved the "Search by Reservation ID, Name or Date" box onto
+        /home and its old reservations page now forwards to LOGOUT - so the
+        2026-10-15 version of this proof, which opened reservations.do,
+        logged the session out every time it ran."""
+        try:
+            await self._go_to_search()
+            await self.page.locator(self._SEARCH_INPUT_SELECTOR).first.wait_for(
+                state="visible", timeout=self._PROVE_SESSION_MS)
+            return True, (self.page.url or "")[:160]
+        except Exception:
+            return False, (self.page.url or "")[:160]
+
+    async def _go_to_search(self) -> str:
+        """Reach the reservation search box WITHOUT opening reservations.do
+        when /home has it (see _prove_session: since 2026-10-16 that page
+        forwards to /logout). Returns where the box is: "here", "home", or
+        "reservations" (old portal layout only - used solely when /home shows
+        no box at all, and logged, because on today's portal it logs out)."""
+        box = self.page.locator(self._SEARCH_INPUT_SELECTOR)
+        if await box.count():
+            return "here"
+        if "/home" not in (self.page.url or ""):
+            await self.navigate(settings.espresso_home_url)
+            await self._settle_navigation()
+        try:
+            await box.first.wait_for(state="visible", timeout=20000)
+            return "home"
+        except Exception:
+            pass
+        logger.warning("espresso.search_box_not_on_home", url=(self.page.url or "")[:120],
+                       msg="falling back to reservations.do - on the 2026-10-16 portal "
+                           "this page forwards to /logout")
+        await self.navigate(settings.espresso_base_url)
+        return "reservations"
 
     async def _check_login(self) -> bool:
         """Whether we are really authenticated on the page we are on now.
@@ -709,6 +1028,23 @@ class EspressoScraper(BaseScraper):
         '#searchReservationBtn, [aria-label="Search by Reservation ID, Name or Date"]'
     )
 
+    async def _open_booking_for_viewing(self, booking_id: str) -> None:
+        """Open in portal (GUI button): the same steps a scan takes to reach
+        a booking - home, login check, reservations, search - and nothing
+        after. Opening a reservation LOCKS it on ESPRESSO until Exit is
+        clicked in that tab (15 minutes otherwise, see release_booking);
+        the GUI says so."""
+        await self.navigate(settings.espresso_home_url)
+        await self._settle_navigation()
+        if not await self._ensure_logged_in():
+            raise RuntimeError("Not logged in to ESPRESSO - press Check login")
+        # The search box is on /home since 2026-10-16; reservations.do now
+        # forwards to /logout (see _prove_session).
+        await self._go_to_search()
+        if not await self._ensure_logged_in():
+            raise RuntimeError("Not logged in to ESPRESSO - press Check login")
+        await self._search_booking(booking_id)
+
     async def _search_booking(self, booking_id: str) -> None:
         """Submit a booking ID in the search form."""
         # Login can still be mid-way through ESPRESSO's OAuth SSO redirect
@@ -739,12 +1075,35 @@ class EspressoScraper(BaseScraper):
             raise
         await self.page.fill(self._SEARCH_INPUT_SELECTOR, "")
         await self.page.fill(self._SEARCH_INPUT_SELECTOR, booking_id)
+        self.last_search_refusal = None
         await self.page.click(self._SEARCH_BUTTON_SELECTOR)
         # Some bookings' search-result pages render the sidebar noticeably
         # slower (observed recurring timeouts on real bookings at 15s while
         # every other booking clears well under it) — 25s gives those the
         # room to load without meaningfully slowing down the normal case.
-        await self.wait_for("#sideBar, [id*='sideBar']", timeout=25000)
+        #
+        # BUT A REFUSAL IS AN ANSWER (2026-10-16). Failure snapshots: 3001034
+        # "ACCESS TO BOOKING ID 3001034 IS DENIED. SECURED BOOKING" (red
+        # banner on /home), DEMO05 "No Reservations found for 'DEMO05'".
+        # Both burned 3 x 25 s every run and were filed ERROR. Watch for the
+        # sidebar OR ESPRESSO's own refusal; a refusal ends the booking.
+        deadline = time.monotonic() + 25
+        while time.monotonic() < deadline:
+            if await self.page.locator("#sideBar, [id*='sideBar']").count():
+                break
+            refusal = search_refusal(await self._body_text())
+            if refusal:
+                self.last_search_refusal = refusal
+                logger.info("espresso.search_refused", booking_id=booking_id, message=refusal)
+                return
+            await asyncio.sleep(0.5)
+        await self.wait_for("#sideBar, [id*='sideBar']", timeout=1000)
+
+    async def _body_text(self) -> str:
+        try:
+            return await self.page.inner_text("body", timeout=3000)
+        except Exception:
+            return ""
 
     async def _read_category(self) -> str | None:
         """Read the current price category from the booking page.
@@ -1086,14 +1445,25 @@ class EspressoScraper(BaseScraper):
         """)
         return result
 
-    async def _read_page_data(self, category: str | None) -> dict:
-        """Read execution token, selection JSON, and radio value from page."""
+    async def _read_page_data(self, category: str | None,
+                              requested_code: str | None = None) -> dict:
+        """Read execution token, selection JSON, and radio value from page.
+
+        requested_code (e.g. "INDIVIDUAL-DJ065340") picks the category's
+        radio in THAT column - a Promotions -> Compare column - by its
+        data-requestedcode, the attribute the row itself carries (verified
+        2026-09-18 for INDIVIDUAL-BESTRATE / -BVL). No such radio ->
+        radioFound=false and nothing is clicked; the caller must not
+        reprice on the default column instead."""
         cat_js = f"'{category}'" if category else "null"
+        code_js = json.dumps(requested_code)
         result = await self.page.evaluate(f"""
             (async () => {{
                 const m = location.href.match(/execution=(e\\d+s\\d+)/);
                 const token = m ? m[1] : null;
                 let radio = '1';
+                let found = false;
+                const wantCode = {code_js};
                 const sel0 = document.querySelector('input.selectionJSON, input[name*="selectionJSON"]');
                 const beforeJson = sel0?.value || '';
                 const cat = {cat_js};
@@ -1103,9 +1473,13 @@ class EspressoScraper(BaseScraper):
                     for (const row of tbody.querySelectorAll('tr')) {{
                         const icon = row.querySelector('td.c1 div.categoryIcon span, .categoryIcon span');
                         if (icon && icon.textContent.trim() === cat) {{
-                            const r = row.querySelector('input[name="rbCategorySelection"][data-columnindex="0"]')
-                                   || row.querySelector('input[type="radio"]');
+                            const r = wantCode
+                                ? Array.from(row.querySelectorAll('input[name="rbCategorySelection"]'))
+                                      .find(el => el.getAttribute('data-requestedcode') === wantCode) || null
+                                : (row.querySelector('input[name="rbCategorySelection"][data-columnindex="0"]')
+                                   || row.querySelector('input[type="radio"]'));
                             if (r) {{
+                                found = true;
                                 radio = r.value;
                                 r.checked = true;
                                 r.click();
@@ -1123,7 +1497,8 @@ class EspressoScraper(BaseScraper):
                 }}
                 await new Promise(res => setTimeout(res, 150));
                 const selFinal = document.querySelector('input.selectionJSON, input[name*="selectionJSON"]');
-                return {{ executionToken: token, selectionJSON: selFinal?.value || '[]', radioValue: radio }};
+                return {{ executionToken: token, selectionJSON: selFinal?.value || '[]', radioValue: radio,
+                          radioFound: found }};
             }})()
         """)
         return result
@@ -1187,6 +1562,170 @@ class EspressoScraper(BaseScraper):
         await asyncio.sleep(1.0)
         top_prices = await self._read_top_prices()
         return top_prices.get("allocationPrice")
+
+    # Promotions -> Compare. Proven on Neon's two HAR files (3000067,
+    # 2026-10-13); see core/espresso_perk_compare.py for the whole record.
+    # The Compare button's own ids on the real page (header and footer).
+    # :visible - on 2026-10-14 the header one was found but never became
+    # visible on 3001033 and 3001069 (30 s click timeout).
+    _COMPARE_SELECTOR = "a.btnCompare#promoFare00:visible, a.btnCompare#promoFare10:visible"
+
+    async def _check_promotions_ticked(self) -> list[str]:
+        """The Promotions checkboxes that are ticked NOW - the post-click
+        check for the ticks, read back from the page."""
+        return await self.page.evaluate(
+            "() => Array.from(document.querySelectorAll('input[name=\"promotions\"]'))"
+            ".filter(e => e.checked).map(e => e.value)")
+
+    async def _perk_compare(self, booking_id: str, category: str | None,
+                            old_fare_names: list[str],
+                            old_total: float | None) -> dict:
+        """Price `category` WITH the booking's perk kept, on the portal's own
+        Promotions -> Compare columns. Returns a record (always - every
+        outcome is captured data) with `results`: one calculate_espresso
+        BookingResult per repriced column.
+
+        ONE COMPARE PER PERK, each paired with Best Rate - exactly the pair
+        Neon's HARs proved. Live 2026-10-14 (9 bookings, TICK_MISMATCH):
+        the page will not hold ALL INC 2PK NRD and ALL INC 2PK ticked
+        together - only ALL INC 2PK stayed ticked every time.
+
+        Clicks: the offer checkboxes and Compare. NEVER Select (it sits right
+        next to Compare), never Continue. Compare is not retried. The booking
+        is released by check_booking's `finally` as on every other path."""
+        record: dict = {"category": category, "outcome": None, "asked": [],
+                        "compares": [], "columns": [], "results": []}
+        if not category:
+            record["outcome"] = "NO_CATEGORY"
+            return record
+
+        targets: list[dict] | None = None
+        occupancy: int | None = None
+        stop: str | None = None
+        index = 0
+        while targets is None or index < len(targets):
+            href = await self.page.evaluate(
+                "() => document.querySelector('a[href*=\"_eventId=linkToPromotionList\"]')"
+                "?.getAttribute('href') || null")
+            if not href:
+                stop = "NO_PROMOTIONS_LINK"
+                break
+            await self.navigate(urljoin(self.page.url, href))
+            await self._settle_navigation()
+
+            values = await self.page.evaluate(
+                "() => Array.from(document.querySelectorAll('input[name=\"promotions\"]'))"
+                ".map(e => e.value)") or []
+            if targets is None:
+                targets = compare_targets(old_fare_names, values)
+                record["asked"] = [t["value"] for t in targets]
+                if not targets:
+                    stop = "PERK_NOT_ON_PROMOTIONS_PAGE"
+                    break
+            target = targets[index]
+            index += 1
+            best_rate = next((v for v in values if v.startswith("BESTRATE^")), None)
+            want = [target["value"]] + ([best_rate] if best_rate else [])
+            step: dict = {"offer": target["value"]}
+            record["compares"].append(step)
+
+            # el.click() rather than .checked so the page's own handlers run -
+            # they are what enable Compare.
+            await self.page.evaluate(
+                """(want) => {
+                    for (const el of document.querySelectorAll('input[name="promotions"]')) {
+                        if (el.checked !== want.includes(el.value)) el.click();
+                    }
+                }""", want)
+            ticked = await self._check_promotions_ticked()
+            if sorted(ticked or []) != sorted(want):
+                step["ticked"] = ticked
+                stop = step["outcome"] = "TICK_MISMATCH"
+                break
+
+            button = self.page.locator(self._COMPARE_SELECTOR).first
+            if await button.count() == 0:
+                stop = step["outcome"] = "NO_VISIBLE_COMPARE_BUTTON"
+                break
+            label = ((await button.text_content()) or "").strip()
+            classes = (await button.get_attribute("class")) or ""
+            # The guard: only ever the Compare button, never Select.
+            if label != "Compare" or "btnSelect" in classes:
+                stop = step["outcome"] = "REFUSED_NOT_COMPARE"
+                break
+            if "disabled" in classes.split():
+                stop = step["outcome"] = "COMPARE_DISABLED"
+                break
+            self.log_action("perk_compare", booking_id=booking_id, offers=want)
+            async with self.page.expect_navigation(wait_until="domcontentloaded", timeout=30000):
+                await button.click(timeout=10000)
+            await self._settle_navigation()
+
+            view = await self.page.evaluate(
+                """(cat) => (typeof viewJSON === 'undefined' || !viewJSON) ? null : {
+                    category: ((viewJSON.matrix || {}).matrix || {})[cat] || null,
+                    occupancy: (viewJSON.sailingModel || {}).occupancy || null,
+                }""", category)
+            if not view or not view.get("category"):
+                stop = step["outcome"] = "NO_PRICE_DATA"
+                break
+            try:
+                occupancy = int(view.get("occupancy")) if view.get("occupancy") else None
+            except (TypeError, ValueError):
+                occupancy = None
+            columns = perk_columns(view["category"], [target])
+            if not columns:
+                stop = step["outcome"] = "COLUMN_NOT_ON_PAGE"
+                break
+            record["columns"].append(columns[0])
+            step["outcome"] = "COMPARED"
+            await self._reprice_perk_column(booking_id, category, columns[0],
+                                            old_total, occupancy, record)
+
+        record["occupancy"] = occupancy
+        if not stop:
+            record["outcome"] = "DONE"
+        elif record["columns"]:
+            record["outcome"] = f"PARTIAL_{stop}"
+        else:
+            record["outcome"] = stop
+        if record["outcome"] != "DONE":
+            # The page that stopped it, for the next diagnosis - 2026-10-14
+            # left nothing to read on the two click timeouts.
+            await self.dump_failure_snapshot(
+                booking_id, f"perk_compare_{record['outcome']}", str(record["compares"])[:500])
+        return record
+
+    async def _reprice_perk_column(self, booking_id: str, category: str,
+                                   column: dict, old_total: float | None,
+                                   occupancy: int | None, record: dict) -> None:
+        """Royal's own total for `category` in this perk column - the same
+        allocate + repriceModalCheck as the main scan, on this column's radio.
+        Skipped when the page already proves the column cannot win."""
+        if not worth_repricing(column, old_total, occupancy):
+            column["repriced"] = False
+            return
+        page_data = await self._read_page_data(category, requested_code=column["key"])
+        # The selection must name THIS column's offer - else we would be
+        # pricing some other column and calling it the perk.
+        if (not page_data.get("radioFound") or not page_data.get("executionToken")
+                or f'"requestedCode":"{column["code"]}"' not in (page_data.get("selectionJSON") or "")):
+            column["repriced"] = "RADIO_NOT_FOUND"
+            return
+        api = await self._execute_api_calls(
+            page_data["executionToken"], page_data["selectionJSON"], page_data["radioValue"])
+        data = api.get("data") if api.get("ok") else None
+        if not isinstance(data, dict) or not isinstance(data.get("result"), dict):
+            column["repriced"] = f"NO_INVOICE: {str(api.get('error') or data)[:120]}"
+            return
+        # Wrapped, so the main reprice stays the last plain capture.
+        self.dump_raw(booking_id, {"perk_compare": {"column": column, "data": data}})
+        r = calculate_espresso(data, booking_id, category)
+        column["repriced"] = True
+        column["new_total"] = r.new_total
+        column["verdict"] = r.status.value
+        column["net_saving"] = r.net_saving
+        record["results"].append((column, r))
 
     async def _execute_api_calls(self, token: str, selection_json: str, radio: str) -> dict:
         """Execute the allocate + reprice API calls inside the page context."""
@@ -1538,7 +2077,12 @@ class EspressoScraper(BaseScraper):
         # is ultimately returned, further down, regardless of which branch
         # produced it — never assumed "USD" when this stays None.
         detected_currency: str | None = None
-        self.last_market_data = None
+        # Was three separate `= None` lines added on three separate days,
+        # one per attribute, each after its own incident. The general
+        # version lives in BaseScraper now and covers NCL and GoCCL too,
+        # which never got the same treatment - 49 bookings in the live
+        # database carry another booking's payment panel because of it.
+        self.reset_per_booking_state()
 
         async def _attempt():
             nonlocal price_category, detected_currency
@@ -1557,9 +2101,15 @@ class EspressoScraper(BaseScraper):
             # tokens, so it stays until the numbers say otherwise.
             watch = _Stopwatch()
             self._last_stage_timings = watch
-            # Cleared per booking: a stale value would silently attribute
-            # the PREVIOUS booking's ship and sail date to this one.
-            self.last_feature_fields = None
+            # AGAIN, per ATTEMPT and not just per booking. _attempt is
+            # retried, and an attempt that dies after reading the payment
+            # panel must not leave that read standing for an attempt that
+            # never got there. Same booking either way, so this is about
+            # a stale reading, not a misattributed one - but the two
+            # readers below (the WLT and skipRepriceModal price, and
+            # BookingService's PERMANENT paid-in-full exclusion) are both
+            # too consequential to feed from a failed attempt.
+            self.reset_per_booking_state()
 
             logger.info("espresso.navigate_home", booking_id=booking_id)
             self.log_action("navigate", booking_id=booking_id, url=settings.espresso_home_url)
@@ -1571,15 +2121,22 @@ class EspressoScraper(BaseScraper):
             # bookings.
             await self._settle_navigation()
             watch.mark("navigate_home")
-            if not await self._check_login():
+            # _ensure_logged_in, not _check_login: a dropped session is
+            # recovered here instead of ending the run. See its docstring -
+            # this exact line abandoned 242 bookings on 2026-10-07.
+            if not await self._ensure_logged_in():
                 raise RuntimeError("Not logged in — please log into ESPRESSO first")
             watch.mark("check_login_1")
 
-            logger.info("espresso.navigate", booking_id=booking_id)
-            self.log_action("navigate", booking_id=booking_id, url=settings.espresso_base_url)
-            await self.navigate(settings.espresso_base_url)
+            # SEARCH FROM /home WHEN IT HAS THE BOX (2026-10-16). Opening
+            # reservations.do directly - what this line did for months - now
+            # forwards to SecureLogin.do -> /logout -> endSession: the
+            # "logging in and out" loop of that morning. See _prove_session.
+            where = await self._go_to_search()
+            logger.info("espresso.navigate", booking_id=booking_id, search_on=where)
+            self.log_action("navigate", booking_id=booking_id, search_on=where)
             watch.mark("navigate_reservations")
-            if not await self._check_login():
+            if not await self._ensure_logged_in():
                 raise RuntimeError("Not logged in — please log into ESPRESSO first")
             watch.mark("check_login_2")
 
@@ -1598,6 +2155,8 @@ class EspressoScraper(BaseScraper):
                 await self.dump_failure_snapshot(booking_id, "search_booking_failed", str(e))
                 raise
             await self.dump_page_snapshot(booking_id, "after_search")
+            if getattr(self, "last_search_refusal", None):
+                return {"_notAccessible": self.last_search_refusal}
             watch.mark("search")
 
             price_category = await self._read_category()
@@ -1738,12 +2297,18 @@ class EspressoScraper(BaseScraper):
                 # recording nothing produced 1,741 WLT rows with no figures
                 # at all, the single biggest group of price-less rows in
                 # the database.
-                payment = {}
-                try:
-                    payment = await self._read_payment_status()
-                except Exception as exc:  # noqa: BLE001
-                    logger.warning("espresso.wlt_price_unreadable",
-                                   booking_id=booking_id, error=str(exc)[:200])
+                # READ EARLIER, NOT HERE. Fixed 2026-10-05 from the first
+                # live run of this code: 0 of 86 WLT bookings got a price.
+                # The log said why - `total_price=None` on every one, with
+                # no exception. _read_payment_status() worked; it was
+                # pointed at the wrong page.
+                #
+                # Total Price lives on the Reservation Summary, and
+                # _click_categories() above has already navigated away to
+                # the category table, so the regex matched nothing. The
+                # value was captured correctly at line ~1630 while the
+                # summary was still on screen - use that.
+                payment = getattr(self, "last_payment_status", None) or {}
                 return {"_wlt": True,
                         "oldTotal": payment.get("total_price"),
                         "currency": payment.get("currency")}
@@ -1781,12 +2346,11 @@ class EspressoScraper(BaseScraper):
                 # one inner_text read and no navigation. Guarded: failing
                 # to read the price must not turn a clean "restricted" into
                 # an error.
-                payment = {}
-                try:
-                    payment = await self._read_payment_status()
-                except Exception as exc:  # noqa: BLE001
-                    logger.warning("espresso.skip_reprice_price_unreadable",
-                                   booking_id=booking_id, error=str(exc)[:200])
+                # Same correction as the WLT branch above: the summary
+                # page is long gone by here, so re-reading returned None on
+                # all 135 restricted bookings in the 2026-10-05 run. Use
+                # the value captured while it was on screen.
+                payment = getattr(self, "last_payment_status", None) or {}
                 logger.info("espresso.skip_reprice", booking_id=booking_id,
                             total_price=payment.get("total_price"))
                 return {"_skipRepriceModal": True,
@@ -1861,6 +2425,14 @@ class EspressoScraper(BaseScraper):
             )
         if api_result.get("_cancelled"):
             return make_cancelled_result(booking_id, price_category, CruiseLine.ESPRESSO)
+        if api_result.get("_notAccessible"):
+            # Not an error: ESPRESSO answered (a secured booking, or no such
+            # booking on this login). Same status NCL uses for "not here".
+            return BookingResult(
+                cruise_line=CruiseLine.ESPRESSO, status=BookingStatus.NOT_ON_THIS_ACCOUNT,
+                booking_id=booking_id, price_category=price_category,
+                note=(f"ESPRESSO: {api_result['_notAccessible']} - not open to this "
+                      f"login; check the booking number or who holds it"))
         if api_result.get("_paymentUnreadable"):
             # See the guard in the flow above. An unreadable payment panel
             # means the balance is UNKNOWN, and an unknown balance must not
@@ -1913,6 +2485,33 @@ class EspressoScraper(BaseScraper):
                 result = make_upgrade_available_result(
                     booking_id, price_category, CruiseLine.ESPRESSO, result.old_total, best,
                 )
+
+        # PRICE IT WITH THE PERK KEPT (2026-10-13, booking 3000067). The
+        # main reprice above is on Best Rate, which drops ALL INC 2PK /
+        # RETREAT; the perk's value was then only estimated. Runs last, so
+        # the upgrade check above still sees the default columns. Only when
+        # a perk is actually dropped - every other booking costs nothing.
+        result_data = (api_result.get("data") or {}).get("result") or {}
+        old_fares = [f.get("name", "") for f in (result_data.get("oldFares") or []) if f.get("name")]
+        new_fares = {f.get("name", "") for f in (result_data.get("newFares") or []) if f.get("name")}
+        dropped_perks = [n for n in old_fares if is_perk(n) and n not in new_fares]
+        if settings.espresso_perk_compare and dropped_perks:
+            try:
+                record = await self._perk_compare(
+                    booking_id, price_category, old_fares, result.old_total)
+                result = merge_perk_compare(result, record, old_fares)
+                logger.info("espresso.perk_compare", booking_id=booking_id,
+                            outcome=record.get("outcome"), asked=record.get("asked"),
+                            columns=[{k: c.get(k) for k in ("name", "price_pp", "new_total",
+                                                             "verdict", "repriced")}
+                                     for c in record.get("columns", [])])
+                record.pop("results", None)  # BookingResults; the columns carry the figures
+                if isinstance(self.last_market_data, dict):
+                    self.last_market_data["perk_compare"] = record
+            except Exception as exc:  # noqa: BLE001 - the main verdict stands
+                logger.warning("espresso.perk_compare_failed", booking_id=booking_id,
+                               error=str(exc)[:300])
+                result.note = (result.note or "") + " [PERK COMPARE failed - price with the perk kept not checked]"
 
         # Applied uniformly to every branch above (sentinel WLT/paid-in-full/
         # skip-reprice/no-price-change results, the main calculated result,

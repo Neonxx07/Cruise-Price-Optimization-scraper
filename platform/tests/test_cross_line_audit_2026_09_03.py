@@ -29,6 +29,11 @@ def _goccl(offer_code, *, per_person=400.0, current_gross=2000.0, guests=2,
         price_category="BALCONY",
         current_stateroom_type="BALCONY",
         current_offer_code="XXX",
+        # Same fare type as the candidate. Since 2026-10-12 an UNKNOWN
+        # current fare -> Pack & Go counts as a downgrade (DEMO26: "nothing
+        # may be lost"), which would stop these tests before the offer-code
+        # rule they exist to pin.
+        current_offer_name="SAVE & SAIL: PACK & GO",
         current_price_gross=current_gross,
         available_offer_codes=[{
             "offer_code": offer_code,

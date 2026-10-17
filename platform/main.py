@@ -68,11 +68,14 @@ def _scraper_for(cruise_line, market: str | None = None):
     from scraper.espresso import EspressoScraper
     from scraper.goccl import GoCCLScraper
     from scraper.ncl import NclScraper
+    from scraper.princess import PrincessScraper
 
     if cruise_line == CruiseLine.NCL:
         return NclScraper(market=market)
     if cruise_line == CruiseLine.GOCCL:
         return GoCCLScraper()
+    if cruise_line == CruiseLine.PRINCESS:
+        return PrincessScraper()
     return EspressoScraper()
 
 
@@ -84,6 +87,8 @@ def _login_base_url(cruise_line, settings):
         return settings.ncl_search_url
     if cruise_line == CruiseLine.GOCCL:
         return settings.goccl_search_url
+    if cruise_line == CruiseLine.PRINCESS:
+        return settings.princess_login_url
     return settings.espresso_home_url
 
 
@@ -269,7 +274,11 @@ def remove_paid_in_full_from_watchlist(path: str, results) -> list[str]:
 
 async def _run_scan(args):
     from config.settings import settings
-    from core.calculator import total_optimization_savings, unconfirmed_candidate_total
+    from core.calculator import (
+    format_savings_by_currency,
+    savings_by_currency,
+    unconfirmed_candidate_total,
+)
     from core.models import CruiseLine
     from models.database import init_db
     from services.booking_service import BookingService
@@ -287,7 +296,7 @@ async def _run_scan(args):
         booking_ids = [b.strip() for b in args.bookings.split(",") if b.strip()]
 
     if not booking_ids:
-        print("❌ No booking IDs provided. Use --bookings '123456,789012' or --bookings-file watchlist.txt")
+        print("❌ No booking IDs provided. Use --bookings '123456,789012' or --bookings-file watchlists/watchlist.txt")
         sys.exit(1)
 
     cruise_line = CruiseLine(args.cruise_line.upper())
@@ -407,9 +416,11 @@ async def _run_scan(args):
 
     # Summary
     opts = [r for r in job.results if r.status.value == "OPTIMIZATION"]
-    total_saving = total_optimization_savings(job.results)
+    # By currency - a single '$' total was adding CAD to USD.
+    # See core.calculator.savings_by_currency.
+    savings_line = format_savings_by_currency(savings_by_currency(job.results))
     unconf_n, unconf_total = unconfirmed_candidate_total(job.results)
-    print(f"\n💰 Total savings found: ${total_saving:.2f} across {len(opts)} booking(s)")
+    print(f"\n💰 Total savings found: {savings_line.replace(' confirmed savings', '')} across {len(opts)} booking(s)")
     if unconf_n:
         print(f"   {unconf_n} UNCONFIRMED candidate(s) worth ${unconf_total:,.2f} excluded from the total - verify before trusting")
 
@@ -438,7 +449,7 @@ async def _run_watch(args):
         booking_ids = [b.strip() for b in args.bookings.split(",") if b.strip()]
 
     if not booking_ids:
-        print("❌ No booking IDs provided. Use --bookings '123456,789012' or --bookings-file watchlist.txt")
+        print("❌ No booking IDs provided. Use --bookings '123456,789012' or --bookings-file watchlists/watchlist.txt")
         sys.exit(1)
 
     cruise_line = CruiseLine(args.cruise_line.upper())
@@ -565,7 +576,7 @@ def main():
     login_parser = subparsers.add_parser(
         "login", help="Open a browser and wait for you to log in manually (no credentials handled)",
     )
-    login_parser.add_argument("--cruise-line", default="ESPRESSO", help="ESPRESSO, NCL, or GOCCL")
+    login_parser.add_argument("--cruise-line", default="ESPRESSO", help="ESPRESSO, NCL, GOCCL or PRINCESS")
     login_parser.add_argument(
         "--market", default=None,
         help="NCL only: which agent account to use — US or CA. NCL runs a "
@@ -586,7 +597,7 @@ def main():
         help="Path to a watchlist text file, one booking ID per line "
              "(blank lines and '#' comments ignored). Overrides --bookings.",
     )
-    scan_parser.add_argument("--cruise-line", default="ESPRESSO", help="ESPRESSO, NCL, or GOCCL")
+    scan_parser.add_argument("--cruise-line", default="ESPRESSO", help="ESPRESSO, NCL, GOCCL or PRINCESS")
     scan_parser.add_argument(
         "--no-cache", action="store_true",
         help="Ignore the NO_SAVING TTL cache and check every booking live. "
@@ -642,7 +653,7 @@ def main():
         help="Path to a watchlist text file, one booking ID per line "
              "(blank lines and '#' comments ignored). Overrides --bookings.",
     )
-    watch_parser.add_argument("--cruise-line", default="ESPRESSO", help="ESPRESSO, NCL, or GOCCL")
+    watch_parser.add_argument("--cruise-line", default="ESPRESSO", help="ESPRESSO, NCL, GOCCL or PRINCESS")
     watch_parser.add_argument(
         "--market", default=None,
         help="NCL only: which agent account to use — US or CA. NCL runs a "

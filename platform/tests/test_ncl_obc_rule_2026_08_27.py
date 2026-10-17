@@ -167,16 +167,31 @@ def test_estimated_values_are_never_priced_into_the_verdict():
     assert any("Unlimited Open Bar" in n for n in priced["unpriced_names"])
 
 
-def test_an_optimization_that_loses_an_unpriced_perk_says_so():
-    """It stays an OPTIMIZATION (we cannot prove a dollar loss) but must not
-    present an unqualified win."""
+def test_a_reprice_that_loses_an_unpriced_perk_is_not_a_saving():
+    """CHANGED 2026-10-15. This test used to pin OPTIMIZATION ("we cannot
+    prove a dollar loss"). Neon proved the loss on 3001042: the "$85
+    saving" dropped the FAS dining package, and with DISXIN re-added on Price
+    Programs the invoice read $3,201.33 (DIN SRV CHG $80 back) - a real
+    saving of $4.78. The drop was the perk. Nothing may be lost."""
     r = calculate_ncl(
         "W", "BF", 2000.00, 1600.00,
         _addons("A", "Unlimited Open Bar Package"), "", "", new_addons=[],
     )
-    assert r.status == BookingStatus.OPTIMIZATION
-    assert "value not readable" in r.note
+    assert r.status == BookingStatus.NO_SAVING
     assert "Unlimited Open Bar" in r.note
+    assert "Price Programs" in r.note
+
+
+def test_3001042_is_not_a_saving():
+    """The real booking: $3,206.11 -> $3,121.33 losing More at Sea dining
+    and Wi-Fi (values not on the page)."""
+    r = calculate_ncl(
+        "3001042", "T1", 3206.11, 3121.33,
+        _addons("MR KENNETH  CARYER", "More at Sea Specialty Dining: 2 Meals")
+        + _addons("MR KENNETH  CARYER", "More at Sea Wi-Fi Package: 150 mins"),
+        "DISC35,DISXIN2", "DISC50,LATREW", new_addons=[],
+    )
+    assert r.status != BookingStatus.OPTIMIZATION
 
 
 def test_real_dollar_value_in_a_non_obc_perk_is_priced():

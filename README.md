@@ -4,7 +4,7 @@
 
 **Automated repricing intelligence for Royal Caribbean, Celebrity, Norwegian, Carnival & MSC Cruises**
 
-[![Version](https://img.shields.io/badge/version-1.1-blue.svg)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-1.2-blue.svg)](CHANGELOG.md)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](CONTRIBUTING.md)
 [![Chrome Extension](https://img.shields.io/badge/Chrome-Extension-4285F4?logo=googlechrome&logoColor=white)]()
@@ -247,6 +247,50 @@ Full policy, plus the incident record that produced these rules:
 
 ## What's New
 
+### Princess (POLAR) is live — the fifth cruise line
+
+Previously groundwork only; now a working read-only scraper plus its own decision logic.
+
+- [`scraper/princess.py`](platform/scraper/princess.py) — reads a booking and prices its own
+  category, built from a captured HAR and a live read-only run.
+- [`core/calculator_princess.py`](platform/core/calculator_princess.py) — written *before*
+  the scraper, from figures that close exactly, so the decision logic was settled
+  independently of the page scraping.
+- `CruiseLine.PRINCESS` now exists, and [`docs/PRINCESS_POLAR.md`](platform/docs/PRINCESS_POLAR.md)
+  records the portal's behaviour.
+
+### The payment-schedule rule — one rule for every line
+
+[`core/payment_schedule_rule.py`](platform/core/payment_schedule_rule.py) encodes a hard
+rule: a deposit or payment date is never added to a saving. It applies across all five
+lines rather than being re-derived per scraper.
+
+### Pricing a perk instead of only naming it
+
+[`core/espresso_perk_compare.py`](platform/core/espresso_perk_compare.py) reads ESPRESSO's
+Promotions → Compare screen, so a booking that would give up its perk tier now comes back
+with **what keeping the perk costs** — previously the scan could only say a tier was being
+given up and point you at the screen.
+
+### MSC status match, and booking numbers from HubSpot
+
+- [`services/status_match_service.py`](platform/services/status_match_service.py) and the
+  `MSC_Status_Match_Toolkit/` prepare one customer's evidence at a time.
+- [`services/hubspot_client.py`](platform/services/hubspot_client.py) reads booking numbers
+  from HubSpot instead of copy-paste. The token lives in the OS keyring, never in the repo.
+
+### Day-to-day
+
+- **Saved lists per cruise line** ([`gui/saved_list.py`](platform/gui/saved_list.py)) —
+  no more re-pasting the same four lists every day.
+- **NCL parallel workers**, Canada-market pass, and per-booking state reset.
+- **GoCCL** review-walk, confirm and category-bar handling.
+- [`docs/BUGS_AND_FIXES.md`](platform/docs/BUGS_AND_FIXES.md) — a running record of what
+  broke and what fixed it.
+
+<details>
+<summary><strong>Earlier releases</strong></summary>
+
 ### Outcome tracking — know whether a saving was actually taken
 
 $31,000 of optimizations had been reported and none verified: no column recorded whether
@@ -289,9 +333,6 @@ closes that, in two halves:
 [`gui/monitor_tabs.py`](platform/gui/monitor_tabs.py) moves logs out of the main window
 into dedicated Dashboard and Logs tabs, and [`scan_watchdog.py`](platform/scan_watchdog.py)
 gained crash, process-death and navigation-retry monitors.
-
-<details>
-<summary><strong>Earlier releases</strong></summary>
 
 ### Scan awareness — stop rescanning what the database already knows
 
@@ -503,13 +544,10 @@ logged-in session.
 | Norwegian (NCL) | SeaWeb Agents (US + Canada/CAD) | ✅ | ✅ | ✅ |
 | Carnival (GoCCL) | GoCCL | ✅ | ✅ | ✅ |
 | MSC Cruises | MSC Book | — | ✅ | ✅ |
-| Princess | POLAR | — | 🚧 in progress | — |
+| Princess | POLAR | — | ✅ | ✅ |
 
-> **Princess is not usable yet.** What exists is the hard part of the domain research —
-> [`core/princess_packages.py`](platform/core/princess_packages.py) maps the Plus/Premier
-> fare packages so two Princess fares are never compared as if their package contents
-> matched. There is no POLAR scraper, no `CruiseLine.PRINCESS`, and nothing imports the
-> module yet. Treat it as groundwork, not a supported line.
+> **Princess is read-only.** It reads a booking and prices its own category; it never
+> commits a refare. See [`docs/PRINCESS_POLAR.md`](platform/docs/PRINCESS_POLAR.md).
 
 > **NCL uses a separate agent account per market.** A Canadian booking checked against the US
 > login reports "Reservation is not found" — it's on the other account, not missing. Set the
@@ -551,7 +589,7 @@ We welcome contributions! See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
 
 ### Areas Where You Can Help
 
-- 🚢 **New cruise line adapters** (Princess, Holland America, Silversea, etc.)
+- 🚢 **New cruise line adapters** (Holland America, Silversea, Virgin, etc.)
 - 🧪 **Testing** — unit tests for the calculator engine
 - 🎨 **Extension UI** — dark mode, better UX
 - 📊 **Dashboard** — React frontend for the API

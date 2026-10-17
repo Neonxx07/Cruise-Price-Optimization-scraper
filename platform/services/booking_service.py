@@ -34,6 +34,7 @@ from scraper.base import (
 )
 from scraper.espresso import EspressoScraper
 from scraper.goccl import GoCCLScraper
+from scraper.princess import PrincessScraper
 from scraper.ncl import NclScraper
 from services.cache_service import CacheService
 from services.exclusion_service import ExclusionService
@@ -47,6 +48,16 @@ logger = get_logger(__name__)
 #: failure a human can fix in ten seconds.
 _LOGIN_SHAPED = ("not logged in", "logged out", "login required",
                  "please log into")
+
+
+def _is_login_shaped(error: str | None) -> bool:
+    """Whether a booking's error says the SESSION failed, as opposed to
+    the booking. Used both for run_summary's `login_blocked` count and for
+    the give-up rule in _run_batch."""
+    if not error:
+        return False
+    text = str(error).lower()
+    return any(token in text for token in _LOGIN_SHAPED)
 
 
 def run_summary(job) -> dict:
@@ -84,10 +95,8 @@ def run_summary(job) -> dict:
     errors = [r for r in results
               if getattr(r.status, "value", r.status) == "ERROR"]
 
-    login_blocked = sum(
-        1 for r in errors
-        if any(token in str(getattr(r, "error", "") or "").lower()
-               for token in _LOGIN_SHAPED))
+    login_blocked = sum(1 for r in errors
+                        if _is_login_shaped(getattr(r, "error", None)))
 
     started = getattr(job, "started_at", None)
     finished = getattr(job, "completed_at", None)
@@ -95,8 +104,17 @@ def run_summary(job) -> dict:
     if started and finished:
         duration_s = round((finished - started).total_seconds(), 1)
 
-    requested = len(getattr(job, "booking_ids", []) or [])
-    checked = len(results)
+    # DISTINCT IDS ON BOTH SIDES. Corrected 2026-10-07, same day the
+    # "unfinished" figure started deciding a job's STATUS and not just its
+    # log line. The retry pass (see _bookings_to_retry) appends a SECOND
+    # result for a booking it re-attempts, so a run that retried five
+    # bookings and never reached five others had len(results) == 769 of
+    # 769 and looked complete. Counting ids answers the question actually
+    # being asked: which bookings were never looked at.
+    requested_ids = {str(b) for b in (getattr(job, "booking_ids", []) or [])}
+    checked_ids = {str(getattr(r, "booking_id", "")) for r in results}
+    requested = len(requested_ids)
+    checked = len(checked_ids & requested_ids)
 
     return {
         "requested": requested,
@@ -105,6 +123,9 @@ def run_summary(job) -> dict:
         # the point. A run that reports 306 of 723 is a different event
         # from one that reports 723 of 723.
         "unfinished": max(requested - checked, 0),
+        # Kept separate so the retry pass stays visible rather than
+        # silently inflating "checked".
+        "attempts": len(results),
         "statuses": dict(statuses.most_common()),
         "optimizations": len(optimizations),
         "savings": round(sum(float(r.net_saving or 0) for r in optimizations), 2),
@@ -171,9 +192,13 @@ class BookingService:
             # `market` selects the NCL agent account (US/CA). NCL runs a
             # separate SeaWeb account per market, so a Canadian booking is
             # invisible on the US login — see NclScraper.__init__.
-            return NclScraper(market=market)
+            scraper = NclScraper(market=market)
+            scraper.session_slot = getattr(self, "session_slot", None)
+            return scraper
         if cruise_line == CruiseLine.GOCCL:
             return GoCCLScraper()
+        if cruise_line == CruiseLine.PRINCESS:
+            return PrincessScraper()
         if cruise_line == CruiseLine.MSC:
             raise ValueError(
                 "MSC is not driven through this scraper pipeline — use the separate MSC "
@@ -216,6 +241,8 @@ class BookingService:
             return settings.ncl_search_url
         if cruise_line == CruiseLine.GOCCL:
             return settings.goccl_search_url
+        if cruise_line == CruiseLine.PRINCESS:
+            return settings.princess_login_url
         if cruise_line == CruiseLine.MSC:
             raise ValueError(
                 "MSC is not driven through this scraper pipeline — use the separate MSC "
@@ -237,6 +264,11 @@ class BookingService:
         not-found."""
         if self._live_scraper is not None:
             same_line = self._live_scraper.cruise_line == cruise_line
+            # NO MARKET MEANS THE DEFAULT ONE, for NCL (2026-10-16). It used
+            # to mean "any": after a Canada pass, the next plain NCL Start
+            # would have reused the CA login and found no US booking.
+            if not market and cruise_line == CruiseLine.NCL:
+                market = settings.ncl_default_market
             wanted = (market or "").upper()
             current = (getattr(self._live_scraper, "market", "") or "").upper()
             same_market = (not wanted) or wanted == current
@@ -392,6 +424,23 @@ class BookingService:
                            error=str(exc)[:200])
             return False
 
+    async def open_booking_for_viewing(self, cruise_line: CruiseLine, booking_id: str):
+        """GUI "Open in portal" (2026-10-09): open one booking in a new tab
+        of THIS service's live, logged-in browser. Logs in first - through
+        the same visible check_login the Login button uses - when there is
+        no live session yet. Never a second browser: see
+        BaseScraper.open_booking_in_new_tab. Raises with a plain reason."""
+        booking_id = (booking_id or "").strip()
+        if not booking_id:
+            raise ValueError("No booking number to open")
+        if not self.has_live_session(cruise_line):
+            if not await self.check_login(cruise_line, timeout_minutes=15.0, headless=False):
+                raise RuntimeError(f"Could not log in to {cruise_line.value} - "
+                                   f"complete the login in its window and press Open again")
+        logger.info("portal.open_booking", cruise_line=cruise_line.value,
+                    booking_id=booking_id)
+        return await self._live_scraper.open_booking_in_new_tab(booking_id)
+
     @staticmethod
     async def _verify_login(scraper, cruise_line: CruiseLine) -> bool:
         """One definition of "logged in", shared by the auto-login path and
@@ -485,9 +534,18 @@ class BookingService:
         # escapes _run_batch's own try/except (which already handles the
         # normal failure paths — this is a last-resort net for anything
         # that somehow gets past that).
+        # KEYWORDS, NOT POSITIONS (2026-10-16). This passed
+        # `..., keep_browser_open, headless, market` positionally to a
+        # signature ordered `..., keep_browser_open, market, headless` - so
+        # the two were SWAPPED: a scan asked for market="CA" ran with
+        # market=None (the US account) and headless="CA", and a headless
+        # scan crashed with "'bool' object has no attribute 'upper'". Caught
+        # by the first live NCL 3-at-once run, whose helper jobs both failed.
         task = asyncio.create_task(self._run_batch(
-            job, on_progress, bypass_cache, raw_dump_dir, capture_market_data,
-            capture_everything, on_action, keep_browser_open, headless, market,
+            job, on_progress=on_progress, bypass_cache=bypass_cache,
+            raw_dump_dir=raw_dump_dir, capture_market_data=capture_market_data,
+            capture_everything=capture_everything, on_action=on_action,
+            keep_browser_open=keep_browser_open, headless=headless, market=market,
         ))
         track_background_task(self._background_tasks, task)
 
@@ -518,6 +576,9 @@ class BookingService:
         # the try, so the except sets FAILED and the finally records it.
         scraper = None
         consecutive_failures = 0
+        # See the give-up rule further down: counts only
+        # SESSION failures, not ordinary booking failures.
+        consecutive_login_failures = 0
 
         # ADDED 2026-08-26: CacheService.cleanup_expired() existed but had
         # ZERO callers anywhere in the project, so eviction only ever
@@ -1218,6 +1279,50 @@ class BookingService:
                 else:
                     consecutive_failures = 0
 
+                # A SESSION THAT WILL NOT COME BACK ENDS THE RUN.
+                #
+                # Added 2026-10-07 alongside EspressoScraper._ensure_logged_in.
+                # The scraper now tries to log back in before giving up on a
+                # booking, which is what rescues the common case - but it
+                # makes the HOPELESS case slower, not better: a portal that
+                # is genuinely down would be handed every remaining booking
+                # in turn, each paying for a full login attempt. On
+                # 2026-10-07 that would have been 318 bookings producing
+                # nothing but ERROR rows for well over an hour.
+                #
+                # There was no abort at all before this - only a cooldown
+                # (3 failures -> 120s) which slows the grinding down without
+                # ever stopping it.
+                #
+                # Stopping is the better outcome in every direction: the
+                # bookings are left unchecked rather than marked ERROR, the
+                # job records INCOMPLETE (so it neither suppresses nor hides
+                # a rescan), and the operator gets one clear reason instead
+                # of 318 identical failures. Only LOGIN-shaped errors count,
+                # so an unlucky run of ordinary timeouts still runs to the
+                # end.
+                if _is_login_shaped(getattr(result, "error", None)):
+                    consecutive_login_failures += 1
+                else:
+                    consecutive_login_failures = 0
+
+                if consecutive_login_failures >= self._LOGIN_GIVE_UP_AFTER:
+                    job.error = (
+                        f"Stopped after {consecutive_login_failures} bookings "
+                        "in a row could not be scanned because the portal "
+                        "session was lost and could not be restored. The "
+                        "remaining bookings were left unchecked - press "
+                        "Start to resume them."
+                    )
+                    logger.error(
+                        "batch.session_unrecoverable", job_id=job.job_id,
+                        consecutive=consecutive_login_failures,
+                        remaining=max(len(job.booking_ids) - len(job.results), 0),
+                        msg="giving up rather than failing every remaining "
+                            "booking against a dead session",
+                    )
+                    break
+
                 job.results.append(result)
                 job.progress_done = min(i + 1, job.progress_total)
 
@@ -1358,6 +1463,11 @@ class BookingService:
                             payment_state_readable=bool(
                                 payment.get("payment_state_readable")),
                             currency=payment.get("currency") or result.currency,
+                            # None for ESPRESSO, which states no such
+                            # field; NCL's portal does, and a reservation
+                            # that is not BOOKED must never become a
+                            # permanent exclusion. See record_paid_in_full.
+                            booking_status=payment.get("booking_status"),
                         )
                     except Exception as exc:
                         logger.warning("batch.exclusion_record_failed",
@@ -1440,7 +1550,41 @@ class BookingService:
             # stay FAILED, not be silently overwritten back to COMPLETED
             # just because the for-loop exited without raising.
             if job.status not in (ScanJobStatus.STOPPED, ScanJobStatus.FAILED):
-                job.status = ScanJobStatus.COMPLETED
+                # COMPLETED MEANS EVERY BOOKING WAS CHECKED. Fixed
+                # 2026-10-07. Neon: *"there s stilll bookings not scanned
+                # in this run"* - 318 of job 104's 769, which nonetheless
+                # recorded COMPLETED because the for-loop exited without
+                # raising. Two things key off that word and both were
+                # misled by it:
+                #
+                #   * recent_identical_scan suppresses a rescan for two
+                #     hours. Neon pressed Start twice at 17:28 to pick up
+                #     the leftovers and was refused ("minutes_remaining":
+                #     81) on the strength of a run that never touched them.
+                #   * resumable_jobs looks for `status != COMPLETED`, so
+                #     the one job most worth resuming was invisible to it.
+                #
+                # Both docstrings already said an interrupted run must not
+                # count - "An interrupted run is not an answer". This line
+                # was what made it count anyway.
+                # Distinct ids, NOT len(results) - the retry pass appends a
+                # second result per re-attempted booking, so counting rows
+                # would let five retries cover five bookings that were
+                # never reached. See run_summary.
+                _requested = {str(b) for b in (job.booking_ids or [])}
+                _checked = {str(getattr(r, "booking_id", "")) for r in job.results}
+                unchecked = len(_requested - _checked)
+                if unchecked:
+                    job.status = ScanJobStatus.INCOMPLETE
+                    logger.warning(
+                        "batch.incomplete", job_id=job.job_id,
+                        requested=len(job.booking_ids or []),
+                        checked=len(job.results), unfinished=unchecked,
+                        msg="ran out of its queue with bookings unchecked - "
+                            "resumable, and will not suppress a rescan",
+                    )
+                else:
+                    job.status = ScanJobStatus.COMPLETED
 
         except Exception as e:
             logger.error("batch.fatal", job_id=job.job_id, error=str(e))
@@ -1775,6 +1919,13 @@ class BookingService:
     #: session, a portal outage - and grinding through a second full pass
     #: would double the damage rather than fix it.
     _RETRY_MAX = 60
+
+    #: Consecutive LOGIN-shaped failures before a run gives up entirely.
+    #: Three, because EspressoScraper._ensure_logged_in has already tried
+    #: to log back in before each of them - so three in a row means three
+    #: failed recoveries, not three unlucky bookings. Ordinary errors do
+    #: not count toward it; see the give-up rule in _run_batch.
+    _LOGIN_GIVE_UP_AFTER = 3
 
     def is_retryable_error(self, error: str | None) -> bool:
         """Whether a failed booking is worth a second attempt.

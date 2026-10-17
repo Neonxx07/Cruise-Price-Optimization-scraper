@@ -12,19 +12,26 @@ from pathlib import Path
 from openpyxl import Workbook
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 
-from core.calculator import total_optimization_savings
+from core.calculator import is_unconfirmed_candidate, savings_by_currency
 from core.models import BookingResult
 
+# CURRENCY IS A COLUMN, not an assumption. Added 2026-10-07: five money
+# columns were headed "($)" with nothing saying which dollars, while the
+# live database holds 623 CAD ESPRESSO bookings alongside 2,992 USD ones.
+# The headers no longer claim a currency the row may not be in.
 COLS = [
-    "Booking ID", "Cruise Line", "Status", "Confidence",
-    "Old Total ($)", "New Total ($)", "Price Drop ($)", "OBC Change ($)",
-    "Net Saving ($)", "Category", "New Category", "Note",
+    "Booking ID", "Cruise Line", "Status", "Confidence", "Currency",
+    "Old Total", "New Total", "Price Drop", "OBC Change",
+    "Net Saving", "Category", "New Category", "Note",
     "Lost Packages", "Lost Fares", "Re-addable Fares", "Gained Fares",
     "Lost Travel Protection", "Promos Before", "Promos After", "Checked At",
 ]
 
 _FILLS = {
     "OPTIMIZATION": PatternFill("solid", fgColor="C6EFCE"),      # green
+    # Not confirmed by the portal (GoCCL review) - verify by hand. Same
+    # pale yellow as the GUI row, never the green of a confirmed saving.
+    "UNCONFIRMED": PatternFill("solid", fgColor="FFFF99"),
     # Deliberately distinct from OPTIMIZATION's green: a category upgrade
     # always needs human review before switching (different physical
     # room/deck), unlike a confirmed same-category OPTIMIZATION.
@@ -65,7 +72,7 @@ _THIN = Border(
     left=Side(style="thin"), right=Side(style="thin"),
     top=Side(style="thin"), bottom=Side(style="thin"),
 )
-_COL_WIDTHS = [14, 12, 14, 10, 13, 13, 13, 13, 13, 10, 12, 30, 24, 24, 24, 24, 24, 30, 30, 20]
+_COL_WIDTHS = [14, 12, 14, 10, 10, 13, 13, 13, 13, 13, 10, 12, 30, 24, 24, 24, 24, 24, 30, 30, 20]
 
 
 def _row(r: BookingResult) -> list:
@@ -74,6 +81,9 @@ def _row(r: BookingResult) -> list:
         r.cruise_line.value,
         r.status.value,
         r.confidence,
+        # BookingResult's own honest default when nothing was detected -
+        # never silently rendered as USD.
+        r.currency or "UNKNOWN",
         r.old_total,
         r.new_total,
         r.price_drop,
@@ -113,12 +123,14 @@ def export_results_excel(results: list[BookingResult], path: str | Path) -> None
     for r in sorted(results, key=sort_key):
         ws.append(_row(r))
         ri = ws.max_row
-        fill = _FILLS.get(r.status.value, _FILLS["NO_SAVING"])
+        key = ("UNCONFIRMED" if r.status.value == "OPTIMIZATION"
+               and is_unconfirmed_candidate(r) else r.status.value)
+        fill = _FILLS.get(key, _FILLS["NO_SAVING"])
         for ci, cell in enumerate(ws[ri], 1):
             cell.fill = fill
             cell.border = _THIN
-            cell.font = _BOLD_FONT if ci in (1, 3, 9) else _DATA_FONT
-            cell.alignment = _CENTER if ci in (3, 4, 10, 11) else _LEFT
+            cell.font = _BOLD_FONT if ci in (1, 3, 10) else _DATA_FONT
+            cell.alignment = _CENTER if ci in (3, 4, 5, 11, 12) else _LEFT
 
     for col_letter, width in zip((chr(65 + i) for i in range(len(_COL_WIDTHS))), _COL_WIDTHS):
         ws.column_dimensions[col_letter].width = width
@@ -135,7 +147,10 @@ def export_results_excel(results: list[BookingResult], path: str | Path) -> None
         return sum(1 for r in results if r.status.value == status)
 
     opts = [r for r in results if r.status.value == "OPTIMIZATION"]
-    total_saved = total_optimization_savings(results)
+    # One row per currency rather than one sum across all of them. See
+    # core.calculator.savings_by_currency: nothing is dropped, and a
+    # single-currency report still shows a single line.
+    by_currency = savings_by_currency(results)
 
     summary_rows = [
         ("Total Checked", len(results)),
@@ -148,8 +163,11 @@ def export_results_excel(results: list[BookingResult], path: str | Path) -> None
         ("No Saving", count("NO_SAVING")),
         ("Skipped Today", count("SKIPPED_TODAY")),
         ("Errors", count("ERROR")),
-        ("Total Savings Found ($)", round(total_saved, 2)),
     ]
+    summary_rows += [
+        (f"Total Savings Found ({code})", round(amount, 2))
+        for code, amount in sorted(by_currency.items())
+    ] or [("Total Savings Found", 0.0)]
     hdr_font = Font(bold=True, name="Calibri")
     for label, value in summary_rows:
         ss.append([label, value])

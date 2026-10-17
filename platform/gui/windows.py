@@ -39,8 +39,23 @@ from PySide6.QtWidgets import (
 )
 from qasync import asyncSlot
 
-from core.calculator import total_optimization_savings, unconfirmed_candidate_total
+from config.settings import settings
+from core.calculator import (
+    format_savings_by_currency,
+    is_unconfirmed_candidate,
+    savings_by_currency,
+    unconfirmed_candidate_total,
+)
+from core.calculator_msc import msc_row_status
+from gui.saved_list import SavedList, parse_ids
 from core.models import BookingResult, BookingStatus, CruiseLine
+
+#: Lines proven to run the FULL flow with no window (NCL 2026-09-16, GoCCL
+#: 2026-10-12). ESPRESSO never - scraper/base.py refuses it regardless.
+# PRINCESS added 2026-10-15: auto sign-in (saved OneSource login) -> Book &
+# Manage Cruises -> POLAR -> DEMO12, DEMO24, DEMO29, windowed and headless:
+# identical results, 0 differences (scratchpad princess_headless_compare.py).
+HEADLESS_CAPABLE_LINES = (CruiseLine.NCL, CruiseLine.GOCCL, CruiseLine.PRINCESS)
 from gui.queue_manager import BookingQueueManager, QueueStatus
 from gui.scan_adapter import GuiScanAdapter
 from services.msc_live_service import MscCheckOutcome, MscLiveService
@@ -60,6 +75,7 @@ _STATUS_RANK = {
     "OPPORTUNITY": 0,        # MSC rows
     "OPTIMIZATION": 0,
     "UPGRADE_AVAILABLE": 1,
+    "DISCOUNT_OPPORTUNITY": 1,   # MSC lead with no proven lower price
     "TRAP": 2,               # real money, but the wrong direction
     "NO_OPPORTUNITY": 3,     # MSC rows
     "NO_SAVING": 3,
@@ -156,6 +172,8 @@ def _booking_id_sort_value(booking_id: str) -> float:
 # so editing it does nothing until the GUI is restarted.
 _RELOAD_SENSITIVE = (
     "scraper/ncl.py", "scraper/espresso.py", "scraper/goccl.py",
+    "scraper/princess.py", "core/calculator_princess.py", "core/princess_pages.py",
+    "core/payment_schedule_rule.py",
     "scraper/base.py", "core/calculator.py", "core/calculator_msc.py",
     "core/models.py", "services/booking_service.py",
 )
@@ -298,6 +316,8 @@ class CruiseLinePanel(QWidget):
 
         self.adapter = GuiScanAdapter()
         self.queue_manager = BookingQueueManager()
+        # This line's saved booking list (Neon 2026-10-16) - see gui/saved_list.py.
+        self.saved_list = SavedList(cruise_line.value)
         # MSC runs through its own service, not BookingQueueManager/
         # BookingService — see msc_live_service.py's module docstring for
         # why (MscBookingResult's four-independent-check shape doesn't fit
@@ -314,6 +334,11 @@ class CruiseLinePanel(QWidget):
         # scanned or reused, and when the next scan is allowed. Read by the
         # Dashboard tab; None until Start is pressed.
         self._last_scan_plan: dict | None = None
+        # The current login problem, shown on the status line until a login
+        # succeeds - see _on_action.
+        self._login_alert: str | None = None
+        # True while "Open in portal" is working - see _on_open_in_portal.
+        self._open_in_progress = False
         self.msc_results: list[MscCheckOutcome] = []
         # Re-entrancy guard for _bulk_table_update. Depth, not a flag, so a
         # per-row helper called inside a batch does not restore sorting
@@ -379,7 +404,10 @@ class CruiseLinePanel(QWidget):
             pass
 
     def is_busy(self) -> bool:
-        return bool(self.queue_manager.is_running or self.msc_service.is_running)
+        # An Open-in-portal in progress counts: the keep-alive skips busy
+        # panels, and it must not navigate the browser mid-open.
+        return bool(self.queue_manager.is_running or self.msc_service.is_running
+                    or self._open_in_progress)
 
     def _build_ui(self) -> None:
         """One cruise line's workspace.
@@ -443,6 +471,22 @@ class CruiseLinePanel(QWidget):
         self.stop_button.setEnabled(False)
         self.stop_button.clicked.connect(self._on_stop)
         header_row.addWidget(self.stop_button)
+
+        # OPEN IN PORTAL, added 2026-10-09. Neon: "an open button that when
+        # i press it it opens the booking number in the portal". Opens the
+        # selected result row's booking (or the number typed in the box)
+        # in a new tab of THIS line's own logged-in browser - never a
+        # second login, which is what knocks a scan's session out.
+        self.open_portal_button = QPushButton("Open in portal")
+        self.open_portal_button.setMinimumWidth(120)
+        self.open_portal_button.setToolTip(
+            "Opens the selected result's booking (or the number typed in the "
+            "booking box) in a new tab of this line's own logged-in browser - "
+            "never a second login. Not available while this line is scanning.")
+        self.open_portal_button.clicked.connect(self._on_open_in_portal)
+        # MSC runs its own browser service, not this path - not wired yet.
+        self.open_portal_button.setEnabled(self.cruise_line != CruiseLine.MSC)
+        header_row.addWidget(self.open_portal_button)
         layout.addLayout(header_row)
 
         # No "Cruise Line:" row any more - the tab label already names it.
@@ -487,6 +531,23 @@ class CruiseLinePanel(QWidget):
         )
         self.load_file_button.clicked.connect(self._add_from_file)
         add_layout.addWidget(self.load_file_button, 2, 2)
+
+        # SAVED LIST (2026-10-16). Every booking added above is also kept in
+        # this line's saved list, duplicates dropped silently; one click
+        # queues the whole list again tomorrow - no more copy-paste.
+        add_layout.addWidget(QLabel("Saved list:"), 3, 0)
+        self.saved_list_label = QLabel()
+        self.saved_list_label.setToolTip(
+            "Every booking you add is kept here automatically, without duplicates.\n"
+            f"File (editable): {self.saved_list.path}")
+        add_layout.addWidget(self.saved_list_label, 3, 1)
+        self.load_saved_button = QPushButton("Load saved list")
+        self.load_saved_button.setMinimumWidth(130)
+        self.load_saved_button.setToolTip("Queue every booking in this line's saved list "
+                                          "(already-queued ones are skipped silently).")
+        self.load_saved_button.clicked.connect(self._load_saved_list)
+        add_layout.addWidget(self.load_saved_button, 3, 2)
+        self._refresh_saved_list_label()
         add_layout.setColumnStretch(1, 1)
         layout.addWidget(add_box)
 
@@ -541,9 +602,18 @@ class CruiseLinePanel(QWidget):
         # Mode, the SlickGrid read, the comparison and the cancel-and-release
         # all work without a display.
         #
+        # GoCCL EARNED IT TOO, 2026-10-12: the same 7 bookings run windowed
+        # (data/goccl_investigate_20261012T152718) and headless (..._headless_
+        # 20261012T154356) through the whole /rate -> /category -> /review
+        # walk - 308 fields compared, 0 differences. Offered in the GUI
+        # 2026-10-15 at Neon's request. A hidden browser has no window to
+        # sign in through, so it needs the saved session
+        # (storage_state_GOCCL.json, from one windowed login) or a saved
+        # credential (SAVE_LOGIN option 5).
+        #
         # Not offered for the others. ESPRESSO can NEVER be headless (Akamai
         # bot detection; scraper/base.py enforces it regardless of any
-        # argument), and MSC/GoCCL have not been tested this way.
+        # argument), and MSC has not been tested this way.
         #
         # Unchecked by default, so behaviour is unchanged until asked for.
         # This governs the SCAN as well as the login: the GUI keeps one
@@ -551,14 +621,34 @@ class CruiseLinePanel(QWidget):
         # every booking is checked in.
         self.headless_checkbox = QCheckBox("Run hidden (headless)")
         self.headless_checkbox.setToolTip(
-            "NCL only. Runs the browser with no visible window - faster and "
-            "out of the way, and proven to drive the full flow (edit mode, "
-            "category grid, price comparison, release).\n\n"
+            "NCL, GoCCL and Princess. Runs the browser with no visible window - "
+            "faster and out of the way, and proven to drive the full flow on "
+            "each (NCL: edit mode, category grid, release; GoCCL: rate, "
+            "category, review, discard; Princess: OneSource sign-in, POLAR "
+            "refare walk).\n\n"
             "Applies from the next login: the scan reuses that browser, so "
-            "check this BEFORE clicking Check Login."
+            "check this BEFORE clicking Check Login. GoCCL: sign in once "
+            "with this unchecked first - a hidden browser cannot show you "
+            "the sign-in page."
         )
-        self.headless_checkbox.setVisible(self.cruise_line == CruiseLine.NCL)
+        self.headless_checkbox.setVisible(self.cruise_line in HEADLESS_CAPABLE_LINES)
         opt_layout.addWidget(self.headless_checkbox)
+
+        # NCL "3 AT ONCE" (2026-10-16): separate logins, headless only.
+        # Proven on 30 bookings - 0 differences, 230 s vs 645 s. Never tabs
+        # on one login (that returned another booking's data).
+        self.parallel_checkbox = QCheckBox(
+            f"{settings.ncl_parallel_workers} at once (separate logins)")
+        self.parallel_checkbox.setToolTip(
+            "NCL only, and only with Run hidden ticked. Splits the queue across "
+            f"{settings.ncl_parallel_workers} hidden browsers, EACH with its own NCL login - "
+            "about 3x faster. Uses about one CPU core per browser.")
+        self.parallel_checkbox.setVisible(self.cruise_line == CruiseLine.NCL)
+        self.parallel_checkbox.setEnabled(False)
+        self.headless_checkbox.toggled.connect(
+            lambda on: (self.parallel_checkbox.setEnabled(on),
+                        on or self.parallel_checkbox.setChecked(False)))
+        opt_layout.addWidget(self.parallel_checkbox)
         opt_layout.addStretch(1)
         layout.addWidget(opt_box)
 
@@ -746,8 +836,12 @@ class CruiseLinePanel(QWidget):
         # would cost more, so we didn't recommend it" — summing those in
         # would make "Total savings" go deeply negative even when real
         # optimizations were found. Matches the CLI's own summary (main.py).
-        savings = total_optimization_savings(unique)
-        # Unconfirmed candidates are excluded from `savings` (they said so
+        # ONE LINE CAN CARRY TWO CURRENCIES. ESPRESSO alone has 2,992 USD
+        # and 623 CAD rows in the live database, so a single "$" total was
+        # adding Canadian dollars to American ones. Nothing is dropped and
+        # a single-currency line is unchanged - see savings_by_currency.
+        savings_text = format_savings_by_currency(savings_by_currency(unique))
+        # Unconfirmed candidates are excluded from the total (they said so
         # themselves) but must stay VISIBLE as an action — $4,100 of the
         # all-time total was previously unverified GoCCL candidates.
         unconf_n, unconf_total = unconfirmed_candidate_total(unique)
@@ -756,7 +850,7 @@ class CruiseLinePanel(QWidget):
             f"Optimizations: {optimizations}   "
             f"Upgrades available: {upgrades}   "
             f"Traps: {traps}   "
-            f"Total savings: ${savings:.2f}"
+            f"Total savings: {savings_text.replace(' confirmed savings', '')}"
         )
         if self.msc_results:
             # No dollar total here on purpose — MSC opportunities are a
@@ -766,6 +860,10 @@ class CruiseLinePanel(QWidget):
             # directly anyway (Neon has to call MSC to act on any of these).
             msc_opportunities = sum(1 for o in self.msc_results if o.result and o.result.has_any_opportunity)
             summary_text += f"   |   MSC bookings watched: {len(self.msc_results)}   MSC opportunities found: {msc_opportunities}"
+            verdicts = [o.status_match["verdict"] for o in self.msc_results if o.status_match]
+            if verdicts:
+                summary_text += (f"   |   Status match eligible: {verdicts.count('ELIGIBLE')}"
+                                 f"   check manually: {verdicts.count('CHECK_MANUALLY')}")
         self.summary_label.setText(summary_text)
 
         # Roll this line's totals up into the all-lines footer. Without
@@ -777,16 +875,142 @@ class CruiseLinePanel(QWidget):
             except Exception:
                 logger.exception("gui.summary_rollup_failed")
 
+    # -- saved list (2026-10-16): silent de-duplication, no pop-ups --------
+
+    def _refresh_saved_list_label(self) -> None:
+        n = len(self.saved_list)
+        self.saved_list_label.setText(
+            f"{n} booking{'s' if n != 1 else ''} saved for {self.cruise_line.value}")
+        self.load_saved_button.setText(f"Load saved list ({n})")
+
+    def _remember(self, ids) -> int:
+        """Add to this line's saved list; returns how many were new. Never
+        raises - a full disk must not stop a booking being queued."""
+        try:
+            new = self.saved_list.add(ids)
+        except Exception:
+            logger.exception("gui.saved_list_write_failed", cruise_line=self.cruise_line.value)
+            return 0
+        self._refresh_saved_list_label()
+        return len(new)
+
+    @Slot()
+    def _load_saved_list(self) -> None:
+        ids = self.saved_list.load()
+        if not ids:
+            self.status_label.setText(f"The {self.cruise_line.value} saved list is empty - "
+                                      "bookings you add are saved to it automatically.")
+            return
+        added = self.queue_manager.add_bookings_bulk("\n".join(ids))
+        self._update_queue_view(self.queue_manager.get_snapshot())
+        skipped = len(ids) - len(added)
+        self.status_label.setText(
+            f"Queued {len(added)} from the saved list"
+            + (f" ({skipped} already in the queue)" if skipped else "") + ".")
+        logger.info("gui.saved_list_loaded", cruise_line=self.cruise_line.value,
+                    saved=len(ids), queued=len(added))
+
     def _add_booking(self) -> None:
         booking_id = self.booking_input.text().strip()
         if not booking_id:
-            QMessageBox.warning(self, "Invalid booking", "Please enter a booking ID.")
+            self.status_label.setText("Type a booking ID first.")
             return
-        if not self.queue_manager.add_booking(booking_id):
-            QMessageBox.information(self, "Duplicate booking", "That booking ID is already added to the queue.")
-            return
+        saved_new = self._remember([booking_id])
+        queued = self.queue_manager.add_booking(booking_id)
         self.booking_input.clear()
+        # Duplicates are dropped silently (Neon 2026-10-16) - a status line,
+        # never a pop-up.
+        self.status_label.setText(
+            (f"Queued {booking_id}." if queued else f"{booking_id} is already queued.")
+            + (" Saved to the list." if saved_new else ""))
         self._update_queue_view(self.queue_manager.get_snapshot())
+
+    def _booking_to_open(self) -> str:
+        """The selected result row's booking number, else the booking box."""
+        rows = {item.row() for item in self.results_table.selectedItems()}
+        if len(rows) == 1:
+            cell = self.results_table.item(rows.pop(), 0)
+            if cell is not None and cell.text().strip():
+                return cell.text().strip()
+        return self.booking_input.text().strip()
+
+    @Slot()
+    @asyncSlot()
+    async def _on_open_in_portal(self) -> None:
+        """Open in portal - see the button's comment in _build_ui. Reports on
+        the status line, never a modal: a modal spins the event loop and
+        has killed a running scan here before (see _on_start)."""
+        if self._open_in_progress:
+            return
+        booking_id = self._booking_to_open()
+        if not booking_id:
+            self.status_label.setText(
+                "Select a result row, or type a booking number in the booking "
+                "box, then press Open in portal.")
+            return
+        if self.is_busy():
+            self.status_label.setText(
+                "This line is scanning - Open in portal is available when it finishes.")
+            return
+        self._open_in_progress = True
+        self.open_portal_button.setEnabled(False)
+        # A scan or login started mid-open would use the scraper while its
+        # page still points at the new tab. Block both until it is done.
+        blocked = [b for b in (self.start_button, self.login_button) if b.isEnabled()]
+        for button in blocked:
+            button.setEnabled(False)
+        line = self.cruise_line.value
+        self.status_label.setText(f"Opening {booking_id} in the {line} portal…")
+        try:
+            await self.queue_manager.open_booking_in_portal(self.cruise_line, booking_id)
+        except Exception as exc:  # noqa: BLE001 - reported, never fatal
+            logger.warning("gui.open_in_portal_failed", cruise_line=line,
+                           booking_id=booking_id, error=str(exc)[:200])
+            self.status_label.setText(f"Could not open {booking_id}: {exc}")
+        else:
+            message = f"Opened {booking_id} in a new tab of the {line} browser window."
+            if self.cruise_line == CruiseLine.ESPRESSO:
+                message += (" Click Exit in that tab when you are done - otherwise "
+                            "ESPRESSO keeps the booking locked for 15 minutes.")
+            self.status_label.setText(message)
+            logger.info("gui.open_in_portal_ok", cruise_line=line, booking_id=booking_id)
+        finally:
+            self._open_in_progress = False
+            for button in blocked:
+                button.setEnabled(True)
+            self.open_portal_button.setEnabled(
+                not self.is_busy() and self.cruise_line != CruiseLine.MSC)
+
+    # POP-UPS WITHOUT A NESTED EVENT LOOP (2026-10-16). Neon: "esspresso
+    # results are not showing ... is ncl working?" - at 13:55:10 Princess's
+    # Start showed QMessageBox.question("Code changed since this window
+    # opened"). A modal .exec() inside an async slot runs a NESTED Qt loop,
+    # qasync resumed the other tabs' tasks inside it, and Python 3.14
+    # refused: "Cannot enter into task ... while another task ... is being
+    # executed". ESPRESSO's Start task (the one that copies results into
+    # this table) died - its batch kept scanning and saving (56 rows) with
+    # nothing on screen - and NCL's Playwright connection task was
+    # destroyed, freezing its scan. open() shows the box window-modal and
+    # RETURNS; _ask awaits the answer on a Future instead of blocking.
+    def _notify(self, icon, title: str, text: str) -> None:
+        box = QMessageBox(icon, title, text, QMessageBox.StandardButton.Ok, self)
+        box.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+        box.open()
+
+    async def _ask(self, title: str, text: str, buttons, default):
+        box = QMessageBox(QMessageBox.Icon.Question, title, text, buttons, self)
+        box.setDefaultButton(default)
+        box.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+        answer = asyncio.get_running_loop().create_future()
+
+        def _done(_result):
+            clicked = box.clickedButton()
+            if not answer.done():
+                answer.set_result(box.standardButton(clicked) if clicked is not None
+                                  else QMessageBox.StandardButton.No)
+        box.finished.connect(_done)
+        box.open()
+        return await answer
 
     @Slot()
     @asyncSlot()
@@ -820,7 +1044,7 @@ class CruiseLinePanel(QWidget):
         self.start_button.setEnabled(False)
         self.status_label.setText("Opening browser for login check...")
         self.login_status_label.setText("Login status: checking...")
-        QApplication.processEvents()
+        await asyncio.sleep(0)
 
         cruise_line = self.cruise_line
         try:
@@ -832,6 +1056,12 @@ class CruiseLinePanel(QWidget):
                 # visible window it opens if that doesn't complete cleanly.
                 logged_in = await self.msc_service.check_login(timeout_minutes=15.0)
             else:
+                if cruise_line == CruiseLine.PRINCESS:
+                    # Signs in with the OneSource login saved in SAVE_LOGIN
+                    # (option 6) and opens POLAR itself (2026-10-15).
+                    self.status_label.setText(
+                        "Princess: signing in to OneSource and opening POLAR... (if it "
+                        "cannot, sign in by hand and click 'Book & Manage Cruises').")
                 # Uses the same shared browser session that Start will reuse —
                 # this window never closes and reopens the browser between
                 # login and scanning (see get_or_create_scraper), which is
@@ -839,7 +1069,7 @@ class CruiseLinePanel(QWidget):
                 # session cookies in a fresh browser instance.
                 logged_in = await self.queue_manager.check_login(
                     cruise_line, timeout_minutes=15.0,
-                    headless=(self.cruise_line == CruiseLine.NCL
+                    headless=(self.cruise_line in HEADLESS_CAPABLE_LINES
                               and self.headless_checkbox.isChecked()),
                 )
             logger.info("gui.check_login_returned", cruise_line=cruise_line.value, logged_in=logged_in)
@@ -866,7 +1096,7 @@ class CruiseLinePanel(QWidget):
             logger.exception("gui.check_login_failed", cruise_line=cruise_line.value)
             self.login_status_label.setText("Login status: failed")
             self.status_label.setText(f"Login check failed: {exc}")
-            QMessageBox.warning(self, "Login failed", str(exc))
+            self._notify(QMessageBox.Icon.Warning, "Login failed", str(exc))
         finally:
             self.login_button.setEnabled(True)
             # GATED 2026-08-26 to match _on_start's finally, whose own
@@ -880,20 +1110,26 @@ class CruiseLinePanel(QWidget):
     def _add_bulk(self) -> None:
         text = self.bulk_input.toPlainText().strip()
         if not text:
-            QMessageBox.warning(self, "No input", "Paste booking IDs into the bulk input first.")
+            self.status_label.setText("Paste booking IDs into the list box first.")
             return
-        added = self.queue_manager.add_bookings_bulk(text)
-        if not added:
-            QMessageBox.information(self, "No new bookings", "No new booking IDs were added to the queue.")
-            return
+        pasted = parse_ids(text)
+        saved_new = self._remember(pasted)
+        added = self.queue_manager.add_bookings_bulk("\n".join(pasted))
         self.bulk_input.clear()
         self._update_queue_view(self.queue_manager.get_snapshot())
-        self.status_label.setText(f"Added {len(added)} booking(s) to queue.")
+        dupes = len(pasted) - len(added)
+        self.status_label.setText(
+            f"Queued {len(added)} booking(s)"
+            + (f", {dupes} duplicate(s) skipped" if dupes else "")
+            + (f"; {saved_new} new saved to the list" if saved_new else "") + ".")
 
     @Slot()
     def _add_from_file(self) -> None:
+        # Watchlists live in watchlists/ since the 2026-10-13 restructure;
+        # open there when it exists.
+        start = Path.cwd() / "watchlists"
         path, _ = QFileDialog.getOpenFileName(
-            self, "Load booking IDs", str(Path.cwd()),
+            self, "Load booking IDs", str(start if start.is_dir() else Path.cwd()),
             "Text files (*.txt *.csv);;All files (*)",
         )
         if not path:
@@ -906,8 +1142,10 @@ class CruiseLinePanel(QWidget):
             QMessageBox.warning(self, "Nothing loaded", error)
             self.status_label.setText(error)
             return
+        saved_new = self._remember(added)
         self._update_queue_view(self.queue_manager.get_snapshot())
-        self.status_label.setText(f"Loaded {len(added)} booking(s) from {Path(path).name}.")
+        self.status_label.setText(f"Loaded {len(added)} booking(s) from {Path(path).name}"
+                                  + (f"; {saved_new} new saved to the list" if saved_new else "") + ".")
 
     @Slot()
     def _remove_queue_item(self, booking_id: str) -> None:
@@ -987,7 +1225,9 @@ class CruiseLinePanel(QWidget):
                 if state == "FAILED":
                     item.setBackground(Qt.GlobalColor.red)
                 elif state == "RUNNING":
-                    item.setBackground(Qt.GlobalColor.green)
+                    # Not green: green is for lower prices only (Neon
+                    # 2026-10-15).
+                    item.setBackground(QColor("#BDD7EE"))
                 elif state == "PAUSED":
                     item.setBackground(Qt.GlobalColor.yellow)
                 elif state == "STOPPED":
@@ -1072,7 +1312,7 @@ class CruiseLinePanel(QWidget):
                     running=snapshot.running, done=snapshot.done,
                     error=snapshot.error)
         if snapshot.queued == 0:
-            QMessageBox.warning(self, "No bookings", "Add at least one booking ID before starting the queue.")
+            self._notify(QMessageBox.Icon.Warning, "No bookings", "Add at least one booking ID before starting the queue.")
             return
 
         # STALE CODE CHECK. See stale_modules() - on 2026-09-15 a fixed
@@ -1085,17 +1325,11 @@ class CruiseLinePanel(QWidget):
         if stale:
             logger.warning("gui.stale_modules", cruise_line=self.cruise_line.value,
                            modules=stale)
-            answer = QMessageBox.question(
-                self,
-                "Code changed since this window opened",
-                "These files were edited after this window started, so the "
+            answer = await self._ask("Code changed since this window opened", "These files were edited after this window started, so the "
                 "running scan would still use the OLD code:\n\n  "
                 + "\n  ".join(stale)
                 + "\n\nRestart the app to pick the changes up.\n\n"
-                  "Start the scan anyway?",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                QMessageBox.StandardButton.No,
-            )
+                  "Start the scan anyway?", QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No, QMessageBox.StandardButton.No)
             if answer != QMessageBox.StandardButton.Yes:
                 self.status_label.setText(
                     "Scan cancelled — restart the app to load the updated code.")
@@ -1180,7 +1414,7 @@ class CruiseLinePanel(QWidget):
                 else:
                     logged_in = await self.queue_manager.check_login(
                         cruise_line_check, timeout_minutes=15.0,
-                        headless=(cruise_line_check == CruiseLine.NCL
+                        headless=(cruise_line_check in HEADLESS_CAPABLE_LINES
                                   and self.headless_checkbox.isChecked()),
                     )
             except Exception as exc:
@@ -1195,9 +1429,7 @@ class CruiseLinePanel(QWidget):
                             cruise_line=cruise_line_check.value)
             else:
                 self.status_label.setText("Not logged in — scan not started")
-                QMessageBox.warning(
-                    self, "Not logged in",
-                    f"Could not log in to {cruise_line_check.value} "
+                self._notify(QMessageBox.Icon.Warning, "Not logged in", f"Could not log in to {cruise_line_check.value} "
                     f"automatically.\n\n"
                     "Complete the login in the browser window that opened "
                     "(ESPRESSO may demand MFA, which cannot be automated), "
@@ -1206,8 +1438,7 @@ class CruiseLinePanel(QWidget):
                     "starting a scan.\n\n"
                     "A browser being open is not the same as being logged in — "
                     "starting anyway would run every booking against a "
-                    "logged-out portal.",
-                )
+                    "logged-out portal.")
                 return
 
         # ── ALREADY SCANNED? DON'T OPEN A BROWSER AT ALL ────────
@@ -1252,20 +1483,20 @@ class CruiseLinePanel(QWidget):
                         scanned_at=str(when),
                         minutes_remaining=plan.get("minutes_remaining"))
             self.status_label.setText(message)
-            QMessageBox.information(
-                self, "Already scanned",
-                message + "\n\nThe results below are the ones from that "
+            self._notify(QMessageBox.Icon.Information, "Already scanned", message + "\n\nThe results below are the ones from that "
                 "scan.\n\nTo scan anyway, tick \"Force live recheck\" — a "
                 "forced re-check is treated as a different request and is "
                 "never suppressed.")
             return
 
+        self._login_alert = None
         self.start_button.setEnabled(False)
         self.stop_button.setEnabled(True)
         self.clear_queue_button.setEnabled(False)
         self.add_booking_button.setEnabled(False)
         self.add_bulk_button.setEnabled(False)
         self.load_file_button.setEnabled(False)
+        self.load_saved_button.setEnabled(False)
         self.booking_input.setEnabled(False)
         self.bulk_input.setEnabled(False)
         # Running "Check login" while a scan is active opens a second,
@@ -1274,6 +1505,8 @@ class CruiseLinePanel(QWidget):
         # scan's already-running session out from under it, cascading
         # into timeouts for every booking still queued.
         self.login_button.setEnabled(False)
+        # Same reason: the scan owns this line's browser while it runs.
+        self.open_portal_button.setEnabled(False)
         self.status_label.setText("Starting queue processing...")
 
 
@@ -1321,7 +1554,7 @@ class CruiseLinePanel(QWidget):
             logger.error("gui.start_exception", error=str(exc)[:300])
             traceback.print_exc()
             self.status_label.setText("Queue processing failed")
-            QMessageBox.critical(self, "Processing failed", str(exc))
+            self._notify(QMessageBox.Icon.Critical, "Processing failed", str(exc))
         finally:
             # CONFIRMED REAL BUG, fixed 2026-08-13 (Phase 0 correctness
             # audit): this used to unconditionally re-enable every control
@@ -1342,9 +1575,11 @@ class CruiseLinePanel(QWidget):
                 self.add_booking_button.setEnabled(True)
                 self.add_bulk_button.setEnabled(True)
                 self.load_file_button.setEnabled(True)
+                self.load_saved_button.setEnabled(True)
                 self.booking_input.setEnabled(True)
                 self.bulk_input.setEnabled(True)
                 self.login_button.setEnabled(True)
+                self.open_portal_button.setEnabled(self.cruise_line != CruiseLine.MSC)
             self._update_queue_view(self.queue_manager.get_snapshot())
 
     async def _run_standard_batch(
@@ -1371,11 +1606,20 @@ class CruiseLinePanel(QWidget):
             if total:
                 text += f" ({min(done + 1, total)}/{total})"
             text += "..."
+            if self._login_alert:
+                text = f"{self._login_alert}   ·   {text}"
             if last_status.get("text") != text:
                 last_status["text"] = text
                 self.status_label.setText(text)
 
         def on_result(result: BookingResult) -> None:
+            # A newer result for the same booking REPLACES the old one (the
+            # table row already does) - an NCL booking first answered "not
+            # on this account" by the US login and then priced on the CA
+            # login must count once, as the CA result.
+            self.results = [r for r in self.results
+                            if not (r.booking_id == result.booking_id
+                                    and r.cruise_line == result.cruise_line)]
             self.results.append(result)
             self._append_result_row(result)
             self._refresh_summary()
@@ -1390,6 +1634,11 @@ class CruiseLinePanel(QWidget):
             capture_market_data=capture_market_data,
             capture_everything=capture_everything,
             on_action=self._on_action,
+            # NCL "3 at once" - only when headless is on as well.
+            parallel=(settings.ncl_parallel_workers
+                      if (self.cruise_line == CruiseLine.NCL
+                          and self.headless_checkbox.isChecked()
+                          and self.parallel_checkbox.isChecked()) else 1),
         )
         # Report the REAL terminal status, 2026-08-26. This used to always
         # say "Queue processing complete." regardless of whether the job
@@ -1414,9 +1663,27 @@ class CruiseLinePanel(QWidget):
                 f"were NOT checked. Re-run after checking login."
             )
             self.status_label.setText(message)
-            QMessageBox.warning(self, "Scan failed", message)
+            self._notify(QMessageBox.Icon.Warning, "Scan failed", message)
         elif job_status == "STOPPED":
             self.status_label.setText(f"Scan stopped by you — {remaining} booking(s) not checked.")
+        elif job_status == "INCOMPLETE":
+            # The run emptied its queue without checking everything —
+            # almost always a session that died partway (2026-10-07: 318 of
+            # 769). Say so plainly and say what to do, because the previous
+            # wording for this case was "Shouldn't happen" and the run
+            # before it just claimed completeness.
+            # Prefer the job's OWN recorded reason when it has one - a run
+            # that gave up on an unrecoverable session says exactly that
+            # (see BookingService._LOGIN_GIVE_UP_AFTER). The generic line
+            # is the fallback, not the default.
+            reason = self.queue_manager.last_job_error
+            message = reason or (
+                f"Scan finished with {remaining} booking(s) NOT checked — "
+                f"usually a dropped ESPRESSO session. Press Start again to "
+                f"pick them up; this run will not block a rescan."
+            )
+            self.status_label.setText(message)
+            self._notify(QMessageBox.Icon.Warning, "Some bookings were not checked", message)
         elif remaining:
             # Shouldn't happen, but never silently claim completeness.
             self.status_label.setText(
@@ -1475,6 +1742,15 @@ class CruiseLinePanel(QWidget):
         detail_str = " ".join(f"{k}={v}" for k, v in detail.items())
         line = f"[{ts}] {action}  {detail_str}"
         self.activity_log.append(line)
+        # LOGIN TROUBLE GOES ON THE STATUS LINE, added 2026-10-08. A
+        # mid-scan sign-out used to be visible only as raw lines in this log,
+        # so the 16:30-17:03 episode that day looked like a stuck scan.
+        message = self._login_status_message(action, entry)
+        if message:
+            # Kept until a login succeeds, so the per-booking progress text
+            # (on_state_change in _run_standard_batch) cannot wipe it.
+            self._login_alert = None if action == "login_recovered" else message
+            self.status_label.setText(message)
         # Also surface it on the shell's combined log, so an operator
         # watching one tab still sees another line's activity — otherwise a
         # concurrent run is invisible unless you switch tabs.
@@ -1483,6 +1759,30 @@ class CruiseLinePanel(QWidget):
                 self._on_activity(self.cruise_line, line)
             except Exception:
                 logger.exception("gui.activity_forward_failed")
+
+    @staticmethod
+    def _login_status_message(action: str, entry: dict) -> str | None:
+        """Status-line text for a scraper login event, or None."""
+        line = entry.get("cruise_line") or "Portal"
+        if action == "login_session_lost":
+            return f"{line} signed out mid-scan - logging back in automatically…"
+        if action == "login_recovered":
+            return f"{line}: logged back in automatically - scan continuing."
+        if action == "login_awaiting_mfa":
+            wait = entry.get("waiting_s") or 0
+            if wait:
+                return (f"{line} is asking for an MFA code - enter it in the "
+                        f"{line} browser window (waiting {wait // 60} min).")
+            return (f"{line} still wants an MFA code - enter it in the {line} "
+                    f"browser window; each booking retries the login.")
+        if action == "login_mfa_timeout":
+            return (f"{line}: no MFA code was entered - the scan keeps retrying "
+                    f"the login on every booking. Enter the code in the {line} "
+                    f"window to resume.")
+        if action == "login_relogin_failed":
+            return (f"{line}: automatic login did not work ({entry.get('result')}) "
+                    f"- retrying on the next booking.")
+        return None
 
     @staticmethod
     def _format_net_saving(net_saving: float, status: str = "",
@@ -1762,7 +2062,12 @@ class CruiseLinePanel(QWidget):
                     item.setToolTip(str(stamp))
             self.results_table.setItem(row, col, item)
 
-        color = self._color_for_status(result.status.value)
+        # An UNCONFIRMED candidate (GoCCL: Carnival's review could not
+        # confirm it) is already kept out of the savings total; its row must
+        # not be the green of a confirmed saving either (2026-10-15).
+        tint_key = ("UNCONFIRMED" if result.status == BookingStatus.OPTIMIZATION
+                    and is_unconfirmed_candidate(result) else result.status.value)
+        color = self._color_for_status(tint_key)
         for col in range(self.results_table.columnCount()):
             item = self.results_table.item(row, col)
             if item is not None:
@@ -1784,7 +2089,9 @@ class CruiseLinePanel(QWidget):
         row = self.results_table.rowCount()
         self.results_table.insertRow(row)
         if outcome.status == "checked" and outcome.result is not None:
-            status_text = "OPPORTUNITY" if outcome.result.has_any_opportunity else "NO_OPPORTUNITY"
+            # Green only for a proven lower price (Neon 2026-10-15) - see
+            # core.calculator_msc.msc_row_status.
+            status_text = msc_row_status(outcome.result)
             checks_text = f"{sum(1 for c in outcome.result.checks if c.status.value == 'OPPORTUNITY')}/{len(outcome.result.checks)} checks"
         else:
             status_text = outcome.status.upper()
@@ -1805,6 +2112,20 @@ class CruiseLinePanel(QWidget):
             )
         else:
             detail = outcome.note or ""
+        # Discounts BEFORE (held) and offered TODAY (Neon 2026-10-15: save
+        # and show before/after for every line).
+        if result is not None and (result.discounts_before is not None
+                                   or result.discounts_today is not None):
+            detail = (f"DISCOUNTS held: {result.discounts_before or 'none'} | "
+                      f"offered today: {result.discounts_today or 'none'}"
+                      + (f" | {detail}" if detail else ""))
+        # Status-match eligibility (no Voyagers membership and no applied
+        # discount; unknown evidence is manual), shared with MSC rules and
+        # persisted with the scan. Leads the Note so it is read first.
+        if outcome.status_match:
+            detail = (f"STATUS MATCH: {outcome.status_match['verdict']} - "
+                      f"{outcome.status_match['reason']}"
+                      + (f" | {detail}" if detail else ""))
 
         # THE DOLLAR VALUE, added 2026-09-03. MSC rows previously put
         # `outcome.note` in the "Net Saving / Summary" column and sorted it
@@ -1832,14 +2153,21 @@ class CruiseLinePanel(QWidget):
         else:
             summary_text = outcome.note
 
+        # OLD / NEW = the booking's own total and TODAY's price for the same
+        # category (Neon 2026-10-15: "it is not showing old price and new
+        # price"). Both were read on every scan and thrown away before the
+        # row. New is today's price, not a promised reprice - the checks in
+        # the Note decide whether anything is an opportunity.
+        old_price = getattr(result, "current_total_price", None) if result else None
+        new_price = getattr(result, "today_price", None) if result else None
         cells = [
             outcome.booking_id,
             "MSC",
             status_text,
             summary_text,
             checks_text,
-            "—",          # MSC has no single old_total
-            "—",          # ...nor a single new_total
+            f"${old_price:,.2f}" if old_price else "—",
+            f"${new_price:,.2f}" if new_price else "—",
             category,
             # MSC runs outside the freshness cache (its own subsystem), so
             # it has no "last scanned" to report. A dash is honest; "Never"
@@ -1863,7 +2191,9 @@ class CruiseLinePanel(QWidget):
             0: _booking_id_sort_value(outcome.booking_id),
             2: _row_rank(status_text, best_value),
             3: (best_value if best_value is not None else -1.0),
-            4: opportunity_count, 5: -1.0, 6: -1.0,
+            4: opportunity_count,
+            5: float(old_price) if old_price else -1.0,
+            6: float(new_price) if new_price else -1.0,
         }
         for col, text in enumerate(cells):
             if col in sort_values:
@@ -2096,6 +2426,9 @@ class CruiseLinePanel(QWidget):
     # same colour on screen as in the spreadsheet the client sees.
     _STATUS_TINTS = {
         "OPTIMIZATION": "#C6EFCE",          # soft green
+        # A candidate the portal did not confirm - verify by hand. Never
+        # the green of a confirmed saving.
+        "UNCONFIRMED": "#FFFF99",           # pale yellow
         # Its own strong colour - see services/excel_export.py's _FILLS for
         # why a cancellation must not share the pale blue of PAID_IN_FULL.
         "CANCELLED": "#F4B183",             # orange
@@ -2118,7 +2451,12 @@ class CruiseLinePanel(QWidget):
         # MSC statuses (see _append_msc_result_row) — OPPORTUNITY means a
         # finding to call MSC about, never a same-category win the agent
         # applied itself the way ESPRESSO's OPTIMIZATION does.
+        # GREEN IS FOR AN AVAILABLE LOWER PRICE ONLY (Neon 2026-10-15,
+        # project-wide). MSC OPPORTUNITY now means a lower price in figures
+        # (core.calculator_msc.msc_row_status); a discount lead with no
+        # proven lower price is ORANGE.
         "OPPORTUNITY": "#C6EFCE",
+        "DISCOUNT_OPPORTUNITY": "#FFCC80",  # orange - a lead, not a price
         "NO_OPPORTUNITY": "#F2F2F2",
         "NOT_FOUND": "#FBE4E4",
         "SESSION_EXPIRED_AFTER_RELOGIN": "#FBE4E4",
@@ -2174,6 +2512,23 @@ class CruiseLinePanel(QWidget):
 
 
 class MainWindow(QMainWindow):
+    #: Ticks between full Chromium censuses. Defined HERE because
+    #: _refresh_resources is a MainWindow method - it was only ever set on
+    #: CruiseLinePanel, so every tick raised
+    #:
+    #:     AttributeError: 'MainWindow' object has no attribute
+    #:                     '_CHROME_CENSUS_EVERY'
+    #:
+    #: which the broad `except` turned into "Resources: (unavailable)" and
+    #: a Dashboard frozen at whatever the first tick happened to read.
+    #: Neon, with a scan running and the board showing NOT CONNECTED and
+    #: 0 Chromium: *"dashboard is not functioning at all"*.
+    #:
+    #: 5 ticks against a 3-second timer is ~15s, which is the cadence the
+    #: census comment below was written for: it costs a median 66ms and a
+    #: max 900ms ON THE UI THREAD, and measures something that barely moves.
+    _CHROME_CENSUS_EVERY = 5
+
     #: Grace period between asking the app to quit and forcing the
     #: process to exit. Long enough for a normal interpreter shutdown,
     #: short enough that a hang is not something the operator notices.
@@ -2394,14 +2749,18 @@ class MainWindow(QMainWindow):
             all_results: list[BookingResult] = []
             for panel in self.panels.values():
                 all_results.extend(getattr(panel, "results", []))
-            total = total_optimization_savings(all_results)
+            # BY CURRENCY. 35 of the OPTIMIZATION rows in the live
+            # database are CAD and were being added to a figure printed
+            # with a dollar sign. Nothing is dropped - see
+            # savings_by_currency - and with one currency present this
+            # reads exactly as it did before.
             unconf_n, unconf_total = unconfirmed_candidate_total(all_results)
             opt = sum(1 for r in all_results if r.status.value == "OPTIMIZATION")
             busy = [l.value for l, p in self.panels.items() if p.is_busy()]
             parts = [
                 str(len(all_results)) + " checked across all lines",
                 str(opt) + " optimization(s)",
-                "${:,.2f} confirmed savings".format(total),
+                format_savings_by_currency(savings_by_currency(all_results)),
             ]
             if unconf_n:
                 parts.append(
@@ -2529,8 +2888,16 @@ class MainWindow(QMainWindow):
                 found += sum(
                     1 for r in getattr(panel, "results", [])
                     if getattr(r.status, "value", r.status) == "OPTIMIZATION")
-                if getattr(snap, "running", 0) or getattr(snap, "progress_total", 0) and (
-                        panel.queue_manager.is_running):
+                # `A or B and C` binds as `A or (B and C)` - the first
+                # version of this read as that by accident. What is meant
+                # is simply: this line is scanning if its queue manager
+                # says so, or if a booking is in flight right now.
+                running_now = bool(getattr(snap, "running", 0))
+                try:
+                    line_is_running = bool(panel.queue_manager.is_running)
+                except Exception:  # noqa: BLE001
+                    line_is_running = False
+                if running_now or line_is_running:
                     scanning.append(line.value)
                     current = getattr(snap, "current_booking_id", None)
                     total = getattr(snap, "progress_total", 0)
